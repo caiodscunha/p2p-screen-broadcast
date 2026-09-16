@@ -13,6 +13,9 @@ people exchanging a text code to establish a direct peer-to-peer connection.
 - 🖥️ Screen + system audio capture (native picker and system-audio
   loopback on Windows and macOS; manual PulseAudio/PipeWire monitor-source
   selection on Linux)
+- 🎚️ Per-app audio capture on Windows: include only one app's audio, or
+  exclude one app (e.g. share your game/music but not your Discord call),
+  via WASAPI Process Loopback — no manual audio device routing required
 - 🔗 Fully peer-to-peer via WebRTC, no relay server ever touches your
   video/audio
 - 🚫 Zero infrastructure, no signaling server, no backend, no account,
@@ -65,6 +68,24 @@ agreed through a different channel than the one used to send the code
 together over the same compromised channel, encryption doesn't help.
 Leaving the passphrase blank keeps the previous plain behavior.
 
+### Per-app audio capture (Windows only)
+
+The "Audio source" dropdown on the Broadcast tab has a "Specific process"
+option that lets you include only one running app's audio, or exclude one
+app from an otherwise full system-audio share — e.g. share your game or
+music but keep a Discord voice call out of the stream, without routing
+anything to a separate audio device manually.
+
+This uses WASAPI's Process Loopback Capture (`AUDIOCLIENT_ACTIVATION_TYPE_
+PROCESS_LOOPBACK`, Windows 10 2004+), the same API OBS Studio uses for its
+"Application Audio Capture" source. It isn't exposed by Chromium/Electron's
+JS APIs, so it's implemented as a small native addon
+(`native/audio-loopback/`, C++/N-API) that captures raw PCM for a target
+process (and its child processes) and streams it to the renderer, where a
+Web Audio `AudioWorklet` turns it into a real `MediaStreamTrack` that gets
+added to the broadcast alongside the video. Windows-only — on macOS and
+Linux this option simply doesn't appear.
+
 ## Tech stack
 
 - **Electron**: desktop shell, native screen/window picker, system-audio
@@ -80,7 +101,23 @@ Platform-specific capture logic lives in `capture.js`, isolated from the
 rest of the app so Windows, macOS and Linux run from the same codebase
 without diverging branches.
 
-## Getting started
+## Download
+
+Prebuilt executables for Windows and Linux are published on the
+[Releases page](https://github.com/caiodscunha/p2p-screen-broadcast/releases).
+Both the broadcaster and every viewer need to download and run the app on
+their own machine (there's nothing to install on a server).
+
+- **Windows**: `Sinal-P2P-<version>-win.exe` (portable, no install needed —
+  just run it)
+- **Linux**: `Sinal-P2P-<version>-linux-x64.tar.gz` (extract and run the
+  `Sinal P2P` binary inside)
+
+A macOS build isn't published yet — `electron-builder` refuses to build for
+macOS from any non-macOS host, even for an unsigned `.zip`, so it needs to
+be built on an actual Mac (see `npm run dist:mac` below).
+
+## Getting started (from source)
 
 Both the broadcaster and every viewer need Node.js installed and must run
 the app on their own machine.
@@ -89,6 +126,22 @@ the app on their own machine.
 npm install
 npm start
 ```
+
+To build the executables yourself:
+
+```bash
+npm run dist:win     # Windows portable .exe
+npm run dist:mac     # macOS .zip — must be run on an actual Mac, electron-builder refuses this target on other hosts
+npm run dist:linux   # Linux .tar.gz
+npm run dist         # all three
+```
+
+Rebuilding the Windows build from source also rebuilds the native
+per-process audio module (see below), which requires the C++ workload of
+Visual Studio Build Tools (`Desktop development with C++`) to be installed.
+Without it, `npm install`/`npm run dist:win` still work, but per-process
+audio capture is silently unavailable (falls back to not offering that
+option in the UI).
 
 ## Usage
 

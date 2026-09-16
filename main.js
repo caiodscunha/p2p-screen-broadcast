@@ -1,29 +1,11 @@
 const { app, BrowserWindow, session, ipcMain, clipboard } = require('electron');
 const path = require('path');
-const { execFile } = require('child_process');
 const { registerDisplayMediaHandler, supportsSystemAudioLoopback } = require('./capture');
+const processAudio = require('./native/audio-loopback');
 
-// O Windows reduz a prioridade de CPU/GPU de processos sem foco/minimizados
-// para economizar energia (Efficiency Mode/EcoQoS), num nível que fica abaixo
-// de qualquer flag do Chromium — é por isso que as flags de occlusion não
-// resolvem o congelamento ao minimizar. A saída (mesma usada por apps como
-// OBS/Discord) é forçar prioridade "Acima do normal" para os processos do
-// Electron (janela principal, renderer e GPU), contornando esse throttling.
-function boostProcessPriority() {
-  if (process.platform !== 'win32') return;
-  app.getAppMetrics().forEach(({ pid }) => {
-    execFile(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-WindowStyle', 'Hidden',
-        '-Command',
-        `try { (Get-Process -Id ${pid}).PriorityClass = 'AboveNormal' } catch {}`,
-      ],
-      () => {}
-    );
-  });
-}
+// Handles de captura por processo ativos, por WebContents (pra poder parar
+// tudo se a janela fechar/recarregar sem que o usuário clique "Parar").
+const activeProcessAudioCaptures = new Map();
 
 // É comum abrir duas instâncias deste app na mesma máquina para testar
 // transmissor e espectador ao mesmo tempo. Por padrão o Electron usa a mesma
@@ -35,27 +17,37 @@ function boostProcessPriority() {
 // não perde nada e elimina esse conflito.
 app.setPath('userData', path.join(app.getPath('temp'), `p2p-screen-broadcast-${process.pid}`));
 
-// Sem isso, o Windows detecta a janela minimizada ou totalmente coberta por
-// outro app ("occlusion") e o Chromium trata a página como se estivesse em
-// segundo plano: reduz a prioridade do processo e pausa/limita timers e
-// renderização, o que congela a transmissão para os espectadores mesmo com a
-// captura de tela ainda ativa. Precisa ser definido antes do app ficar
-// pronto (app.whenReady).
-// IntensiveWakeUpThrottling é um mecanismo separado de throttling de timers
-// para páginas em segundo plano (distinto do que backgroundThrottling:false
-// desliga) que também pode segurar o loop de captura/envio de vídeo.
-app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion,IntensiveWakeUpThrottling');
-app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
-app.commandLine.appendSwitch('disable-renderer-backgrounding');
-app.commandLine.appendSwitch('disable-background-timer-throttling');
-
 ipcMain.handle('clipboard:write', (event, text) => clipboard.writeText(text));
 ipcMain.handle('clipboard:read', () => clipboard.readText());
 ipcMain.handle('capture:supportsSystemAudio', () => supportsSystemAudioLoopback);
-// Reforça a prioridade assim que a captura de tela começa, porque nesse
-// momento o Chromium sobe processos novos (serviço de captura de vídeo) que
-// ainda não tinham sido priorizados pela chamada inicial.
-ipcMain.handle('capture:started', () => boostProcessPriority());
+
+// Captura de áudio por processo (Windows apenas, via módulo nativo em
+// native/audio-loopback). Deixa incluir só um app específico, ou excluir um
+// app específico do resto — útil pra tirar uma chamada de voz (Discord, etc)
+// do que é compartilhado, sem depender de rotear áudio manualmente pro SO.
+ipcMain.handle('audio-process:supported', () => processAudio.supported);
+ipcMain.handle('audio-process:list', () => processAudio.listProcesses());
+
+ipcMain.handle('audio-process:start', (event, { pid, exclude }) => {
+  const webContents = event.sender;
+  const handle = processAudio.startCapture(pid, exclude, (error, samples, sampleRate, channels) => {
+    if (webContents.isDestroyed()) return;
+    if (error) {
+      webContents.send('audio-process:error', error);
+      return;
+    }
+    webContents.send('audio-process:chunk', samples, sampleRate, channels);
+  });
+
+  if (!activeProcessAudioCaptures.has(webContents.id)) activeProcessAudioCaptures.set(webContents.id, new Set());
+  activeProcessAudioCaptures.get(webContents.id).add(handle);
+  return handle;
+});
+
+ipcMain.handle('audio-process:stop', (event, handle) => {
+  processAudio.stopCapture(handle);
+  activeProcessAudioCaptures.get(event.sender.id)?.delete(handle);
+});
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -69,20 +61,35 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      backgroundThrottling: false,
+      // Desliga o DevTools (Ctrl+Shift+I/F12 e qualquer chamada a
+      // openDevTools()) nos executáveis empacotados, para o usuário final não
+      // conseguir abrir o console. Continua disponível rodando via
+      // "npm start"/"electron .", já que app.isPackaged só é true num build.
+      devTools: !app.isPackaged,
     },
   });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
-  // Reaplica a prioridade ao minimizar: o Windows pode resetar a classe de
-  // prioridade do processo quando ele perde o estado "restaurado".
-  win.on('minimize', boostProcessPriority);
+
+  // Evita vazar uma thread de captura nativa rodando pra sempre se a janela
+  // fechar/recarregar sem que o usuário clique em "Parar".
+  win.webContents.on('destroyed', () => {
+    const handles = activeProcessAudioCaptures.get(win.webContents.id);
+    if (handles) {
+      handles.forEach((handle) => processAudio.stopCapture(handle));
+      activeProcessAudioCaptures.delete(win.webContents.id);
+    }
+  });
 }
 
 app.whenReady().then(() => {
+  // Sem verificador ortográfico: os campos de texto do app são só
+  // código/senha/nome, não precisam disso, e o serviço de spellcheck do
+  // Chromium carrega dicionários inteiros na memória à toa.
+  session.defaultSession.setSpellCheckerEnabled(false);
+
   registerDisplayMediaHandler(session.defaultSession);
 
   createWindow();
-  setTimeout(boostProcessPriority, 3000);
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

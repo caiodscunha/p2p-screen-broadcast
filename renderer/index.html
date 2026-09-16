@@ -35,14 +35,32 @@
             tem suporte à captura automática do áudio do sistema; apenas o
             vídeo será compartilhado, a menos que você selecione uma fonte de
             áudio abaixo.</p>
-          <div class="field-block" id="linux-audio-block" hidden>
-            <label for="audio-source-select">Fonte de áudio do sistema (opcional,
-              via PulseAudio/PipeWire, geralmente algo como &quot;Monitor of ...&quot;):</label>
+          <div class="field-block" id="audio-source-block">
+            <label for="audio-source-select">Fonte de áudio a compartilhar</label>
+            <p class="hint">Por padrão, "áudio do sistema" inclui tudo que está tocando
+              (jogos, música, e também chamadas de voz como Discord). Pra excluir algo
+              específico, escolha "Processo específico" abaixo (Windows) ou configure
+              esse app para tocar num dispositivo de saída separado (ou um cabo de
+              áudio virtual, ex: VB-CABLE) e selecione esse dispositivo aqui.</p>
             <div class="btn-row">
               <select id="audio-source-select">
-                <option value="">Sem áudio do sistema</option>
+                <option value="">Nenhum áudio</option>
               </select>
               <button id="btn-refresh-audio-sources" type="button" class="btn btn-ghost">Atualizar lista</button>
+            </div>
+            <div class="field-block" id="process-audio-block" hidden>
+              <label for="process-audio-mode">O que fazer com o app escolhido</label>
+              <select id="process-audio-mode">
+                <option value="include">Compartilhar só o áudio desse app</option>
+                <option value="exclude">Compartilhar tudo, exceto o áudio desse app</option>
+              </select>
+              <div class="field-block">
+                <label for="process-audio-select">App</label>
+                <div class="btn-row">
+                  <select id="process-audio-select"></select>
+                  <button id="btn-refresh-audio-processes" type="button" class="btn btn-ghost">Atualizar lista</button>
+                </div>
+              </div>
             </div>
           </div>
           <div class="video-wrap">
