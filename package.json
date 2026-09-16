@@ -4,11 +4,62 @@
   "version": "1.0.0",
   "description": "Transmissão de tela e áudio ponto-a-ponto (sem servidor)",
   "main": "main.js",
+  "author": "Caio Cunha",
   "private": true,
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac",
+    "dist:linux": "electron-builder --linux",
+    "dist": "electron-builder --win --mac --linux"
   },
   "devDependencies": {
-    "electron": "^32.0.0"
+    "electron": "^32.0.0",
+    "electron-builder": "^26.15.3",
+    "node-addon-api": "^8.9.2",
+    "node-gyp": "^12.4.0"
+  },
+  "build": {
+    "appId": "dev.caiocunha.sinalp2p",
+    "productName": "Sinal P2P",
+    "directories": {
+      "output": "dist",
+      "buildResources": "assets"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "capture.js",
+      "renderer/**/*",
+      "assets/**/*",
+      "package.json",
+      "native/audio-loopback/index.js",
+      "native/audio-loopback/build/Release/audio_loopback.node"
+    ],
+    "asarUnpack": [
+      "native/audio-loopback/build/Release/audio_loopback.node"
+    ],
+    "win": {
+      "icon": "assets/icon.png",
+      "target": [
+        "portable"
+      ],
+      "artifactName": "Sinal-P2P-${version}-win.${ext}"
+    },
+    "mac": {
+      "icon": "assets/icon.png",
+      "target": [
+        "zip"
+      ],
+      "artifactName": "Sinal-P2P-${version}-mac.${ext}"
+    },
+    "linux": {
+      "icon": "assets/icon.png",
+      "target": [
+        "tar.gz"
+      ],
+      "category": "Network",
+      "artifactName": "Sinal-P2P-${version}-linux-${arch}.${ext}"
+    }
   }
 }

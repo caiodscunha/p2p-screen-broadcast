@@ -124,21 +124,40 @@ tabTransmitir.addEventListener('click', () => switchTab('transmitir'));
 tabAssistir.addEventListener('click', () => switchTab('assistir'));
 
 const audioSourceSelect = document.getElementById('audio-source-select');
-const linuxAudioBlock = document.getElementById('linux-audio-block');
 const btnRefreshAudioSources = document.getElementById('btn-refresh-audio-sources');
 
+// Valor especial reservado para "usar o loopback automático do sistema" (todo
+// o áudio que está tocando). Qualquer outro valor não-vazio é um deviceId
+// real de um dispositivo de entrada específico.
+const LOOPBACK_VALUE = '__loopback__';
+// Fonte de áudio "captura por processo" (só Windows) — incluir ou excluir um
+// app específico via WASAPI Process Loopback, em vez de um dispositivo
+// inteiro. Ver native/audio-loopback.
+const PROCESS_VALUE = '__process__';
+let supportsLoopback = false;
+let supportsProcessAudio = false;
+
 window.api.supportsSystemAudio().then((supported) => {
-  if (supported) return;
-  document.getElementById('audio-hint').hidden = false;
-  linuxAudioBlock.hidden = false;
+  supportsLoopback = supported;
+  if (!supported) document.getElementById('audio-hint').hidden = false;
   refreshAudioSources();
 });
 
-// No Linux não existe loopback de áudio nativo: o usuário precisa expor o
-// "monitor" da sua placa de som (PulseAudio/PipeWire) como um dispositivo de
-// entrada e escolhê-lo aqui. Os labels dos dispositivos só ficam visíveis
-// depois de uma permissão de áudio concedida, por isso o getUserMedia
-// "descartável" abaixo.
+window.api.supportsProcessAudio().then((supported) => {
+  supportsProcessAudio = supported;
+  refreshAudioSources();
+});
+
+// Além do loopback automático (quando suportado), deixa escolher um
+// dispositivo de entrada específico como fonte de áudio — útil para excluir
+// algo do que é compartilhado (ex: a chamada de voz do Discord), desde que
+// esse app/chamada esteja tocando num dispositivo de saída separado (ou um
+// cabo de áudio virtual) que não seja o padrão do sistema. No Linux, isso
+// também é o que expõe o "monitor" do PulseAudio/PipeWire como entrada. Os
+// labels dos dispositivos só ficam visíveis depois de uma permissão de áudio
+// concedida, por isso o getUserMedia "descartável" abaixo.
+let audioSourceInitialized = false;
+
 async function refreshAudioSources() {
   try {
     const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -150,12 +169,31 @@ async function refreshAudioSources() {
   const devices = await navigator.mediaDevices.enumerateDevices();
   const audioInputs = devices.filter((d) => d.kind === 'audioinput');
 
-  const previousValue = audioSourceSelect.value;
+  // Na primeira chamada, o valor do <select> é só o placeholder estático do
+  // HTML, não uma escolha real do usuário — ignora ele pra não confundir
+  // "ainda não escolheu nada" com "escolheu Nenhum áudio" e cair sempre em
+  // silêncio por padrão mesmo quando o loopback está disponível.
+  const previousValue = audioSourceInitialized ? audioSourceSelect.value : undefined;
+  audioSourceInitialized = true;
   audioSourceSelect.innerHTML = '';
+
+  if (supportsLoopback) {
+    const loopbackOption = document.createElement('option');
+    loopbackOption.value = LOOPBACK_VALUE;
+    loopbackOption.textContent = 'Áudio do sistema (tudo, padrão)';
+    audioSourceSelect.appendChild(loopbackOption);
+  }
+
+  if (supportsProcessAudio) {
+    const processOption = document.createElement('option');
+    processOption.value = PROCESS_VALUE;
+    processOption.textContent = 'Processo específico (incluir ou excluir um app)';
+    audioSourceSelect.appendChild(processOption);
+  }
 
   const noneOption = document.createElement('option');
   noneOption.value = '';
-  noneOption.textContent = 'Sem áudio do sistema';
+  noneOption.textContent = 'Nenhum áudio';
   audioSourceSelect.appendChild(noneOption);
 
   audioInputs.forEach((d) => {
@@ -165,16 +203,53 @@ async function refreshAudioSources() {
     audioSourceSelect.appendChild(opt);
   });
 
-  const stillExists = audioInputs.some((d) => d.deviceId === previousValue);
-  if (stillExists) {
+  const previousStillValid =
+    (previousValue === LOOPBACK_VALUE && supportsLoopback) ||
+    (previousValue === PROCESS_VALUE && supportsProcessAudio) ||
+    previousValue === '' ||
+    audioInputs.some((d) => d.deviceId === previousValue);
+
+  if (previousStillValid) {
     audioSourceSelect.value = previousValue;
+  } else if (supportsLoopback) {
+    audioSourceSelect.value = LOOPBACK_VALUE;
   } else {
     const monitor = audioInputs.find((d) => /monitor/i.test(d.label));
-    if (monitor) audioSourceSelect.value = monitor.deviceId;
+    audioSourceSelect.value = monitor ? monitor.deviceId : '';
   }
 }
 
 btnRefreshAudioSources.addEventListener('click', refreshAudioSources);
+
+const processAudioBlock = document.getElementById('process-audio-block');
+const processAudioSelect = document.getElementById('process-audio-select');
+const processAudioMode = document.getElementById('process-audio-mode');
+const btnRefreshAudioProcesses = document.getElementById('btn-refresh-audio-processes');
+
+audioSourceSelect.addEventListener('change', () => {
+  const isProcessMode = audioSourceSelect.value === PROCESS_VALUE;
+  processAudioBlock.hidden = !isProcessMode;
+  if (isProcessMode) refreshAudioProcesses();
+});
+
+async function refreshAudioProcesses() {
+  const processes = await window.api.listAudioProcesses();
+  const previousValue = processAudioSelect.value;
+  processAudioSelect.innerHTML = '';
+
+  processes.forEach((p) => {
+    const opt = document.createElement('option');
+    opt.value = String(p.pid);
+    opt.textContent = p.title.length > 60 ? p.title.slice(0, 57) + '...' : p.title;
+    processAudioSelect.appendChild(opt);
+  });
+
+  if (processes.some((p) => String(p.pid) === previousValue)) {
+    processAudioSelect.value = previousValue;
+  }
+}
+
+btnRefreshAudioProcesses.addEventListener('click', refreshAudioProcesses);
 
 function switchTab(which) {
   const isTransmitir = which === 'transmitir';
@@ -209,7 +284,49 @@ const broadcastPassphraseInput = document.getElementById('broadcast-passphrase')
 const liveBadge = document.getElementById('live-badge');
 const liveBadgeText = document.getElementById('live-badge-text');
 
+// Estado da captura de áudio por processo em andamento (null quando não
+// está em uso). Precisa ser desmontado em stopCapture() além de qualquer
+// track normal, já que envolve um AudioContext + sessão nativa próprios.
+let processAudioState = null;
+
+async function startProcessAudioTrack(pid, exclude) {
+  const audioCtx = new AudioContext({ sampleRate: 48000 });
+  await audioCtx.audioWorklet.addModule('pcm-injector-worklet.js');
+
+  const workletNode = new AudioWorkletNode(audioCtx, 'pcm-injector', {
+    outputChannelCount: [2],
+  });
+  const destination = audioCtx.createMediaStreamDestination();
+  workletNode.connect(destination);
+
+  const unsubscribeChunk = window.api.onProcessAudioChunk((samples, sampleRate, channels) => {
+    workletNode.port.postMessage({ interleaved: samples, channels }, [samples.buffer]);
+  });
+  const unsubscribeError = window.api.onProcessAudioError((message) => {
+    alert('Captura de áudio por processo falhou: ' + message);
+  });
+
+  const handle = await window.api.startProcessAudioCapture(pid, exclude);
+
+  processAudioState = {
+    handle,
+    audioCtx,
+    cleanup: () => {
+      unsubscribeChunk();
+      unsubscribeError();
+      window.api.stopProcessAudioCapture(handle);
+      audioCtx.close().catch(() => {});
+    },
+  };
+
+  return destination.stream.getAudioTracks()[0];
+}
+
 btnStartCapture.addEventListener('click', async () => {
+  const selectedAudio = audioSourceSelect.value;
+  const useLoopback = selectedAudio === LOOPBACK_VALUE;
+  const useProcessAudio = selectedAudio === PROCESS_VALUE;
+
   try {
     localStream = await navigator.mediaDevices.getDisplayMedia({
       video: {
@@ -217,16 +334,27 @@ btnStartCapture.addEventListener('click', async () => {
         height: { ideal: 1080, max: 1080 },
         frameRate: { ideal: 60, max: 60 },
       },
-      audio: true,
+      // Só pede o loopback quando é isso que o usuário escolheu; caso
+      // contrário o handler do main process (capture.js) nem tenta anexar
+      // áudio automático, evitando misturar loopback com outra fonte de
+      // áudio escolhida abaixo.
+      audio: useLoopback,
     });
 
-    // Fallback para Linux: sem loopback nativo, o áudio do sistema (se
-    // escolhido) vem de um dispositivo de entrada separado (o "monitor" do
-    // PulseAudio/PipeWire) e é anexado manualmente ao stream capturado.
-    const linuxAudioDeviceId = audioSourceSelect.value;
-    if (linuxAudioDeviceId) {
+    if (useProcessAudio) {
+      const pid = Number(processAudioSelect.value);
+      const exclude = processAudioMode.value === 'exclude';
+      if (!pid) {
+        throw new Error('Escolha um app na lista de "Processo específico".');
+      }
+      const track = await startProcessAudioTrack(pid, exclude);
+      localStream.addTrack(track);
+    } else if (selectedAudio && !useLoopback) {
+      // Dispositivo de entrada específico escolhido (mic real, "Stereo Mix",
+      // um cabo de áudio virtual, ou o "monitor" do PulseAudio/PipeWire no
+      // Linux) em vez do loopback completo do sistema.
       const audioStream = await navigator.mediaDevices.getUserMedia({
-        audio: { deviceId: { exact: linuxAudioDeviceId } },
+        audio: { deviceId: { exact: selectedAudio } },
       });
       audioStream.getAudioTracks().forEach((track) => localStream.addTrack(track));
     }
@@ -242,7 +370,6 @@ btnStartCapture.addEventListener('click', async () => {
   btnNewViewer.disabled = false;
   liveBadge.hidden = false;
   setPaused(false);
-  window.api.notifyCaptureStarted();
 
   // se o usuário parar o compartilhamento pelos controles do próprio SO
   localStream.getVideoTracks()[0].addEventListener('ended', stopCapture);
@@ -279,6 +406,10 @@ function stopCapture() {
   if (localStream) {
     localStream.getTracks().forEach((t) => t.stop());
     localStream = null;
+  }
+  if (processAudioState) {
+    processAudioState.cleanup();
+    processAudioState = null;
   }
   preview.srcObject = null;
   viewers.forEach((v) => v.pc.close());
@@ -436,28 +567,6 @@ function renderViewerList() {
 
 renderViewerList();
 
-// Diagnóstico: loga a cada 3s as estatísticas de envio de vídeo pra cada
-// espectador. Serve pra descobrir, quando a transmissão "trava", se quem
-// para de produzir/enviar frames é o lado de quem transmite (aqui) ou se os
-// frames continuam sendo enviados normalmente e o travamento é só na
-// recepção/decodificação de quem assiste. Acompanhe pelo DevTools
-// (Ctrl+Shift+I) durante o teste de minimizar/cobrir a janela.
-setInterval(async () => {
-  for (const v of viewers) {
-    if (v.pc.connectionState !== 'connected') continue;
-    const stats = await v.pc.getStats();
-    stats.forEach((report) => {
-      if (report.type === 'outbound-rtp' && report.kind === 'video') {
-        console.log(
-          `[transmitir] espectador #${v.id} vídeo — fps=${report.framesPerSecond ?? '?'} ` +
-            `framesSent=${report.framesSent} bytesSent=${report.bytesSent} ` +
-            `qualityLimitation=${report.qualityLimitationReason ?? '?'}`
-        );
-      }
-    });
-  }
-}, 3000);
-
 // ===================================================================
 // ASSISTIR
 // ===================================================================
@@ -532,23 +641,3 @@ btnDisconnect.addEventListener('click', () => {
   answerBlock.hidden = true;
   watchStatus.textContent = 'Desconectado.';
 });
-
-// Contraparte do log de diagnóstico do lado de quem transmite: se
-// framesDecoded/bytesReceived continuam subindo normalmente aqui enquanto o
-// vídeo aparenta estar congelado na tela, o problema é na decodificação/
-// renderização desta janela, não no envio. Se pararem de subir junto com o
-// congelamento, o problema é do lado de quem transmite (ele parou de mandar
-// frames). Acompanhe pelo DevTools (Ctrl+Shift+I).
-setInterval(async () => {
-  if (!viewerPc || viewerPc.connectionState !== 'connected') return;
-  const stats = await viewerPc.getStats();
-  stats.forEach((report) => {
-    if (report.type === 'inbound-rtp' && report.kind === 'video') {
-      console.log(
-        `[assistir] vídeo — fps=${report.framesPerSecond ?? '?'} ` +
-          `framesDecoded=${report.framesDecoded} bytesReceived=${report.bytesReceived} ` +
-          `jitterBufferDelay=${report.jitterBufferDelay ?? '?'}`
-      );
-    }
-  });
-}, 3000);

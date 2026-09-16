@@ -18,7 +18,11 @@ function registerDisplayMediaHandler(targetSession) {
       desktopCapturer.getSources({ types: ['screen'] }).then((sources) => {
         callback({
           video: sources[0],
-          audio: supportsSystemAudioLoopback ? 'loopback' : undefined,
+          // Só liga o loopback quando o renderer realmente pediu áudio. Isso
+          // permite ao usuário optar por uma fonte de áudio específica (ex:
+          // um cabo virtual sem o Discord) em vez do loopback completo do
+          // sistema, chamando getDisplayMedia com audio:false nesse caso.
+          audio: supportsSystemAudioLoopback && request.audioRequested ? 'loopback' : undefined,
         });
       });
     },

@@ -4,5 +4,21 @@ contextBridge.exposeInMainWorld('api', {
   copyToClipboard: (text) => ipcRenderer.invoke('clipboard:write', text),
   readClipboard: () => ipcRenderer.invoke('clipboard:read'),
   supportsSystemAudio: () => ipcRenderer.invoke('capture:supportsSystemAudio'),
-  notifyCaptureStarted: () => ipcRenderer.invoke('capture:started'),
+
+  // Captura de áudio por processo (só Windows) — deixa incluir só um app
+  // específico, ou excluir um app específico do resto.
+  supportsProcessAudio: () => ipcRenderer.invoke('audio-process:supported'),
+  listAudioProcesses: () => ipcRenderer.invoke('audio-process:list'),
+  startProcessAudioCapture: (pid, exclude) => ipcRenderer.invoke('audio-process:start', { pid, exclude }),
+  stopProcessAudioCapture: (handle) => ipcRenderer.invoke('audio-process:stop', handle),
+  onProcessAudioChunk: (callback) => {
+    const listener = (event, samples, sampleRate, channels) => callback(samples, sampleRate, channels);
+    ipcRenderer.on('audio-process:chunk', listener);
+    return () => ipcRenderer.removeListener('audio-process:chunk', listener);
+  },
+  onProcessAudioError: (callback) => {
+    const listener = (event, message) => callback(message);
+    ipcRenderer.on('audio-process:error', listener);
+    return () => ipcRenderer.removeListener('audio-process:error', listener);
+  },
 });
