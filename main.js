@@ -62,6 +62,9 @@ function createWindow() {
     width: 1100,
     height: 720,
     autoHideMenuBar: true,
+    title: 'Sinal P2P',
+    icon: path.join(__dirname, 'assets', 'icon.png'),
+    backgroundColor: '#15161a',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,

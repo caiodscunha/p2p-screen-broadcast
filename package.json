@@ -1,5 +1,6 @@
 {
   "name": "transmissao-p2p",
+  "productName": "Sinal P2P",
   "version": "1.0.0",
   "description": "Transmissão de tela e áudio ponto-a-ponto (sem servidor)",
   "main": "main.js",

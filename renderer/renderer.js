@@ -2,12 +2,88 @@ const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
 
 // ---------- utilidades ----------
 
-function encode(obj) {
-  return btoa(unescape(encodeURIComponent(JSON.stringify(obj))));
+// O código de oferta/resposta carrega seus candidatos ICE (IP público, às
+// vezes IP local) em texto plano — base64 só torna isso seguro de colar, não
+// esconde nada. Com uma senha combinada por outro canal (voz, presencial),
+// o payload vira AES-GCM de verdade; sem senha, cai no formato antigo
+// (prefixo "P1."), só codificado. "E1." identifica um código criptografado
+// para que o lado que decodifica saiba se precisa pedir a senha.
+const PBKDF2_ITERATIONS = 100000;
+
+function bufToBase64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)));
 }
 
-function decode(str) {
-  return JSON.parse(decodeURIComponent(escape(atob(str.trim()))));
+function base64ToBytes(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function deriveKey(passphrase, salt, usage) {
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(passphrase),
+    'PBKDF2',
+    false,
+    ['deriveKey']
+  );
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    [usage]
+  );
+}
+
+async function encode(obj, passphrase) {
+  const json = JSON.stringify(obj);
+  if (!passphrase) {
+    return 'P1.' + btoa(unescape(encodeURIComponent(json)));
+  }
+
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(passphrase, salt, 'encrypt');
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(json));
+
+  const combined = new Uint8Array(salt.length + iv.length + ciphertext.byteLength);
+  combined.set(salt, 0);
+  combined.set(iv, salt.length);
+  combined.set(new Uint8Array(ciphertext), salt.length + iv.length);
+  return 'E1.' + bufToBase64(combined.buffer);
+}
+
+async function decode(str, passphrase) {
+  const trimmed = str.trim();
+  const prefix = trimmed.slice(0, 3);
+  const payload = trimmed.slice(3);
+
+  if (prefix === 'P1.') {
+    return JSON.parse(decodeURIComponent(escape(atob(payload))));
+  }
+
+  if (prefix === 'E1.') {
+    if (!passphrase) {
+      throw new Error('Este código é protegido por senha. Informe a senha combinada.');
+    }
+    const combined = base64ToBytes(payload);
+    const salt = combined.slice(0, 16);
+    const iv = combined.slice(16, 28);
+    const ciphertext = combined.slice(28);
+    const key = await deriveKey(passphrase, salt, 'decrypt');
+    try {
+      const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+      return JSON.parse(new TextDecoder().decode(plainBuf));
+    } catch (err) {
+      throw new Error('Senha incorreta ou código inválido.');
+    }
+  }
+
+  // formato legado (sem prefixo), gerado por versões anteriores do app
+  return JSON.parse(decodeURIComponent(escape(atob(trimmed))));
 }
 
 // Espera o ICE gathering terminar, mas com um teto de tempo: se o STUN
@@ -129,6 +205,9 @@ const answerCodeInput = document.getElementById('answer-code-input');
 const pasteAnswerBtn = document.getElementById('paste-answer');
 const connectAnswerBtn = document.getElementById('connect-answer');
 const viewerListEl = document.getElementById('viewer-list');
+const broadcastPassphraseInput = document.getElementById('broadcast-passphrase');
+const liveBadge = document.getElementById('live-badge');
+const liveBadgeText = document.getElementById('live-badge-text');
 
 btnStartCapture.addEventListener('click', async () => {
   try {
@@ -161,6 +240,7 @@ btnStartCapture.addEventListener('click', async () => {
   btnPauseCapture.disabled = false;
   btnStopCapture.disabled = false;
   btnNewViewer.disabled = false;
+  liveBadge.hidden = false;
   setPaused(false);
   window.api.notifyCaptureStarted();
 
@@ -189,6 +269,8 @@ function setPaused(paused) {
     });
   }
   btnPauseCapture.textContent = paused ? 'Retomar compartilhamento' : 'Pausar compartilhamento';
+  liveBadge.classList.toggle('is-paused', paused);
+  liveBadgeText.textContent = paused ? 'PAUSADO' : 'AO VIVO';
 }
 
 btnStopCapture.addEventListener('click', stopCapture);
@@ -208,6 +290,7 @@ function stopCapture() {
   btnNewViewer.disabled = true;
   offerBlock.hidden = true;
   answerInputBlock.hidden = true;
+  liveBadge.hidden = true;
   setPaused(false);
 }
 
@@ -233,7 +316,7 @@ btnNewViewer.addEventListener('click', async () => {
     }
   });
 
-  const viewer = { id, pc, status: 'connecting' };
+  const viewer = { id, pc, status: 'connecting', name: null };
   viewers.push(viewer);
   renderViewerList();
 
@@ -247,7 +330,7 @@ btnNewViewer.addEventListener('click', async () => {
   await waitIceGatheringComplete(pc);
 
   pendingViewerId = id;
-  offerCodeEl.value = encode(pc.localDescription.toJSON());
+  offerCodeEl.value = await encode(pc.localDescription.toJSON(), broadcastPassphraseInput.value.trim());
   offerBlock.hidden = false;
   answerInputBlock.hidden = false;
   answerCodeInput.value = '';
@@ -268,7 +351,13 @@ connectAnswerBtn.addEventListener('click', async () => {
     return;
   }
   try {
-    const answer = decode(answerCodeInput.value);
+    const decoded = await decode(answerCodeInput.value, broadcastPassphraseInput.value.trim());
+    // O nome do espectador vem embutido no código de resposta (não há canal
+    // de sinalização contínuo para mandar isso separado). Formato antigo
+    // (só a descrição, sem "sdp"/"name") continua funcionando como fallback.
+    const answer = decoded && decoded.sdp ? decoded.sdp : decoded;
+    const name = decoded && decoded.name ? String(decoded.name).trim().slice(0, 60) : '';
+    if (name) viewer.name = name;
     await viewer.pc.setRemoteDescription(answer);
   } catch (err) {
     alert('Código de resposta inválido: ' + err.message);
@@ -277,6 +366,7 @@ connectAnswerBtn.addEventListener('click', async () => {
   offerBlock.hidden = true;
   answerInputBlock.hidden = true;
   pendingViewerId = null;
+  renderViewerList();
 });
 
 function renderViewerList() {
@@ -299,22 +389,38 @@ function renderViewerList() {
 
   viewers.forEach((v) => {
     const li = document.createElement('li');
-    const dot = document.createElement('span');
-    dot.className =
-      'status-dot ' +
-      (v.status === 'connected'
+    const displayName = v.name || `Espectador #${v.id}`;
+    const statusClass =
+      v.status === 'connected'
         ? 'status-connected'
         : v.status === 'failed' || v.status === 'disconnected'
         ? 'status-failed'
-        : 'status-connecting');
-    const label = document.createElement('span');
-    label.textContent = `Espectador #${v.id} — ${statusLabel[v.status] || v.status}`;
+        : 'status-connecting';
+
+    const avatar = document.createElement('span');
+    avatar.className = 'viewer-avatar';
+    avatar.textContent = displayName.trim().charAt(0).toUpperCase() || '?';
+
+    const name = document.createElement('span');
+    name.className = 'viewer-name';
+    name.textContent = displayName;
+
+    const pill = document.createElement('span');
+    pill.className = 'status-pill ' + statusClass;
+    pill.textContent = statusLabel[v.status] || v.status;
+
+    const meta = document.createElement('span');
+    meta.className = 'viewer-meta';
+    meta.appendChild(name);
+    meta.appendChild(pill);
 
     const left = document.createElement('span');
-    left.appendChild(dot);
-    left.appendChild(label);
+    left.className = 'viewer-row-left';
+    left.appendChild(avatar);
+    left.appendChild(meta);
 
     const removeBtn = document.createElement('button');
+    removeBtn.className = 'btn btn-danger-ghost';
     removeBtn.textContent = 'Remover';
     removeBtn.addEventListener('click', () => {
       v.pc.close();
@@ -367,6 +473,8 @@ const copyAnswerBtn = document.getElementById('copy-answer');
 const watchStatus = document.getElementById('watch-status');
 const remoteVideo = document.getElementById('remote-video');
 const btnDisconnect = document.getElementById('btn-disconnect');
+const watchPassphraseInput = document.getElementById('watch-passphrase');
+const viewerNameInput = document.getElementById('viewer-name-input');
 
 pasteOfferBtn.addEventListener('click', () => {
   offerCodeInput.value = window.api.readClipboard();
@@ -375,7 +483,7 @@ pasteOfferBtn.addEventListener('click', () => {
 btnGenerateAnswer.addEventListener('click', async () => {
   let offer;
   try {
-    offer = decode(offerCodeInput.value);
+    offer = await decode(offerCodeInput.value, watchPassphraseInput.value.trim());
   } catch (err) {
     alert('Código do transmissor inválido: ' + err.message);
     return;
@@ -401,7 +509,11 @@ btnGenerateAnswer.addEventListener('click', async () => {
   await viewerPc.setLocalDescription(answer);
   await waitIceGatheringComplete(viewerPc);
 
-  answerCodeEl.value = encode(viewerPc.localDescription.toJSON());
+  const payload = {
+    sdp: viewerPc.localDescription.toJSON(),
+    name: viewerNameInput.value.trim().slice(0, 60),
+  };
+  answerCodeEl.value = await encode(payload, watchPassphraseInput.value.trim());
   answerBlock.hidden = false;
   watchStatus.textContent = 'Envie o código de resposta ao transmissor...';
 });
