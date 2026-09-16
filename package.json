@@ -1,0 +1,13 @@
+{
+  "name": "transmissao-p2p",
+  "version": "1.0.0",
+  "description": "Transmissão de tela e áudio ponto-a-ponto (sem servidor)",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^32.0.0"
+  }
+}
