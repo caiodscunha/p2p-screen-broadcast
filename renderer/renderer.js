@@ -310,7 +310,7 @@ btnNewViewer.addEventListener('click', async () => {
     }
   });
 
-  const viewer = { id, pc, status: 'connecting' };
+  const viewer = { id, pc, status: 'connecting', name: null };
   viewers.push(viewer);
   renderViewerList();
 
@@ -345,7 +345,13 @@ connectAnswerBtn.addEventListener('click', async () => {
     return;
   }
   try {
-    const answer = await decode(answerCodeInput.value, broadcastPassphraseInput.value.trim());
+    const decoded = await decode(answerCodeInput.value, broadcastPassphraseInput.value.trim());
+    // O nome do espectador vem embutido no código de resposta (não há canal
+    // de sinalização contínuo para mandar isso separado). Formato antigo
+    // (só a descrição, sem "sdp"/"name") continua funcionando como fallback.
+    const answer = decoded && decoded.sdp ? decoded.sdp : decoded;
+    const name = decoded && decoded.name ? String(decoded.name).trim().slice(0, 60) : '';
+    if (name) viewer.name = name;
     await viewer.pc.setRemoteDescription(answer);
   } catch (err) {
     alert('Código de resposta inválido: ' + err.message);
@@ -354,6 +360,7 @@ connectAnswerBtn.addEventListener('click', async () => {
   offerBlock.hidden = true;
   answerInputBlock.hidden = true;
   pendingViewerId = null;
+  renderViewerList();
 });
 
 function renderViewerList() {
@@ -385,7 +392,8 @@ function renderViewerList() {
         ? 'status-failed'
         : 'status-connecting');
     const label = document.createElement('span');
-    label.textContent = `Espectador #${v.id} — ${statusLabel[v.status] || v.status}`;
+    const displayName = v.name || `Espectador #${v.id}`;
+    label.textContent = `${displayName} — ${statusLabel[v.status] || v.status}`;
 
     const left = document.createElement('span');
     left.appendChild(dot);
@@ -445,6 +453,7 @@ const watchStatus = document.getElementById('watch-status');
 const remoteVideo = document.getElementById('remote-video');
 const btnDisconnect = document.getElementById('btn-disconnect');
 const watchPassphraseInput = document.getElementById('watch-passphrase');
+const viewerNameInput = document.getElementById('viewer-name-input');
 
 pasteOfferBtn.addEventListener('click', () => {
   offerCodeInput.value = window.api.readClipboard();
@@ -479,7 +488,11 @@ btnGenerateAnswer.addEventListener('click', async () => {
   await viewerPc.setLocalDescription(answer);
   await waitIceGatheringComplete(viewerPc);
 
-  answerCodeEl.value = await encode(viewerPc.localDescription.toJSON(), watchPassphraseInput.value.trim());
+  const payload = {
+    sdp: viewerPc.localDescription.toJSON(),
+    name: viewerNameInput.value.trim().slice(0, 60),
+  };
+  answerCodeEl.value = await encode(payload, watchPassphraseInput.value.trim());
   answerBlock.hidden = false;
   watchStatus.textContent = 'Envie o código de resposta ao transmissor...';
 });
