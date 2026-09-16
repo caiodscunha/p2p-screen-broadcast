@@ -230,7 +230,13 @@ audioSourceSelect.addEventListener('change', () => {
   const isProcessMode = audioSourceSelect.value === PROCESS_VALUE;
   processAudioBlock.hidden = !isProcessMode;
   if (isProcessMode) refreshAudioProcesses();
+  switchAudioSource();
 });
+
+// Se já está transmitindo e o usuário troca de app/modo dentro de "Processo
+// específico", aplica a troca imediatamente, sem esperar um novo clique.
+processAudioMode.addEventListener('change', () => switchAudioSource());
+processAudioSelect.addEventListener('change', () => switchAudioSource());
 
 async function refreshAudioProcesses() {
   const processes = await window.api.listAudioProcesses();
@@ -289,6 +295,98 @@ const liveBadgeText = document.getElementById('live-badge-text');
 // track normal, já que envolve um AudioContext + sessão nativa próprios.
 let processAudioState = null;
 
+// Guardadas à parte pra trocar de fonte de áudio em pleno andamento (ver
+// switchAudioSource) sem precisar recapturar nada:
+// - loopbackAudioTrack: só existe se "Áudio do sistema" foi a escolha ao dar
+//   play — vem embutida na mesma chamada de getDisplayMedia que pegou o
+//   vídeo, então não tem como buscar uma nova sem reabrir o seletor de tela.
+//   Por isso ela é preservada (nunca stopada) enquanto durar a transmissão,
+//   pra poder ser reaproveitada se o usuário voltar pra essa opção depois.
+// - silentAudioTrack: track de áudio silenciosa (Web Audio), criada sob
+//   demanda, usada quando a escolha é "Nenhum áudio" — garante que sempre
+//   exista uma track de áudio no localStream (mesmo que muda) desde o
+//   início, então trocar de fonte depois sempre pode usar
+//   RTCRtpSender.replaceTrack() em vez de precisar renegociar a conexão.
+let loopbackAudioTrack = null;
+let silentAudioTrack = null;
+
+function getOrCreateSilentAudioTrack() {
+  if (silentAudioTrack && silentAudioTrack.readyState === 'live') return silentAudioTrack;
+  const ctx = new AudioContext();
+  const destination = ctx.createMediaStreamDestination();
+  silentAudioTrack = destination.stream.getAudioTracks()[0];
+  return silentAudioTrack;
+}
+
+// Resolve a track de áudio correspondente ao que está selecionado agora na
+// UI. Usada tanto ao iniciar quanto ao trocar de fonte em andamento.
+async function acquireAudioTrack() {
+  const selected = audioSourceSelect.value;
+
+  if (selected === LOOPBACK_VALUE) {
+    if (!loopbackAudioTrack) {
+      throw new Error(
+        '"Áudio do sistema" só pode ser escolhido ao iniciar a captura (exigiria reabrir o seletor de tela).'
+      );
+    }
+    return loopbackAudioTrack;
+  }
+
+  if (selected === PROCESS_VALUE) {
+    const pid = Number(processAudioSelect.value);
+    if (!pid) throw new Error('Escolha um app na lista de "Processo específico".');
+    const exclude = processAudioMode.value === 'exclude';
+    return startProcessAudioTrack(pid, exclude);
+  }
+
+  if (selected) {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: selected } } });
+    return stream.getAudioTracks()[0];
+  }
+
+  return getOrCreateSilentAudioTrack();
+}
+
+// Troca a fonte de áudio com a transmissão já rolando: pega a nova track e
+// substitui via RTCRtpSender.replaceTrack() em cada espectador já conectado
+// — isso funciona sem precisar renegociar a conexão (nem gerar um novo
+// código), já que todo espectador já tem um sender de áudio desde a
+// primeira oferta (mesmo que inicialmente silencioso).
+async function switchAudioSource() {
+  if (!localStream) return; // nada rodando ainda; o botão "Iniciar" cuida disso
+
+  const previousProcessState = processAudioState;
+  processAudioState = null; // é recriado abaixo se a nova fonte for "processo"
+
+  let newTrack;
+  try {
+    newTrack = await acquireAudioTrack();
+  } catch (err) {
+    alert('Não foi possível trocar a fonte de áudio: ' + err.message);
+    processAudioState = previousProcessState; // mantém a sessão antiga rodando
+    return;
+  }
+
+  const previousTrack = localStream.getAudioTracks()[0];
+  if (previousTrack && previousTrack !== newTrack) {
+    localStream.removeTrack(previousTrack);
+    // loopback e silêncio ficam guardados pra reaproveitar depois; qualquer
+    // outra track (dispositivo ou processo) pode ser parada de vez.
+    if (previousTrack !== loopbackAudioTrack && previousTrack !== silentAudioTrack) {
+      previousTrack.stop();
+    }
+  }
+  if (!localStream.getAudioTracks().includes(newTrack)) {
+    localStream.addTrack(newTrack);
+  }
+
+  viewers.forEach((v) => {
+    if (v.audioSender) v.audioSender.replaceTrack(newTrack).catch(() => {});
+  });
+
+  if (previousProcessState) previousProcessState.cleanup();
+}
+
 async function startProcessAudioTrack(pid, exclude) {
   const audioCtx = new AudioContext({ sampleRate: 48000 });
   await audioCtx.audioWorklet.addModule('pcm-injector-worklet.js');
@@ -325,7 +423,6 @@ async function startProcessAudioTrack(pid, exclude) {
 btnStartCapture.addEventListener('click', async () => {
   const selectedAudio = audioSourceSelect.value;
   const useLoopback = selectedAudio === LOOPBACK_VALUE;
-  const useProcessAudio = selectedAudio === PROCESS_VALUE;
 
   try {
     localStream = await navigator.mediaDevices.getDisplayMedia({
@@ -341,22 +438,22 @@ btnStartCapture.addEventListener('click', async () => {
       audio: useLoopback,
     });
 
-    if (useProcessAudio) {
-      const pid = Number(processAudioSelect.value);
-      const exclude = processAudioMode.value === 'exclude';
-      if (!pid) {
-        throw new Error('Escolha um app na lista de "Processo específico".');
+    if (useLoopback) {
+      // Guardada pra poder ser reaproveitada se o usuário trocar de fonte e
+      // depois voltar pra "Áudio do sistema" (ver switchAudioSource).
+      loopbackAudioTrack = localStream.getAudioTracks()[0] || null;
+      // Se o usuário desmarcou "compartilhar áudio do sistema" no seletor
+      // nativo, nenhuma track de áudio volta — cai pra silenciosa, mantendo
+      // a garantia de que sempre existe uma track de áudio no localStream.
+      if (!loopbackAudioTrack) {
+        localStream.addTrack(getOrCreateSilentAudioTrack());
       }
-      const track = await startProcessAudioTrack(pid, exclude);
+    } else {
+      // Sempre garante uma track de áudio desde o início (real ou
+      // silenciosa) — assim todo espectador já nasce com um sender de
+      // áudio, e trocar de fonte depois nunca precisa renegociar.
+      const track = await acquireAudioTrack();
       localStream.addTrack(track);
-    } else if (selectedAudio && !useLoopback) {
-      // Dispositivo de entrada específico escolhido (mic real, "Stereo Mix",
-      // um cabo de áudio virtual, ou o "monitor" do PulseAudio/PipeWire no
-      // Linux) em vez do loopback completo do sistema.
-      const audioStream = await navigator.mediaDevices.getUserMedia({
-        audio: { deviceId: { exact: selectedAudio } },
-      });
-      audioStream.getAudioTracks().forEach((track) => localStream.addTrack(track));
     }
   } catch (err) {
     alert('Não foi possível capturar a tela: ' + err.message);
@@ -411,6 +508,17 @@ function stopCapture() {
     processAudioState.cleanup();
     processAudioState = null;
   }
+  // loopbackAudioTrack/silentAudioTrack podem ter sido trocadas pra fora do
+  // localStream (mas mantidas vivas de propósito pra reaproveitar depois —
+  // ver switchAudioSource); aqui a transmissão acabou de vez, então param.
+  if (loopbackAudioTrack) {
+    loopbackAudioTrack.stop();
+    loopbackAudioTrack = null;
+  }
+  if (silentAudioTrack) {
+    silentAudioTrack.stop();
+    silentAudioTrack = null;
+  }
   preview.srcObject = null;
   viewers.forEach((v) => v.pc.close());
   viewers = [];
@@ -433,10 +541,12 @@ btnNewViewer.addEventListener('click', async () => {
   viewerCounter += 1;
   const id = viewerCounter;
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  const viewer = { id, pc, status: 'connecting', name: null, videoSender: null, audioSender: null };
 
   localStream.getTracks().forEach((track) => {
     const sender = pc.addTrack(track, localStream);
     if (track.kind === 'video') {
+      viewer.videoSender = sender;
       // Teto de 8 Mbps por espectador. É um máximo, não um valor fixo: o
       // WebRTC ainda estima a banda real disponível e usa menos se precisar
       // — isso só evita que ele tente mandar mais do que 8 Mbps para cada
@@ -444,10 +554,13 @@ btnNewViewer.addEventListener('click', async () => {
       const params = sender.getParameters();
       params.encodings = [{ maxBitrate: 8_000_000, maxFramerate: 60 }];
       sender.setParameters(params).catch(() => {});
+    } else if (track.kind === 'audio') {
+      // Guardado pra permitir trocar a fonte de áudio em pleno andamento
+      // (ver switchAudioSource) via replaceTrack(), sem renegociar.
+      viewer.audioSender = sender;
     }
   });
 
-  const viewer = { id, pc, status: 'connecting', name: null };
   viewers.push(viewer);
   renderViewerList();
 
