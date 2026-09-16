@@ -289,6 +289,106 @@ const viewerListEl = document.getElementById('viewer-list');
 const broadcastPassphraseInput = document.getElementById('broadcast-passphrase');
 const liveBadge = document.getElementById('live-badge');
 const liveBadgeText = document.getElementById('live-badge-text');
+const monitorSelect = document.getElementById('monitor-select');
+const btnRefreshMonitors = document.getElementById('btn-refresh-monitors');
+const monitorThumbnail = document.getElementById('monitor-thumbnail');
+
+// Lista as telas via desktopCapturer (com miniatura) em vez de depender do
+// seletor nativo do SO — assim dá pra trocar de monitor com a transmissão
+// já em andamento (replaceTrack, sem reconectar ninguém), e funciona igual
+// em Windows/macOS/Linux.
+let screensCache = [];
+
+async function refreshMonitors() {
+  screensCache = await window.api.listScreens();
+  const previousValue = monitorSelect.value;
+  monitorSelect.innerHTML = '';
+
+  screensCache.forEach((screen) => {
+    const opt = document.createElement('option');
+    opt.value = screen.id;
+    opt.textContent = screen.name || screen.id;
+    monitorSelect.appendChild(opt);
+  });
+
+  if (screensCache.some((s) => s.id === previousValue)) {
+    monitorSelect.value = previousValue;
+  }
+  updateMonitorThumbnail();
+}
+
+function updateMonitorThumbnail() {
+  const screen = screensCache.find((s) => s.id === monitorSelect.value);
+  if (screen && screen.thumbnail) {
+    monitorThumbnail.src = screen.thumbnail;
+    monitorThumbnail.hidden = false;
+  } else {
+    monitorThumbnail.hidden = true;
+  }
+}
+
+btnRefreshMonitors.addEventListener('click', refreshMonitors);
+refreshMonitors();
+
+async function acquireVideoTrackForScreen(sourceId) {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: {
+      mandatory: {
+        chromeMediaSource: 'desktop',
+        chromeMediaSourceId: sourceId,
+        maxWidth: 1920,
+        maxHeight: 1080,
+        maxFrameRate: 60,
+      },
+    },
+  });
+  return stream.getVideoTracks()[0];
+}
+
+// Troca de monitor com a transmissão já rolando, sem recapturar áudio nem
+// reconectar espectadores — mesma técnica do switchAudioSource, mas pro
+// sender de vídeo. Não usada pela primeira captura (que ainda passa pelo
+// seletor nativo do SO quando disponível); só entra em ação numa troca
+// depois de já estar transmitindo.
+async function switchMonitor() {
+  updateMonitorThumbnail();
+  if (!localStream) return;
+
+  const sourceId = monitorSelect.value;
+  if (!sourceId) return;
+
+  let newTrack;
+  try {
+    newTrack = await acquireVideoTrackForScreen(sourceId);
+  } catch (err) {
+    alert('Não foi possível trocar de monitor: ' + err.message);
+    return;
+  }
+
+  // Mantém o mesmo teto de bitrate/framerate usado ao conectar cada
+  // espectador (ver btnNewViewer), já que replaceTrack não herda isso.
+  newTrack.contentHint = 'detail';
+
+  const oldTrack = localStream.getVideoTracks()[0];
+  if (oldTrack) {
+    localStream.removeTrack(oldTrack);
+    oldTrack.stop();
+  }
+  localStream.addTrack(newTrack);
+
+  viewers.forEach((v) => {
+    if (!v.videoSender) return;
+    v.videoSender.replaceTrack(newTrack).catch(() => {});
+    const params = v.videoSender.getParameters();
+    params.encodings = [{ maxBitrate: 8_000_000, maxFramerate: 60 }];
+    v.videoSender.setParameters(params).catch(() => {});
+  });
+
+  localStream.getVideoTracks()[0].addEventListener('ended', stopCapture);
+}
+
+monitorSelect.addEventListener('change', () => switchMonitor());
 
 // Estado da captura de áudio por processo em andamento (null quando não
 // está em uso). Precisa ser desmontado em stopCapture() além de qualquer
@@ -465,6 +565,7 @@ btnStartCapture.addEventListener('click', async () => {
   btnPauseCapture.disabled = false;
   btnStopCapture.disabled = false;
   btnNewViewer.disabled = false;
+  monitorSelect.disabled = false;
   liveBadge.hidden = false;
   setPaused(false);
 
@@ -527,6 +628,7 @@ function stopCapture() {
   btnPauseCapture.disabled = true;
   btnStopCapture.disabled = true;
   btnNewViewer.disabled = true;
+  monitorSelect.disabled = true;
   offerBlock.hidden = true;
   answerInputBlock.hidden = true;
   liveBadge.hidden = true;
