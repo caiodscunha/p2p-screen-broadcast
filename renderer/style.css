@@ -318,4 +318,7 @@ textarea {
 .status-pill.status-connecting { color: var(--warning); background: var(--warning-soft); }
 .status-pill.status-failed { color: var(--accent-strong); background: var(--accent-soft); }
 
+.viewer-stats { font-size: 11px; color: var(--text-faint); margin-top: 2px; }
+.viewer-stats.viewer-stats-limited { color: var(--warning); }
+
 .viewer-list .btn { padding: 5px 12px; font-size: 12px; }
