@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, ipcMain, clipboard } = require('electron');
+const { app, BrowserWindow, session, ipcMain, clipboard, desktopCapturer } = require('electron');
 const path = require('path');
 const { registerDisplayMediaHandler, supportsSystemAudioLoopback } = require('./capture');
 const processAudio = require('./native/audio-loopback');
@@ -47,6 +47,22 @@ ipcMain.handle('audio-process:start', (event, { pid, exclude }) => {
 ipcMain.handle('audio-process:stop', (event, handle) => {
   processAudio.stopCapture(handle);
   activeProcessAudioCaptures.get(event.sender.id)?.delete(handle);
+});
+
+// Lista as telas disponíveis (com miniatura) pra deixar o usuário escolher
+// qual monitor compartilhar — inclusive pra trocar de monitor com a
+// transmissão já rolando, sem depender do seletor nativo do SO (que só
+// aparece no início, e nem existe no Linux).
+ipcMain.handle('capture:listScreens', async () => {
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: { width: 320, height: 180 },
+  });
+  return sources.map((s) => ({
+    id: s.id,
+    name: s.name,
+    thumbnail: s.thumbnail.isEmpty() ? null : s.thumbnail.toDataURL(),
+  }));
 });
 
 function createWindow() {

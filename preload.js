@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld('api', {
   copyToClipboard: (text) => ipcRenderer.invoke('clipboard:write', text),
   readClipboard: () => ipcRenderer.invoke('clipboard:read'),
   supportsSystemAudio: () => ipcRenderer.invoke('capture:supportsSystemAudio'),
+  listScreens: () => ipcRenderer.invoke('capture:listScreens'),
 
   // Captura de áudio por processo (só Windows) — deixa incluir só um app
   // específico, ou excluir um app específico do resto.

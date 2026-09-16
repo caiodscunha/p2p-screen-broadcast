@@ -31,6 +31,16 @@
             <button id="btn-pause-capture" class="btn btn-ghost" disabled>Pausar compartilhamento</button>
             <button id="btn-stop-capture" class="btn btn-danger-ghost" disabled>Parar transmissão</button>
           </div>
+          <div class="field-block">
+            <label for="monitor-select">Monitor a compartilhar</label>
+            <p class="hint">Pode ser trocado a qualquer momento, mesmo com a
+              transmissão já rolando — ninguém precisa reconectar.</p>
+            <div class="btn-row">
+              <select id="monitor-select" disabled></select>
+              <button id="btn-refresh-monitors" type="button" class="btn btn-ghost">Atualizar lista</button>
+            </div>
+            <img id="monitor-thumbnail" alt="" hidden />
+          </div>
           <p id="audio-hint" class="hint" hidden>Este sistema operacional não
             tem suporte à captura automática do áudio do sistema; apenas o
             vídeo será compartilhado, a menos que você selecione uma fonte de
