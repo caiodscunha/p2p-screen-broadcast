@@ -51,6 +51,20 @@ The only external service involved is a public Google STUN server
 public IP/port for NAT traversal. No STUN/TURN server ever sees your
 video, audio, or any application data.
 
+### Code encryption (optional)
+
+The offer/answer code is base64, not encryption — anyone who gets a copy of
+it (not just the intended recipient) can attempt to use it, since it embeds
+your ICE candidates (IP/port) in plain text. Both the broadcast and watch
+screens have an optional passphrase field: if set, the code is encrypted
+with AES-GCM (key derived via PBKDF2, Web Crypto API, no dependencies)
+before being base64-encoded, and the same passphrase is required to decode
+it on the other end. This only adds real protection if the passphrase is
+agreed through a different channel than the one used to send the code
+(e.g. code over chat, passphrase said out loud on a call) — if both travel
+together over the same compromised channel, encryption doesn't help.
+Leaving the passphrase blank keeps the previous plain behavior.
+
 ## Tech stack
 
 - **Electron**: desktop shell, native screen/window picker, system-audio

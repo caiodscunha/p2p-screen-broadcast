@@ -81,7 +81,8 @@ textarea {
 .code-block { margin-top: 14px; }
 .code-block label { display: block; margin-bottom: 6px; font-size: 13px; color: #ccc; }
 
-select {
+select,
+input[type='text'] {
   background: #2b2d34;
   color: #eaeaea;
   border: 1px solid #444;
@@ -90,6 +91,10 @@ select {
   font-size: 13px;
   margin: 4px 6px 4px 0;
   max-width: 100%;
+}
+
+input[type='text'] {
+  width: 100%;
 }
 
 .viewer-list { list-style: none; padding: 0; margin: 8px 0 0; }

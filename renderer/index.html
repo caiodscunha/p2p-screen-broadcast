@@ -41,6 +41,11 @@
         <h2>2. Adicionar espectador</h2>
         <p class="hint">Cada espectador precisa de um código próprio. Gere um código, envie
           para a pessoa (WhatsApp, chat, etc.), e cole de volta o código de resposta que ela te mandar.</p>
+        <div class="code-block">
+          <label for="broadcast-passphrase">Senha para proteger o código (opcional):</label>
+          <input type="text" id="broadcast-passphrase"
+            placeholder="Combine por outro canal (voz, presencial); deixe em branco para não usar" />
+        </div>
         <button id="btn-new-viewer" disabled>Gerar código para novo espectador</button>
 
         <div class="code-block" id="offer-block" hidden>
@@ -69,6 +74,10 @@
         <h2>1. Colar código do transmissor</h2>
         <textarea id="offer-code-input" placeholder="Cole aqui o código enviado pelo transmissor..."></textarea>
         <button id="paste-offer">Colar do clipboard</button>
+        <div class="code-block">
+          <label for="watch-passphrase">Senha combinada com quem transmite (se houver):</label>
+          <input type="text" id="watch-passphrase" placeholder="Deixe em branco se não houver senha" />
+        </div>
         <button id="btn-generate-answer">Gerar código de resposta</button>
 
         <div class="code-block" id="answer-block" hidden>
