@@ -686,8 +686,8 @@ copyOfferBtn.addEventListener('click', () => {
   window.api.copyToClipboard(offerCodeEl.value);
 });
 
-pasteAnswerBtn.addEventListener('click', () => {
-  answerCodeInput.value = window.api.readClipboard();
+pasteAnswerBtn.addEventListener('click', async () => {
+  answerCodeInput.value = await window.api.readClipboard();
 });
 
 connectAnswerBtn.addEventListener('click', async () => {
@@ -714,6 +714,37 @@ connectAnswerBtn.addEventListener('click', async () => {
   pendingViewerId = null;
   renderViewerList();
 });
+
+// Diagnóstico visível na própria UI (sem precisar de DevTools, que fica
+// desligado nos executáveis empacotados): mostra o bitrate/fps reais de
+// cada espectador e, quando o WebRTC está segurando a qualidade, por quê
+// ("banda" = faltou upload disponível; "cpu" = o encoder não deu conta).
+// Serve pra confirmar se o atraso que aumenta por ordem de entrada é
+// mesmo falta de banda, e não outra coisa.
+const limitationLabel = { cpu: 'CPU', bandwidth: 'banda', other: 'outro' };
+
+setInterval(async () => {
+  let changed = false;
+  for (const v of viewers) {
+    if (!v.videoSender || v.pc.connectionState !== 'connected') continue;
+    const stats = await v.pc.getStats();
+    stats.forEach((report) => {
+      if (report.type !== 'outbound-rtp' || report.kind !== 'video') return;
+      if (v.lastStatsSample) {
+        const dtSeconds = (report.timestamp - v.lastStatsSample.timestamp) / 1000;
+        const dBytes = report.bytesSent - v.lastStatsSample.bytesSent;
+        if (dtSeconds > 0) v.bitrateKbps = Math.round((dBytes * 8) / dtSeconds / 1000);
+      }
+      v.lastStatsSample = { timestamp: report.timestamp, bytesSent: report.bytesSent };
+      v.fps = report.framesPerSecond ?? null;
+      v.limitation = report.qualityLimitationReason && report.qualityLimitationReason !== 'none'
+        ? report.qualityLimitationReason
+        : null;
+      changed = true;
+    });
+  }
+  if (changed) renderViewerList();
+}, 2000);
 
 function renderViewerList() {
   viewerListEl.innerHTML = '';
@@ -760,6 +791,16 @@ function renderViewerList() {
     meta.appendChild(name);
     meta.appendChild(pill);
 
+    if (v.status === 'connected' && v.bitrateKbps != null) {
+      const statsEl = document.createElement('span');
+      const limitLabel = limitationLabel[v.limitation];
+      statsEl.className = 'viewer-stats' + (limitLabel ? ' viewer-stats-limited' : '');
+      statsEl.textContent =
+        `${(v.bitrateKbps / 1000).toFixed(1)} Mbps · ${v.fps ?? '?'} fps` +
+        (limitLabel ? ` · limitado por ${limitLabel}` : '');
+      meta.appendChild(statsEl);
+    }
+
     const left = document.createElement('span');
     left.className = 'viewer-row-left';
     left.appendChild(avatar);
@@ -800,8 +841,8 @@ const btnDisconnect = document.getElementById('btn-disconnect');
 const watchPassphraseInput = document.getElementById('watch-passphrase');
 const viewerNameInput = document.getElementById('viewer-name-input');
 
-pasteOfferBtn.addEventListener('click', () => {
-  offerCodeInput.value = window.api.readClipboard();
+pasteOfferBtn.addEventListener('click', async () => {
+  offerCodeInput.value = await window.api.readClipboard();
 });
 
 btnGenerateAnswer.addEventListener('click', async () => {
