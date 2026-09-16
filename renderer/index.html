@@ -2,12 +2,18 @@
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8" />
-  <title>Transmissão P2P</title>
+  <title>Sinal P2P</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header>
-    <h1>Transmissão P2P</h1>
+    <div class="brand">
+      <img class="brand-mark" src="../assets/icon.png" alt="" width="32" height="32" />
+      <div class="brand-text">
+        <h1>Sinal P2P</h1>
+        <p class="brand-tagline">Transmissão de tela ponto-a-ponto &middot; sem servidor</p>
+      </div>
+    </div>
     <nav class="tabs">
       <button id="tab-transmitir" class="tab active">Transmitir</button>
       <button id="tab-assistir" class="tab">Assistir</button>
@@ -18,51 +24,64 @@
   <section id="view-transmitir" class="view active">
     <div class="row">
       <div class="col">
-        <h2>1. Capturar a tela</h2>
-        <button id="btn-start-capture">Iniciar captura de tela</button>
-        <button id="btn-pause-capture" disabled>Pausar compartilhamento</button>
-        <button id="btn-stop-capture" disabled>Parar transmissão</button>
-        <p id="audio-hint" class="hint" hidden>Este sistema operacional não
-          tem suporte à captura automática do áudio do sistema; apenas o
-          vídeo será compartilhado, a menos que você selecione uma fonte de
-          áudio abaixo.</p>
-        <div class="code-block" id="linux-audio-block" hidden>
-          <label for="audio-source-select">Fonte de áudio do sistema (opcional,
-            via PulseAudio/PipeWire, geralmente algo como "Monitor of ..."):</label>
-          <select id="audio-source-select">
-            <option value="">Sem áudio do sistema</option>
-          </select>
-          <button id="btn-refresh-audio-sources" type="button">Atualizar lista</button>
+        <div class="card">
+          <h2><span class="step-badge">1</span>Capturar a tela</h2>
+          <div class="btn-row">
+            <button id="btn-start-capture" class="btn btn-primary">Iniciar captura de tela</button>
+            <button id="btn-pause-capture" class="btn btn-ghost" disabled>Pausar compartilhamento</button>
+            <button id="btn-stop-capture" class="btn btn-danger-ghost" disabled>Parar transmissão</button>
+          </div>
+          <p id="audio-hint" class="hint" hidden>Este sistema operacional não
+            tem suporte à captura automática do áudio do sistema; apenas o
+            vídeo será compartilhado, a menos que você selecione uma fonte de
+            áudio abaixo.</p>
+          <div class="field-block" id="linux-audio-block" hidden>
+            <label for="audio-source-select">Fonte de áudio do sistema (opcional,
+              via PulseAudio/PipeWire, geralmente algo como &quot;Monitor of ...&quot;):</label>
+            <div class="btn-row">
+              <select id="audio-source-select">
+                <option value="">Sem áudio do sistema</option>
+              </select>
+              <button id="btn-refresh-audio-sources" type="button" class="btn btn-ghost">Atualizar lista</button>
+            </div>
+          </div>
+          <div class="video-wrap">
+            <div class="live-badge" id="live-badge" hidden><span class="live-dot"></span><span id="live-badge-text">AO VIVO</span></div>
+            <video id="preview" autoplay muted playsinline></video>
+          </div>
         </div>
-        <video id="preview" autoplay muted playsinline></video>
       </div>
 
       <div class="col">
-        <h2>2. Adicionar espectador</h2>
-        <p class="hint">Cada espectador precisa de um código próprio. Gere um código, envie
-          para a pessoa (WhatsApp, chat, etc.), e cole de volta o código de resposta que ela te mandar.</p>
-        <div class="code-block">
-          <label for="broadcast-passphrase">Senha para proteger o código (opcional):</label>
-          <input type="text" id="broadcast-passphrase"
-            placeholder="Combine por outro canal (voz, presencial); deixe em branco para não usar" />
-        </div>
-        <button id="btn-new-viewer" disabled>Gerar código para novo espectador</button>
+        <div class="card">
+          <h2><span class="step-badge">2</span>Adicionar espectador</h2>
+          <p class="hint">Cada espectador precisa de um código próprio. Gere um código, envie
+            para a pessoa (WhatsApp, chat, etc.), e cole de volta o código de resposta que ela te mandar.</p>
+          <div class="field-block">
+            <label for="broadcast-passphrase">Senha para proteger o código (opcional)</label>
+            <input type="text" id="broadcast-passphrase"
+              placeholder="Combine por outro canal (voz, presencial); deixe em branco para não usar" />
+          </div>
+          <button id="btn-new-viewer" class="btn btn-primary" disabled>Gerar código para novo espectador</button>
 
-        <div class="code-block" id="offer-block" hidden>
-          <label>Código para enviar ao espectador (oferta):</label>
-          <textarea id="offer-code" readonly></textarea>
-          <button id="copy-offer">Copiar código</button>
-        </div>
+          <div class="field-block code-block" id="offer-block" hidden>
+            <label>Código para enviar ao espectador (oferta)</label>
+            <textarea id="offer-code" readonly></textarea>
+            <button id="copy-offer" class="btn btn-ghost">Copiar código</button>
+          </div>
 
-        <div class="code-block" id="answer-input-block" hidden>
-          <label>Cole aqui o código de resposta do espectador:</label>
-          <textarea id="answer-code-input" placeholder="Cole o código aqui..."></textarea>
-          <button id="paste-answer">Colar do clipboard</button>
-          <button id="connect-answer">Conectar espectador</button>
-        </div>
+          <div class="field-block code-block" id="answer-input-block" hidden>
+            <label>Cole aqui o código de resposta do espectador</label>
+            <textarea id="answer-code-input" placeholder="Cole o código aqui..."></textarea>
+            <div class="btn-row">
+              <button id="paste-answer" class="btn btn-ghost">Colar do clipboard</button>
+              <button id="connect-answer" class="btn btn-primary">Conectar espectador</button>
+            </div>
+          </div>
 
-        <h3>Espectadores</h3>
-        <ul id="viewer-list" class="viewer-list"></ul>
+          <h3>Espectadores</h3>
+          <ul id="viewer-list" class="viewer-list"></ul>
+        </div>
       </div>
     </div>
   </section>
@@ -71,31 +90,39 @@
   <section id="view-assistir" class="view">
     <div class="row">
       <div class="col">
-        <h2>1. Colar código do transmissor</h2>
-        <div class="code-block">
-          <label for="viewer-name-input">Seu nome (aparece para quem transmite):</label>
-          <input type="text" id="viewer-name-input" placeholder="Ex: Maria" maxlength="60" />
-        </div>
-        <textarea id="offer-code-input" placeholder="Cole aqui o código enviado pelo transmissor..."></textarea>
-        <button id="paste-offer">Colar do clipboard</button>
-        <div class="code-block">
-          <label for="watch-passphrase">Senha combinada com quem transmite (se houver):</label>
-          <input type="text" id="watch-passphrase" placeholder="Deixe em branco se não houver senha" />
-        </div>
-        <button id="btn-generate-answer">Gerar código de resposta</button>
+        <div class="card">
+          <h2><span class="step-badge">1</span>Colar código do transmissor</h2>
+          <div class="field-block">
+            <label for="viewer-name-input">Seu nome (aparece para quem transmite)</label>
+            <input type="text" id="viewer-name-input" placeholder="Ex: Maria" maxlength="60" />
+          </div>
+          <textarea id="offer-code-input" placeholder="Cole aqui o código enviado pelo transmissor..."></textarea>
+          <div class="btn-row">
+            <button id="paste-offer" class="btn btn-ghost">Colar do clipboard</button>
+          </div>
+          <div class="field-block">
+            <label for="watch-passphrase">Senha combinada com quem transmite (se houver)</label>
+            <input type="text" id="watch-passphrase" placeholder="Deixe em branco se não houver senha" />
+          </div>
+          <button id="btn-generate-answer" class="btn btn-primary">Gerar código de resposta</button>
 
-        <div class="code-block" id="answer-block" hidden>
-          <label>Código de resposta (envie de volta ao transmissor):</label>
-          <textarea id="answer-code" readonly></textarea>
-          <button id="copy-answer">Copiar código</button>
+          <div class="field-block code-block" id="answer-block" hidden>
+            <label>Código de resposta (envie de volta ao transmissor)</label>
+            <textarea id="answer-code" readonly></textarea>
+            <button id="copy-answer" class="btn btn-ghost">Copiar código</button>
+          </div>
         </div>
       </div>
 
       <div class="col">
-        <h2>2. Assistir</h2>
-        <p id="watch-status" class="hint">Aguardando conexão...</p>
-        <video id="remote-video" autoplay playsinline controls></video>
-        <button id="btn-disconnect" disabled>Desconectar</button>
+        <div class="card">
+          <h2><span class="step-badge">2</span>Assistir</h2>
+          <p id="watch-status" class="hint">Aguardando conexão...</p>
+          <div class="video-wrap">
+            <video id="remote-video" autoplay playsinline controls></video>
+          </div>
+          <button id="btn-disconnect" class="btn btn-danger-ghost" disabled>Desconectar</button>
+        </div>
       </div>
     </div>
   </section>

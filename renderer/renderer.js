@@ -206,6 +206,8 @@ const pasteAnswerBtn = document.getElementById('paste-answer');
 const connectAnswerBtn = document.getElementById('connect-answer');
 const viewerListEl = document.getElementById('viewer-list');
 const broadcastPassphraseInput = document.getElementById('broadcast-passphrase');
+const liveBadge = document.getElementById('live-badge');
+const liveBadgeText = document.getElementById('live-badge-text');
 
 btnStartCapture.addEventListener('click', async () => {
   try {
@@ -238,6 +240,7 @@ btnStartCapture.addEventListener('click', async () => {
   btnPauseCapture.disabled = false;
   btnStopCapture.disabled = false;
   btnNewViewer.disabled = false;
+  liveBadge.hidden = false;
   setPaused(false);
   window.api.notifyCaptureStarted();
 
@@ -266,6 +269,8 @@ function setPaused(paused) {
     });
   }
   btnPauseCapture.textContent = paused ? 'Retomar compartilhamento' : 'Pausar compartilhamento';
+  liveBadge.classList.toggle('is-paused', paused);
+  liveBadgeText.textContent = paused ? 'PAUSADO' : 'AO VIVO';
 }
 
 btnStopCapture.addEventListener('click', stopCapture);
@@ -285,6 +290,7 @@ function stopCapture() {
   btnNewViewer.disabled = true;
   offerBlock.hidden = true;
   answerInputBlock.hidden = true;
+  liveBadge.hidden = true;
   setPaused(false);
 }
 
@@ -383,23 +389,38 @@ function renderViewerList() {
 
   viewers.forEach((v) => {
     const li = document.createElement('li');
-    const dot = document.createElement('span');
-    dot.className =
-      'status-dot ' +
-      (v.status === 'connected'
+    const displayName = v.name || `Espectador #${v.id}`;
+    const statusClass =
+      v.status === 'connected'
         ? 'status-connected'
         : v.status === 'failed' || v.status === 'disconnected'
         ? 'status-failed'
-        : 'status-connecting');
-    const label = document.createElement('span');
-    const displayName = v.name || `Espectador #${v.id}`;
-    label.textContent = `${displayName} — ${statusLabel[v.status] || v.status}`;
+        : 'status-connecting';
+
+    const avatar = document.createElement('span');
+    avatar.className = 'viewer-avatar';
+    avatar.textContent = displayName.trim().charAt(0).toUpperCase() || '?';
+
+    const name = document.createElement('span');
+    name.className = 'viewer-name';
+    name.textContent = displayName;
+
+    const pill = document.createElement('span');
+    pill.className = 'status-pill ' + statusClass;
+    pill.textContent = statusLabel[v.status] || v.status;
+
+    const meta = document.createElement('span');
+    meta.className = 'viewer-meta';
+    meta.appendChild(name);
+    meta.appendChild(pill);
 
     const left = document.createElement('span');
-    left.appendChild(dot);
-    left.appendChild(label);
+    left.className = 'viewer-row-left';
+    left.appendChild(avatar);
+    left.appendChild(meta);
 
     const removeBtn = document.createElement('button');
+    removeBtn.className = 'btn btn-danger-ghost';
     removeBtn.textContent = 'Remover';
     removeBtn.addEventListener('click', () => {
       v.pc.close();
