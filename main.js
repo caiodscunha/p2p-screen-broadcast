@@ -161,6 +161,49 @@ async function ensureFirewallAccess() {
   });
 }
 
+// Minimizar a janela enquanto está compartilhando a tela trava o PC inteiro
+// nalgumas máquinas (não só o app) — reproduzido em mais de uma máquina.
+// Pesquisa aponta pra uma classe de bug conhecida e documentada (inclusive
+// pela própria Intel) de driver de GPU híbrida (Intel+dedicada, Optimus e
+// afins): MINIMIZAR é, no Win32, um evento de RESIZE da janela pro estado
+// iconificado — e redimensionar uma janela acelerada por GPU enquanto a
+// mesma GPU está sob carga pesada (aqui: captura de tela + codificação de
+// vídeo por hardware rodando ao mesmo tempo) é o gatilho documentado desse
+// tipo de travamento em laptops com GPU híbrida. Não tem como consertar o
+// driver da Intel/NVIDIA a partir daqui — mas dá pra evitar o gatilho: só
+// desabilita o próprio botão/atalho de minimizar da janela enquanto uma
+// transmissão estiver ativa (ver 'sharing:active' abaixo), o que remove a
+// ação perigosa em vez de tentar reagir depois que ela já travou tudo.
+// Não cobre 100% dos jeitos de minimizar no Windows (Win+D "Mostrar área de
+// trabalho" ainda minimiza todas as janelas de qualquer forma), mas cobre o
+// caminho mais comum (botão da barra de título, clique com botão direito na
+// barra de tarefas, Alt+Espaço).
+function getMinimizeWarningMarkerPath() {
+  return path.join(app.getPath('appData'), 'sinal-p2p', 'minimize-warning-shown.json');
+}
+
+async function maybeExplainMinimizeDisabled() {
+  const markerPath = getMinimizeWarningMarkerPath();
+  if (fs.existsSync(markerPath)) return;
+
+  try {
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    fs.writeFileSync(markerPath, JSON.stringify({ shown: true }));
+  } catch {
+    // não crítico — na pior das hipóteses mostra de novo na próxima vez
+  }
+
+  await dialog.showMessageBox({
+    type: 'info',
+    title: 'Minimizar desabilitado durante a transmissão',
+    message: 'Enquanto você está compartilhando a tela, o botão de minimizar desta janela fica desativado.',
+    detail:
+      'Minimizar durante a transmissão pode travar o computador inteiro em algumas máquinas (driver de vídeo, ' +
+      'principalmente notebooks com GPU híbrida). Pra tirar a janela do caminho sem minimizar, é só trocar de ' +
+      'janela normalmente (Alt+Tab ou clicando em outro app) — o Sinal P2P continua transmitindo por trás.',
+  });
+}
+
 // Handles de captura por processo ativos, por WebContents (pra poder parar
 // tudo se a janela fechar/recarregar sem que o usuário clique "Parar").
 const activeProcessAudioCaptures = new Map();
@@ -210,6 +253,14 @@ ipcMain.handle('audio-process:start', (event, { pid, exclude }) => {
 ipcMain.handle('audio-process:stop', (event, handle) => {
   processAudio.stopCapture(handle);
   activeProcessAudioCaptures.get(event.sender.id)?.delete(handle);
+});
+
+// Ver comentário grande acima (maybeExplainMinimizeDisabled) sobre o porquê.
+ipcMain.on('sharing:active', (event, active) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win || win.isDestroyed()) return;
+  win.setMinimizable(!active);
+  if (active) maybeExplainMinimizeDisabled();
 });
 
 // Canal de sinalização sem servidor (ver signal-punch.js): cada participante
@@ -306,6 +357,12 @@ function createWindow() {
     },
   });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+
+  // Toda vez que a página carrega/recarrega, o estado de "compartilhando"
+  // do renderer começa do zero — sem isso, um reload em pleno
+  // compartilhamento (ex: DevTools) deixaria minimizar desabilitado pra
+  // sempre, já que só o renderer avisa quando volta a compartilhar de novo.
+  win.webContents.on('did-finish-load', () => win.setMinimizable(true));
 
   // Evita vazar uma thread de captura nativa rodando pra sempre se a janela
   // fechar/recarregar sem que o usuário clique em "Parar".

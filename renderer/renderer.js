@@ -1150,6 +1150,7 @@ async function confirmStartSharing() {
   videoTrack.addEventListener('ended', stopSharing);
 
   mySharing = true;
+  window.api.setSharingActive(true);
   applyLocalTracksToAllPeers();
   roomPeers.forEach((peer) => negotiate(peer));
   broadcastSharingState(true);
@@ -1231,6 +1232,7 @@ function stopSharing() {
   if (!mySharing && !localStream) return;
   const wasSharing = mySharing;
   mySharing = false;
+  window.api.setSharingActive(false);
 
   if (localStream) {
     localStream.getTracks().forEach((t) => t.stop());

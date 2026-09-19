@@ -34,4 +34,9 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('signal:message', listener);
     return () => ipcRenderer.removeListener('signal:message', listener);
   },
+
+  // Avisa o processo principal quando este PC começa/para de compartilhar a
+  // própria tela, pra ele poder desabilitar o botão de minimizar da janela
+  // enquanto isso — ver comentário em main.js sobre o bug de travamento.
+  setSharingActive: (active) => ipcRenderer.send('sharing:active', active),
 });

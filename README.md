@@ -295,18 +295,28 @@ yet:
   something else), and both screen picking and audio-source selection are
   more likely to need manual fiddling or simply not work on some setups.
   Not yet systematically tested across distros.
-- **Minimizing the window can freeze the share, and sometimes the OS/Chrome
-  itself**: when the broadcaster minimizes the app (or another window fully
-  covers it), the video reliably freezes for viewers until the window is
-  restored — confirmed via WebRTC stats that frames keep arriving but stop
-  being decoded while minimized. On top of that, minimizing has also been
-  observed to freeze the whole app, or possibly Windows/Chrome itself, in
-  ways not yet root-caused. Several fixes were already tried (disabling
-  Chromium's window-occlusion throttling, disabling hardware acceleration,
-  forcing process priority) — none of them helped, so the actual cause is
-  still unidentified. Avoid minimizing the window while sharing for now;
-  covering it with another window instead of minimizing may also trigger
-  the video-freeze part of this.
+- **Minimizing while sharing could freeze the whole computer (fixed, but not
+  a driver fix — the trigger is avoided instead)**: on some machines —
+  mainly laptops with hybrid graphics (an Intel integrated GPU alongside a
+  discrete one, e.g. NVIDIA Optimus) — minimizing the window while actively
+  sharing your screen could freeze the entire PC, not just the app. This
+  matches a known, driver-level bug class (documented by Intel and reported
+  by others independently of this app): minimizing is a window-resize event
+  at the OS level, and resizing a GPU-accelerated window while its GPU is
+  under heavy concurrent load (screen capture + hardware video encoding, in
+  this case) is a known trigger for hybrid-graphics driver hangs. We can't
+  fix the driver from here, so instead the app **disables the minimize
+  button/shortcut for as long as you're sharing your screen** (a one-time
+  dialog explains this the first time it happens) — removing the trigger
+  instead of reacting to it. This doesn't cover every way Windows can
+  minimize a window (Win+D "Show desktop" still minimizes everything
+  regardless); switching to another app normally (Alt+Tab, clicking another
+  window) works fine and doesn't trigger this. Separately, and unrelated to
+  the freeze above: if another window fully covers the broadcaster's
+  (without minimizing), the video can still visibly stall for viewers until
+  it's uncovered again — confirmed via WebRTC stats that frames keep
+  arriving but stop being decoded while occluded; not yet root-caused or
+  fixed.
 
 ## License
 
