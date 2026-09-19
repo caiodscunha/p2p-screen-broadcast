@@ -186,6 +186,12 @@ let myInviteCodePromise = null;
 let focusedPeerId = null; // null | 'self' | peerId
 let mySharing = false;
 let localStream = null;
+// Agenda a saída automática dessa "sala fantasma" (só você, ninguém
+// conectado) alguns segundos depois de um "Entrar" que falhou — ver o `if
+// (!result.ok)` abaixo. Guardado à parte pra poder cancelar se a pessoa
+// clicar em "Sair da sala" antes do tempo, e pra `leaveRoom()` não tentar
+// disparar de novo depois.
+let joinFailureAutoLeaveTimer = null;
 
 const roomNameLabel = document.getElementById('room-name-label');
 const btnCopyRoomCode = document.getElementById('btn-copy-room-code');
@@ -258,7 +264,18 @@ async function enterRoom({ name, passphrase, hostSid, hostCands }) {
       message: joinMessage,
     });
     if (!result.ok) {
-      setRoomStatus('Não consegui entrar na sala — a pessoa pode estar offline ou a rede não permite conexão automática.');
+      setRoomStatus(
+        'Não consegui entrar — código expirado, offline, ou limite temporário do ntfy.sh. Voltando ao início...'
+      );
+      // Sem isso a pessoa ficava presa numa "sala" sozinha, sem ninguém
+      // conectado, até clicar em "Sair da sala" por conta própria — agora
+      // volta pra tela inicial sozinha depois de um tempo pra dar chance de
+      // ler a mensagem, a menos que ela já tenha saído manualmente antes
+      // (leaveRoom() cancela este timer).
+      joinFailureAutoLeaveTimer = setTimeout(() => {
+        joinFailureAutoLeaveTimer = null;
+        leaveRoom();
+      }, 10000);
     } else {
       setRoomStatus('');
     }
@@ -280,6 +297,11 @@ btnToggleParticipants.addEventListener('click', () => {
 btnLeaveRoom.addEventListener('click', () => leaveRoom());
 
 function leaveRoom() {
+  if (joinFailureAutoLeaveTimer) {
+    clearTimeout(joinFailureAutoLeaveTimer);
+    joinFailureAutoLeaveTimer = null;
+  }
+
   roomPeers.forEach((peer) => {
     sendToPeer(peer, { t: 'peer-left', peerId: myPeerId }).catch(() => {});
   });

@@ -238,7 +238,10 @@ option in the UI).
 
 1. On the home screen, paste the code you received under **Entrar em
    sala**, fill in your name and the passphrase if one was set, and click
-   **Entrar**.
+   **Entrar**. If it doesn't connect (expired code, the room's creator
+   already closed their app, or a temporary signaling hiccup — see
+   [Known issues](#known-issues)), a message explains that and you're
+   returned to the home screen automatically after a few seconds.
 2. You'll see the grid of whoever's currently sharing (or an empty state if
    nobody is yet) and a participants list of everyone in the room (toggle it
    with the people icon on the right of the bottom dock). Hover a tile and
