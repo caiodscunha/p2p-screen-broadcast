@@ -1,111 +1,120 @@
-# P2P Screen & Audio Broadcast
+# Sinal P2P
 
 A serverless, peer-to-peer screen and system-audio broadcasting app for
-Windows, macOS and Linux, built with Electron and native WebRTC.
+Windows, macOS and Linux, built with Electron and native WebRTC — with a
+Discord-style **room**: create or join a room with a single code, and
+everyone in it can watch everyone else's screen and broadcast their own,
+at the same time, in a grid you can click into focus.
 
 It was created as a **free alternative to Discord's screen sharing**, after
 Discord's streaming/voice features were blocked for users in Brazil. No
-signaling server of our own, no accounts, no infrastructure to maintain: the
-broadcaster generates a code, sends it to a viewer over any chat app, and
-the connection is established directly between the two — automatically
-whenever the network allows it, falling back to pasting one response code
-back manually otherwise.
+signaling server of our own, no accounts, no infrastructure to maintain: one
+person creates a room and shares a small code with everyone else, and every
+connection in the room is established directly, peer-to-peer, between
+whichever two people need to talk to each other.
 
 ## Features
 
+- 🧑‍🤝‍🧑 **Rooms, not one-off pairings**: create or join with one code;
+  anyone in the room can start sharing their screen at any time, and
+  everyone else sees it appear in the grid automatically
+- 🟦 **Discord-style grid & focus**: all active screen shares laid out in a
+  grid; click one to focus it full-size with the rest as a thumbnail strip,
+  click again (or "back to grid") to undo
+- ▶️ **One-click share bar**: a bottom bar with a share button that opens a
+  picker (monitor + audio source) the first time, turns into a red "stop
+  sharing" button while live, with an arrow beside it to change monitor/
+  audio source mid-stream
+- 🚪 **Stopping your share doesn't drop you from the room**: your connection
+  to everyone stays up, your tile just disappears from the grid until you
+  share again
 - 🖥️ Screen + system audio capture (native picker and system-audio
   loopback on Windows and macOS; manual PulseAudio/PipeWire monitor-source
   selection on Linux)
 - 🎚️ Per-app audio capture on Windows: include only one app's audio, or
   exclude one app (e.g. share your game/music but not your Discord call),
   via WASAPI Process Loopback — no manual audio device routing required
-- 🔗 Fully peer-to-peer via WebRTC, no relay server ever touches your
-  video/audio
+- 🔗 Fully peer-to-peer via WebRTC mesh, no relay server ever touches your
+  video/audio — every pair of participants in a room talks directly to
+  each other
 - ⚡ Automatic connection when possible: tries a direct UDP path first
   (local network, UPnP router port mapping, STUN-discovered public
   address), then a free public relay as a second attempt — no manual
   copy/paste needed when either one works
-- 📋 Manual signaling as a guaranteed fallback: one offer/answer code
-  exchange per viewer, sendable over WhatsApp, chat, email, anything,
-  whenever the automatic path can't get through
 - 🚫 No infrastructure of our own: no backend, no database, no accounts —
   see [How it works](#how-it-works) for the two free, public, neutral
-  services involved in establishing the connection (never in the actual
+  services involved in establishing connections (never in the actual
   video/audio)
-- 👥 One broadcaster, multiple simultaneous viewers
-- 🎯 Minimal by design, just screen/audio broadcasting, no chat, no room
-  list, no extra features
+- 🎯 Minimal by design: rooms, screen/audio sharing, grid/focus — no chat,
+  no accounts, no recording
 
 ## Why this exists
 
 Discord's screen streaming stopped working reliably for users in Brazil.
-This project replaces that specific use case, one person streaming their
-screen (with audio) to friends, without depending on any third-party
-service or server. Every participant just runs the same app locally.
+This project replaces that use case — a group of people watching each
+other's screens, like a Discord voice channel with video — without
+depending on any third-party service or server. Every participant just
+runs the same app locally.
 
 ## How it works
 
-The SDP handshake required by WebRTC still boils down to one **offer code**
-and one **answer code**, exchanged like before — but delivering the answer
-back to the broadcaster is now automated whenever possible, instead of
-always requiring a manual copy/paste in both directions:
+Joining a room used to mean pasting a full WebRTC offer (containing an
+entire SDP) for every single pairing. Rooms work differently: the code only
+carries the **rendezvous point** of whoever generated it (a random session
+id plus a handful of network addresses) — no SDP at all, so it's short and
+generated instantly, no ICE gathering wait.
 
-1. The broadcaster starts screen capture and generates a base64-encoded
-   **offer code** (ICE gathering is awaited to completion, so it's a single
-   one-shot code, no trickle ICE needed). This code also embeds a small,
-   passphrase-protected "rendezvous" section (a random session id plus a
-   handful of network addresses) used only for the automatic delivery
-   described below.
-2. The broadcaster sends that code to a viewer through any side channel
-   (WhatsApp, Discord text chat, email, etc).
-3. The viewer pastes the code into the app and clicks **Enter**. The app
-   generates the answer, then tries to deliver it back automatically:
-   - First, direct UDP to one of the addresses embedded in the offer (the
-     broadcaster's local network address, a port UPnP mapped on their
-     router, or their public address discovered via STUN).
-   - In parallel, as a second attempt, a free public relay
-     ([ntfy.sh](https://ntfy.sh)) — used only to shuttle the small
-     signaling payload over plain HTTPS, so it works even when direct UDP
-     is blocked by a NAT/firewall/ISP that doesn't allow it (which happens
-     in practice on some networks).
-   - Whichever path succeeds first wins, and the broadcaster's app applies
-     the answer automatically — no code ever needs to be copied back.
-4. If neither automatic path works (e.g. very restrictive network on both
-   ends), the app falls back to showing the same **answer code** as before,
-   for the viewer to send back manually; the broadcaster pastes it in to
-   complete the connection.
-5. Steps 1–4 are repeated once per additional viewer.
+1. Someone clicks **Criar sala** — their app opens a listening "rendezvous"
+   (local network addresses, a UPnP-mapped router port, and their
+   STUN-discovered public address) and encodes it into a small, optionally
+   passphrase-protected **room code**.
+2. That code is shared with anyone who should join, through any side
+   channel (WhatsApp, chat, email, etc).
+3. Each person who pastes the code and clicks **Entrar** sends a small
+   `join` message to that rendezvous — delivered automatically whenever the
+   network allows (direct UDP first, a free public relay,
+   [ntfy.sh](https://ntfy.sh), as a fallback in parallel).
+4. Whoever receives that `join` replies with the room's current roster and
+   introduces the newcomer to everyone else already there. From that point
+   on, **every pair of participants talks directly to each other** — the
+   person who answered `join` was only ever a matchmaker for that one
+   moment, never a relay for the mesh that forms afterward. Any current
+   member of the room can hand out their own current room code to invite
+   more people, not just whoever created it first.
+5. Starting to share your screen (the bottom bar's share button) sends your
+   video/audio directly to every other connection in the mesh — no new code
+   to generate or exchange, and no code re-entry needed for people already
+   in the room.
 
 Two free, public, neutral third-party services are involved in setting up
-the connection — never in the actual video/audio, which always flows
-directly between the two peers over WebRTC:
+connections — never in the actual video/audio, which always flows directly
+between peers over WebRTC:
 
 - **Google's public STUN server** (`stun.l.google.com:19302`), used to help
   each participant discover their own public IP/port for NAT traversal.
 - **[ntfy.sh](https://ntfy.sh)**, a free and open-source pub/sub-over-HTTP
   service (self-hostable, same code you could run yourself), used only as
-  a best-effort relay for the tiny signaling payload described in step 3.
-  If you'd rather this app never talk to it at all, it's only ever used as
-  a fallback alongside direct UDP — either one failing just means falling
-  back further, down to the fully manual flow.
+  a best-effort relay for the small signaling messages described above
+  (room join, and the per-pair WebRTC offer/answer/ICE candidates). If
+  you'd rather this app never talk to it at all, it's only ever used
+  alongside direct UDP — either one failing just means the room can't form
+  that particular connection, everything else keeps working.
 
 ### Code encryption (optional)
 
-The offer/answer code is base64, not encryption — anyone who gets a copy of
-it (not just the intended recipient) can attempt to use it, since it embeds
-your ICE candidates (IP/port) in plain text. Both the broadcast and watch
-screens have an optional passphrase field: if set, the code is encrypted
-with AES-GCM (key derived via PBKDF2, Web Crypto API, no dependencies)
-before being base64-encoded, and the same passphrase is required to decode
-it on the other end. This only adds real protection if the passphrase is
-agreed through a different channel than the one used to send the code
-(e.g. code over chat, passphrase said out loud on a call) — if both travel
-together over the same compromised channel, encryption doesn't help.
-Leaving the passphrase blank keeps the previous plain behavior.
+The room code is base64, not encryption by default — anyone who gets a copy
+of it can attempt to join, since it embeds your rendezvous IP/port in plain
+text. Both "Criar sala" and "Entrar em sala" have an optional passphrase
+field: if set, the code is encrypted with AES-GCM (key derived via PBKDF2,
+Web Crypto API, no dependencies) before being base64-encoded, and the same
+passphrase is required to decode it on the other end. This only adds real
+protection if the passphrase is agreed through a different channel than the
+one used to send the code (e.g. code over chat, passphrase said out loud on
+a call). Leaving the passphrase blank keeps the previous plain behavior.
 
 ### Per-app audio capture (Windows only)
 
-The "Audio source" dropdown on the Broadcast tab has a "Specific process"
+The audio source picker in the share popover has a "Specific process"
 option that lets you include only one running app's audio, or exclude one
 app from an otherwise full system-audio share — e.g. share your game or
 music but keep a Discord voice call out of the stream, without routing
@@ -118,14 +127,14 @@ JS APIs, so it's implemented as a small native addon
 (`native/audio-loopback/`, C++/N-API) that captures raw PCM for a target
 process (and its child processes) and streams it to the renderer, where a
 Web Audio `AudioWorklet` turns it into a real `MediaStreamTrack` that gets
-added to the broadcast alongside the video. Windows-only — on macOS and
-Linux this option simply doesn't appear.
+added to the share alongside the video. Windows-only — on macOS and Linux
+this option simply doesn't appear.
 
 ## Tech stack
 
 - **Electron**: desktop shell, native screen/window picker, system-audio
   loopback capture
-- **WebRTC** (native, via Chromium): peer-to-peer media transport
+- **WebRTC** (native, via Chromium): peer-to-peer mesh media transport
 - **Vanilla JS/HTML/CSS**: renderer UI, no frameworks
 
 Electron was chosen over alternatives (.NET/SIPSorcery, Python) specifically
@@ -140,7 +149,7 @@ without diverging branches.
 
 Prebuilt executables for Windows and Linux are published on the
 [Releases page](https://github.com/caiodscunha/p2p-screen-broadcast/releases).
-Both the broadcaster and every viewer need to download and run the app on
+Everyone who wants to be in a room needs to download and run the app on
 their own machine (there's nothing to install on a server).
 
 - **Windows**: `Sinal-P2P-<version>-win.exe` (portable, no install needed —
@@ -154,8 +163,8 @@ be built on an actual Mac (see `npm run dist:mac` below).
 
 ## Getting started (from source)
 
-Both the broadcaster and every viewer need Node.js installed and must run
-the app on their own machine.
+Everyone who wants to be in a room needs Node.js installed and must run the
+app on their own machine.
 
 ```bash
 npm install
@@ -180,56 +189,59 @@ option in the UI).
 
 ## Usage
 
-### Broadcasting
+### Creating a room
 
-1. Go to the **Broadcast** tab. On Windows/macOS, click **Start screen
-   capture** and check "also share system audio" in the native picker. On
-   Linux, first pick your sound card's monitor source (usually named
-   "Monitor of ...") from the audio dropdown that appears, then click
-   **Start screen capture**.
-2. Click **Generate code for new viewer** and copy the generated code.
-3. Send that code to the viewer through any channel (WhatsApp, chat, etc).
-4. If the network allows it, the viewer's connection completes
-   automatically — nothing else to do. If their app shows "Couldn't connect
-   automatically", ask for the response code it gives them, paste it into
-   the "Paste response code here" field, and click **Connect viewer**.
-5. Repeat steps 2–4 for each additional person who wants to watch.
+1. On the home screen, fill in your name and (optionally) a passphrase
+   under **Criar sala**, then click it.
+2. In the room, click **Copiar código da sala** and send that code to
+   whoever you want to invite, through any channel (WhatsApp, chat, etc).
+   Anyone can join with it for as long as your app stays open — and once
+   they're in, they can generate and share their own current invite code
+   too, so the room doesn't depend on you staying online forever.
+3. Click the monitor icon in the bottom bar to open the share popover, pick
+   a monitor and an audio source, and click **Começar a compartilhar**.
+   Your tile appears in the grid for everyone in the room.
+4. While live, the same button turns into a red "stop sharing" button
+   (click to stop instantly); the small arrow beside it reopens the same
+   popover to switch monitor or audio source without interrupting the
+   stream.
 
-At any point after step 1, click **Pause sharing** to freeze the video for
-every connected viewer without dropping their connections (system audio
-keeps playing); click it again to resume.
+### Joining a room
 
-### Watching
-
-1. Go to the **Watch** tab and paste the code received from the broadcaster.
-2. Click **Enter** — the app tries to connect automatically.
-3. If it can't (the status will say so), click **"Couldn't connect?
-   Generate response code"**, copy the code it shows, and send it back to
-   the broadcaster.
-4. Once connected — automatically or after the broadcaster pastes your
-   response code — video and audio start playing.
+1. On the home screen, paste the code you received under **Entrar em
+   sala**, fill in your name and the passphrase if one was set, and click
+   **Entrar**.
+2. You'll see the grid of whoever's currently sharing (or an empty state if
+   nobody is yet) and a participants list of everyone in the room. Click
+   any tile to focus it full-size; click "Voltar pro grid" to undo.
+3. Share your own screen the same way described above whenever you want to.
 
 ## Limitations
 
 - **No TURN server**: this only affects the actual video/audio stream, not
-  the signaling relay above — if both participants are behind
+  the signaling relay above — if two participants are both behind
   restrictive/symmetric NATs (e.g. some corporate networks), the direct
-  WebRTC connection itself may fail regardless of how the offer/answer
-  codes were exchanged. Works reliably on normal home networks.
+  WebRTC connection between just that pair may fail regardless of how the
+  room code was exchanged. Works reliably on normal home networks.
 - **Automatic connection is best-effort**: it depends on things outside the
   app's control (router UPnP support, ISP/NAT behavior, ntfy.sh being
-  reachable) and can simply not work on some networks. The manual
-  offer/answer code exchange always remains available as a fallback and
-  never stops working.
-- **No room/lobby system**: every new viewer is added one at a time by
-  design, there's no shared "room code" or viewer list to join from.
+  reachable) and can simply not work on some networks — there's currently
+  no manual fallback for room signaling (unlike the old one-off offer/
+  answer flow), since a room's mesh isn't a single pairing that a human can
+  paste codes for.
+- **No SFU / bandwidth budgeting**: since every pair of participants talks
+  directly (mesh), a room with several people sharing their screens at the
+  same time means each of them is uploading directly to every other
+  participant — there's a per-connection bitrate cap, but nothing that
+  budgets total bandwidth across a room with many simultaneous
+  broadcasters.
 - **No native system-audio loopback on Linux**: `getDisplayMedia` loopback
   audio is only supported by Chromium/Electron on Windows and macOS. On
   Linux the app instead lets you manually pick a PulseAudio/PipeWire
   monitor source as a regular input device; if your distro doesn't expose
   one, only video is captured.
-- Intentionally minimal: no chat, no recording, no room list, no accounts,
-  just screen + audio broadcast.
+- Intentionally minimal: no chat, no recording, no accounts, just rooms +
+  screen/audio sharing.
 
 ## License
 
