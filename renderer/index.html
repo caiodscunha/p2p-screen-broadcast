@@ -6,155 +6,173 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <img class="brand-mark" src="../assets/icon.png" alt="" width="32" height="32" />
-      <div class="brand-text">
-        <h1>Sinal P2P</h1>
-        <p class="brand-tagline">Transmissão de tela ponto-a-ponto &middot; sem servidor</p>
+  <!-- ===================== HOME (criar/entrar) ===================== -->
+  <section id="view-home" class="view active">
+    <div class="home-wrap">
+      <div class="brand-hero">
+        <img class="brand-mark" src="../assets/icon.png" alt="" width="40" height="40" />
+        <div>
+          <h1>Sinal P2P</h1>
+          <p class="brand-tagline">Salas de transmissão de tela ponto-a-ponto &middot; sem servidor</p>
+        </div>
       </div>
-    </div>
-    <nav class="tabs">
-      <button id="tab-transmitir" class="tab active">Transmitir</button>
-      <button id="tab-assistir" class="tab">Assistir</button>
-    </nav>
-  </header>
 
-  <!-- ===================== TRANSMITIR ===================== -->
-  <section id="view-transmitir" class="view active">
-    <div class="row">
-      <div class="col">
-        <div class="card">
-          <h2><span class="step-badge">1</span>Capturar a tela</h2>
-          <div class="btn-row">
-            <button id="btn-start-capture" class="btn btn-primary">Iniciar captura de tela</button>
-            <button id="btn-pause-capture" class="btn btn-ghost" disabled>Pausar compartilhamento</button>
-            <button id="btn-stop-capture" class="btn btn-danger-ghost" disabled>Parar transmissão</button>
+      <div class="row home-cards">
+        <div class="col">
+          <div class="card">
+            <h2><span class="step-badge">1</span>Criar uma sala</h2>
+            <p class="hint">Você vira o ponto de encontro da sala — gere um código e mande pra quem
+              quiser convidar. Enquanto seu app estiver aberto, mais gente pode entrar com o mesmo código.</p>
+            <div class="field-block">
+              <label for="create-name-input">Seu nome</label>
+              <input type="text" id="create-name-input" placeholder="Ex: Caio" maxlength="60" />
+            </div>
+            <div class="field-block">
+              <label for="create-passphrase-input">Senha para proteger o código (opcional)</label>
+              <input type="text" id="create-passphrase-input"
+                placeholder="Combine por outro canal (voz, presencial); deixe em branco para não usar" />
+            </div>
+            <button id="btn-create-room" class="btn btn-primary">Criar sala</button>
           </div>
-          <div class="field-block">
-            <label for="monitor-select">Monitor a compartilhar</label>
-            <p class="hint">Pode ser trocado a qualquer momento, mesmo com a
-              transmissão já rolando — ninguém precisa reconectar.</p>
+        </div>
+
+        <div class="col">
+          <div class="card">
+            <h2><span class="step-badge">2</span>Entrar numa sala</h2>
+            <p class="hint">Cole o código que a pessoa te mandou. Se a rede permitir, a conexão com
+              todo mundo na sala acontece sozinha.</p>
+            <div class="field-block">
+              <label for="join-name-input">Seu nome</label>
+              <input type="text" id="join-name-input" placeholder="Ex: Maria" maxlength="60" />
+            </div>
+            <textarea id="join-code-input" placeholder="Cole aqui o código da sala..."></textarea>
             <div class="btn-row">
-              <select id="monitor-select" disabled></select>
-              <button id="btn-refresh-monitors" type="button" class="btn btn-ghost">Atualizar lista</button>
+              <button id="paste-join-code" class="btn btn-ghost">Colar do clipboard</button>
             </div>
-            <img id="monitor-thumbnail" alt="" hidden />
-          </div>
-          <p id="audio-hint" class="hint" hidden>Este sistema operacional não
-            tem suporte à captura automática do áudio do sistema; apenas o
-            vídeo será compartilhado, a menos que você selecione uma fonte de
-            áudio abaixo.</p>
-          <div class="field-block" id="audio-source-block">
-            <label for="audio-source-select">Fonte de áudio a compartilhar</label>
-            <p class="hint">Por padrão, "áudio do sistema" inclui tudo que está tocando
-              (jogos, música, e também chamadas de voz como Discord). Pra excluir algo
-              específico, escolha "Processo específico" abaixo (Windows) ou configure
-              esse app para tocar num dispositivo de saída separado (ou um cabo de
-              áudio virtual, ex: VB-CABLE) e selecione esse dispositivo aqui.</p>
-            <div class="btn-row">
-              <select id="audio-source-select">
-                <option value="">Nenhum áudio</option>
-              </select>
-              <button id="btn-refresh-audio-sources" type="button" class="btn btn-ghost">Atualizar lista</button>
+            <div class="field-block">
+              <label for="join-passphrase-input">Senha combinada (se houver)</label>
+              <input type="text" id="join-passphrase-input" placeholder="Deixe em branco se não houver senha" />
             </div>
-            <div class="field-block" id="process-audio-block" hidden>
-              <label for="process-audio-mode">O que fazer com o app escolhido</label>
-              <select id="process-audio-mode">
-                <option value="include">Compartilhar só o áudio desse app</option>
-                <option value="exclude">Compartilhar tudo, exceto o áudio desse app</option>
-              </select>
-              <div class="field-block">
-                <label for="process-audio-select">App</label>
-                <div class="btn-row">
-                  <select id="process-audio-select"></select>
-                  <button id="btn-refresh-audio-processes" type="button" class="btn btn-ghost">Atualizar lista</button>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="video-wrap">
-            <div class="live-badge" id="live-badge" hidden><span class="live-dot"></span><span id="live-badge-text">AO VIVO</span></div>
-            <video id="preview" autoplay muted playsinline></video>
+            <button id="btn-join-room" class="btn btn-primary">Entrar</button>
           </div>
         </div>
       </div>
 
-      <div class="col">
-        <div class="card">
-          <h2><span class="step-badge">2</span>Adicionar espectador</h2>
-          <p class="hint">Cada espectador precisa de um código próprio. Gere um código, envie
-            para a pessoa (WhatsApp, chat, etc.) — se a rede permitir, a conexão acontece sozinha
-            assim que ela colar o código; senão, ela te manda um código de resposta pra colar aqui.</p>
-          <div class="field-block">
-            <label for="broadcast-passphrase">Senha para proteger o código (opcional)</label>
-            <input type="text" id="broadcast-passphrase"
-              placeholder="Combine por outro canal (voz, presencial); deixe em branco para não usar" />
-          </div>
-          <button id="btn-new-viewer" class="btn btn-primary" disabled>Gerar código para novo espectador</button>
-
-          <div class="field-block code-block" id="offer-block" hidden>
-            <label>Código para enviar ao espectador (oferta)</label>
-            <textarea id="offer-code" readonly></textarea>
-            <button id="copy-offer" class="btn btn-ghost">Copiar código</button>
-          </div>
-
-          <div class="field-block code-block" id="answer-input-block" hidden>
-            <p id="auto-connect-status" class="hint"></p>
-            <label>Cole aqui o código de resposta do espectador</label>
-            <textarea id="answer-code-input" placeholder="Cole o código aqui..."></textarea>
-            <div class="btn-row">
-              <button id="paste-answer" class="btn btn-ghost">Colar do clipboard</button>
-              <button id="connect-answer" class="btn btn-primary">Conectar espectador</button>
-            </div>
-          </div>
-
-          <h3>Espectadores</h3>
-          <ul id="viewer-list" class="viewer-list"></ul>
-        </div>
-      </div>
+      <p id="home-status" class="hint home-status" hidden></p>
     </div>
   </section>
 
-  <!-- ===================== ASSISTIR ===================== -->
-  <section id="view-assistir" class="view">
-    <div class="row">
-      <div class="col">
-        <div class="card">
-          <h2><span class="step-badge">1</span>Colar código do transmissor</h2>
-          <div class="field-block">
-            <label for="viewer-name-input">Seu nome (aparece para quem transmite)</label>
-            <input type="text" id="viewer-name-input" placeholder="Ex: Maria" maxlength="60" />
-          </div>
-          <textarea id="offer-code-input" placeholder="Cole aqui o código enviado pelo transmissor..."></textarea>
-          <div class="btn-row">
-            <button id="paste-offer" class="btn btn-ghost">Colar do clipboard</button>
-          </div>
-          <div class="field-block">
-            <label for="watch-passphrase">Senha combinada com quem transmite (se houver)</label>
-            <input type="text" id="watch-passphrase" placeholder="Deixe em branco se não houver senha" />
-          </div>
-          <button id="btn-generate-answer" class="btn btn-primary">Entrar</button>
-          <button id="btn-show-answer-code" type="button" class="btn btn-ghost" hidden>Problemas para conectar? Gerar código de resposta</button>
+  <!-- ===================== SALA ===================== -->
+  <section id="view-room" class="view room-view">
+    <header class="room-header">
+      <div class="brand room-brand">
+        <img class="brand-mark" src="../assets/icon.png" alt="" width="18" height="18" />
+        <span id="room-name-label">Sala</span>
+      </div>
+    </header>
 
-          <div class="field-block code-block" id="answer-block" hidden>
-            <label>Código de resposta (envie de volta ao transmissor)</label>
-            <textarea id="answer-code" readonly></textarea>
-            <button id="copy-answer" class="btn btn-ghost">Copiar código</button>
-          </div>
+    <div class="room-body">
+      <div class="room-stage">
+        <p id="room-status" class="hint room-status" hidden></p>
+        <p id="grid-empty" class="grid-empty">Ninguém está compartilhando a tela ainda.</p>
+        <div id="stream-grid" class="stream-grid"></div>
+
+        <div id="focus-view" class="focus-view" hidden>
+          <div id="focus-main" class="focus-main"></div>
+          <div id="focus-strip" class="focus-strip"></div>
         </div>
       </div>
 
-      <div class="col">
-        <div class="card">
-          <h2><span class="step-badge">2</span>Assistir</h2>
-          <p id="watch-status" class="hint">Aguardando conexão...</p>
-          <div class="video-wrap">
-            <video id="remote-video" autoplay playsinline controls></video>
+      <aside id="participants-panel" class="participants-panel" hidden>
+        <h3>Na sala</h3>
+        <ul id="participants-list" class="viewer-list"></ul>
+      </aside>
+    </div>
+
+    <footer class="bottom-bar">
+      <div class="dock">
+        <button id="btn-copy-room-code" class="dock-btn" type="button" title="Copiar código da sala">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"></path>
+            <polyline points="16 6 12 2 8 6"></polyline>
+            <line x1="12" y1="2" x2="12" y2="15"></line>
+          </svg>
+        </button>
+
+        <div class="share-control">
+          <button id="btn-toggle-share" class="control-btn" type="button" title="Compartilhar tela">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="4" width="20" height="13" rx="2"></rect>
+              <line x1="8" y1="21" x2="16" y2="21"></line>
+              <line x1="12" y1="17" x2="12" y2="21"></line>
+            </svg>
+          </button>
+          <button id="btn-share-menu" class="control-btn control-btn-arrow" type="button" hidden title="Trocar monitor ou fonte de áudio">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="18 15 12 9 6 15"></polyline>
+            </svg>
+          </button>
+        </div>
+
+        <button id="btn-leave-room" class="dock-btn dock-btn-danger" type="button" title="Sair da sala">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+            <polyline points="16 17 21 12 16 7"></polyline>
+            <line x1="21" y1="12" x2="9" y2="12"></line>
+          </svg>
+        </button>
+      </div>
+
+      <button id="btn-toggle-participants" class="dock-standalone-btn" type="button" title="Participantes">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+          <circle cx="9" cy="7" r="4"></circle>
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+          <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+        </svg>
+      </button>
+    </footer>
+
+    <!-- popover: escolher tela/áudio antes de começar a compartilhar -->
+    <div id="share-setup-popover" class="popover" hidden>
+      <h3>Compartilhar tela</h3>
+      <div class="field-block">
+        <label for="monitor-select">Monitor a compartilhar</label>
+        <div class="btn-row">
+          <select id="monitor-select"></select>
+          <button id="btn-refresh-monitors" type="button" class="btn btn-ghost">Atualizar</button>
+        </div>
+        <img id="monitor-thumbnail" alt="" hidden />
+        <p id="loopback-hint" class="hint" hidden>Com "Áudio do sistema", o Windows/macOS pergunta
+          qual tela compartilhar na hora — o monitor escolhido acima é ignorado nesse modo.</p>
+      </div>
+      <p id="audio-hint" class="hint" hidden>Este sistema operacional não tem suporte à captura
+        automática do áudio do sistema; apenas o vídeo será compartilhado, a menos que você
+        selecione uma fonte de áudio abaixo.</p>
+      <div class="field-block">
+        <label for="audio-source-select">Fonte de áudio</label>
+        <div class="btn-row">
+          <select id="audio-source-select">
+            <option value="">Nenhum áudio</option>
+          </select>
+          <button id="btn-refresh-audio-sources" type="button" class="btn btn-ghost">Atualizar</button>
+        </div>
+        <div class="field-block" id="process-audio-block" hidden>
+          <label for="process-audio-mode">O que fazer com o app escolhido</label>
+          <select id="process-audio-mode">
+            <option value="include">Compartilhar só o áudio desse app</option>
+            <option value="exclude">Compartilhar tudo, exceto o áudio desse app</option>
+          </select>
+          <div class="field-block">
+            <label for="process-audio-select">App</label>
+            <div class="btn-row">
+              <select id="process-audio-select"></select>
+              <button id="btn-refresh-audio-processes" type="button" class="btn btn-ghost">Atualizar</button>
+            </div>
           </div>
-          <button id="btn-disconnect" class="btn btn-danger-ghost" disabled>Desconectar</button>
         </div>
       </div>
+      <button id="btn-confirm-share" class="btn btn-primary">Começar a compartilhar</button>
     </div>
   </section>
 

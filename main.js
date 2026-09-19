@@ -161,6 +161,49 @@ async function ensureFirewallAccess() {
   });
 }
 
+// Minimizar a janela enquanto está compartilhando a tela trava o PC inteiro
+// nalgumas máquinas (não só o app) — reproduzido em mais de uma máquina.
+// Pesquisa aponta pra uma classe de bug conhecida e documentada (inclusive
+// pela própria Intel) de driver de GPU híbrida (Intel+dedicada, Optimus e
+// afins): MINIMIZAR é, no Win32, um evento de RESIZE da janela pro estado
+// iconificado — e redimensionar uma janela acelerada por GPU enquanto a
+// mesma GPU está sob carga pesada (aqui: captura de tela + codificação de
+// vídeo por hardware rodando ao mesmo tempo) é o gatilho documentado desse
+// tipo de travamento em laptops com GPU híbrida. Não tem como consertar o
+// driver da Intel/NVIDIA a partir daqui — mas dá pra evitar o gatilho: só
+// desabilita o próprio botão/atalho de minimizar da janela enquanto uma
+// transmissão estiver ativa (ver 'sharing:active' abaixo), o que remove a
+// ação perigosa em vez de tentar reagir depois que ela já travou tudo.
+// Não cobre 100% dos jeitos de minimizar no Windows (Win+D "Mostrar área de
+// trabalho" ainda minimiza todas as janelas de qualquer forma), mas cobre o
+// caminho mais comum (botão da barra de título, clique com botão direito na
+// barra de tarefas, Alt+Espaço).
+function getMinimizeWarningMarkerPath() {
+  return path.join(app.getPath('appData'), 'sinal-p2p', 'minimize-warning-shown.json');
+}
+
+async function maybeExplainMinimizeDisabled() {
+  const markerPath = getMinimizeWarningMarkerPath();
+  if (fs.existsSync(markerPath)) return;
+
+  try {
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    fs.writeFileSync(markerPath, JSON.stringify({ shown: true }));
+  } catch {
+    // não crítico — na pior das hipóteses mostra de novo na próxima vez
+  }
+
+  await dialog.showMessageBox({
+    type: 'info',
+    title: 'Minimizar desabilitado durante a transmissão',
+    message: 'Enquanto você está compartilhando a tela, o botão de minimizar desta janela fica desativado.',
+    detail:
+      'Minimizar durante a transmissão pode travar o computador inteiro em algumas máquinas (driver de vídeo, ' +
+      'principalmente notebooks com GPU híbrida). Pra tirar a janela do caminho sem minimizar, é só trocar de ' +
+      'janela normalmente (Alt+Tab ou clicando em outro app) — o Sinal P2P continua transmitindo por trás.',
+  });
+}
+
 // Handles de captura por processo ativos, por WebContents (pra poder parar
 // tudo se a janela fechar/recarregar sem que o usuário clique "Parar").
 const activeProcessAudioCaptures = new Map();
@@ -212,39 +255,52 @@ ipcMain.handle('audio-process:stop', (event, handle) => {
   activeProcessAudioCaptures.get(event.sender.id)?.delete(handle);
 });
 
-// Handshake automático de resposta (ver signal-punch.js): o transmissor abre
-// um "ponto de encontro" UDP (IP local + IP público via STUN) e embute esses
-// candidatos no próprio código de oferta (dentro do payload criptografado
-// pela senha, se houver uma); o espectador manda a resposta direto pra lá,
-// sem precisar colar nada de volta na mão.
-ipcMain.handle('signal:startHost', async (event) => {
+// Ver comentário grande acima (maybeExplainMinimizeDisabled) sobre o porquê.
+ipcMain.on('sharing:active', (event, active) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win || win.isDestroyed()) return;
+  win.setMinimizable(!active);
+  if (active) maybeExplainMinimizeDisabled();
+});
+
+// Canal de sinalização sem servidor (ver signal-punch.js): cada participante
+// de uma sala abre o próprio "ponto de encontro" (UDP local/STUN/UPnP +
+// retransmissor ntfy.sh) e mantém aberto pela sessão inteira — usado tanto
+// pra entrar na sala (o código da sala carrega o ponto de encontro de quem
+// criou) quanto pra formar a malha de conexões WebRTC entre todo mundo
+// depois (oferta/resposta trocadas direto entre cada par, sem passar pelo
+// host de novo).
+ipcMain.handle('signal:startListener', async (event) => {
   const webContents = event.sender;
   let handle;
-  handle = await signalPunch.startHostListener({
-    onAnswer: (code) => {
+  handle = await signalPunch.startListener({
+    onMessage: (message, meta) => {
       if (webContents.isDestroyed()) return;
-      webContents.send('signal:answer', { sessionId: handle.sessionId, code });
+      webContents.send('signal:message', { sessionId: handle.sessionId, message, from: meta.from });
     },
   });
   if (!handle) return null; // nem IP local nem STUN disponíveis — sem atalho automático
 
   if (!activeSignalListeners.has(webContents.id)) activeSignalListeners.set(webContents.id, new Map());
-  activeSignalListeners.get(webContents.id).set(handle.sessionId, handle.stop);
+  activeSignalListeners.get(webContents.id).set(handle.sessionId, handle);
 
   return { sessionId: handle.sessionId, candidates: handle.candidates };
 });
 
-ipcMain.handle('signal:stopHost', (event, sessionId) => {
+ipcMain.handle('signal:stopListener', (event, sessionId) => {
   const listeners = activeSignalListeners.get(event.sender.id);
-  const stop = listeners && listeners.get(sessionId);
-  if (stop) {
-    stop();
+  const handle = listeners && listeners.get(sessionId);
+  if (handle) {
+    handle.stop();
     listeners.delete(sessionId);
   }
 });
 
-ipcMain.handle('signal:sendAnswer', (event, { candidates, sessionId, code }) => {
-  return signalPunch.sendAnswer({ candidates, sessionId, code });
+ipcMain.handle('signal:send', (event, { mySessionId, candidates, targetSessionId, message, opts }) => {
+  const listeners = activeSignalListeners.get(event.sender.id);
+  const handle = listeners && listeners.get(mySessionId);
+  if (!handle) return Promise.resolve({ ok: false, via: null });
+  return handle.send(candidates, targetSessionId, message, opts);
 });
 
 // Lista as telas disponíveis (com miniatura) pra deixar o usuário escolher
@@ -280,9 +336,33 @@ function createWindow() {
       // conseguir abrir o console. Continua disponível rodando via
       // "npm start"/"electron .", já que app.isPackaged só é true num build.
       devTools: !app.isPackaged,
+      // Sem isso, o vídeo (com som) de quem entrou na sala e só começou a
+      // compartilhar bem depois de qualquer clique na janela ficava com o
+      // autoplay bloqueado pela política padrão do Chromium (que existe pra
+      // sites não tocarem som sem permissão do usuário) — a conexão e o
+      // vídeo chegavam certinho, só nunca eram exibidos, sem erro nenhum.
+      // Este é um app desktop nosso, não um site de terceiros; a
+      // transmissão de tela SEMPRE deve tocar automaticamente.
+      autoplayPolicy: 'no-user-gesture-required',
+      // Por padrão o Electron desacelera a renderização de janelas sem foco
+      // (pra economizar recursos) — o processamento de rede/decodificação
+      // do WebRTC continua rodando (confirmado: os frames continuam sendo
+      // decodificados nas estatísticas), mas a pintura do <video> na tela
+      // trava, ficando preso em "nada carregado ainda" até a janela voltar
+      // a ficar em foco. Isso é fatal pra um app que mostra vídeo de várias
+      // pessoas ao mesmo tempo — a pessoa não fica o tempo todo com a
+      // janela em foco, e cada participante da sala roda numa janela
+      // separada.
+      backgroundThrottling: false,
     },
   });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+
+  // Toda vez que a página carrega/recarrega, o estado de "compartilhando"
+  // do renderer começa do zero — sem isso, um reload em pleno
+  // compartilhamento (ex: DevTools) deixaria minimizar desabilitado pra
+  // sempre, já que só o renderer avisa quando volta a compartilhar de novo.
+  win.webContents.on('did-finish-load', () => win.setMinimizable(true));
 
   // Evita vazar uma thread de captura nativa rodando pra sempre se a janela
   // fechar/recarregar sem que o usuário clique em "Parar".
@@ -294,7 +374,7 @@ function createWindow() {
     }
     const signalListeners = activeSignalListeners.get(win.webContents.id);
     if (signalListeners) {
-      signalListeners.forEach((stop) => stop());
+      signalListeners.forEach((handle) => handle.stop());
       activeSignalListeners.delete(win.webContents.id);
     }
   });

@@ -23,14 +23,20 @@ contextBridge.exposeInMainWorld('api', {
     return () => ipcRenderer.removeListener('audio-process:error', listener);
   },
 
-  // Handshake automático de resposta (UDP+STUN, ver signal-punch.js) — os
-  // candidatos vão embutidos no próprio código de oferta, ver renderer.js.
-  startHostSignal: () => ipcRenderer.invoke('signal:startHost'),
-  stopHostSignal: (sessionId) => ipcRenderer.invoke('signal:stopHost', sessionId),
-  sendSignalAnswer: (info) => ipcRenderer.invoke('signal:sendAnswer', info),
-  onSignalAnswer: (callback) => {
+  // Canal de sinalização sem servidor (UDP+STUN+UPnP+ntfy, ver
+  // signal-punch.js) — usado pra entrar numa sala e depois formar a malha de
+  // conexões WebRTC entre todo mundo (ver protocolo em renderer.js).
+  startSignalListener: () => ipcRenderer.invoke('signal:startListener'),
+  stopSignalListener: (sessionId) => ipcRenderer.invoke('signal:stopListener', sessionId),
+  sendSignalMessage: (info) => ipcRenderer.invoke('signal:send', info),
+  onSignalMessage: (callback) => {
     const listener = (event, data) => callback(data);
-    ipcRenderer.on('signal:answer', listener);
-    return () => ipcRenderer.removeListener('signal:answer', listener);
+    ipcRenderer.on('signal:message', listener);
+    return () => ipcRenderer.removeListener('signal:message', listener);
   },
+
+  // Avisa o processo principal quando este PC começa/para de compartilhar a
+  // própria tela, pra ele poder desabilitar o botão de minimizar da janela
+  // enquanto isso — ver comentário em main.js sobre o bug de travamento.
+  setSharingActive: (active) => ipcRenderer.send('sharing:active', active),
 });

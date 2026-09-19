@@ -31,3 +31,7 @@ Thumbs.db
 .vscode/
 .idea/
 /logs
+
+# Configuração local do Claude Code (permissões, settings pessoais) — nunca
+# é código do projeto, não deveria subir pro repositório.
+.claude/

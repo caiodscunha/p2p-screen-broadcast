@@ -47,29 +47,17 @@ body {
   min-height: 100vh;
 }
 
-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-  padding: 16px 24px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--border);
-}
-
 .brand { display: flex; align-items: center; gap: 12px; }
 
 .brand-mark {
-  width: 32px;
-  height: 32px;
-  border-radius: 10px;
+  border-radius: 8px;
   flex-shrink: 0;
   background: var(--bg);
   padding: 3px;
+  display: block;
 }
 
-.brand-text h1 {
+h1 {
   margin: 0;
   font-size: 16px;
   font-weight: 700;
@@ -82,30 +70,12 @@ header {
   color: var(--text-faint);
 }
 
-.tabs { display: flex; gap: 6px; }
-
-.tab {
-  background: transparent;
-  border: none;
-  color: var(--text-dim);
-  padding: 9px 18px;
-  cursor: pointer;
-  font-size: 13px;
-  font-family: var(--font-body);
-  font-weight: 600;
-  border-radius: var(--radius-sm);
-  transition: color 0.15s ease, background 0.15s ease;
-}
-
-.tab:hover:not(.active) { color: var(--text); background: var(--panel-raised); }
-
-.tab.active {
-  color: var(--accent-on);
-  background: var(--accent);
-}
-
 .view { display: none; padding: 24px 28px 40px; }
 .view.active { display: block; }
+
+/* Salas ocupam a janela inteira (grid + barra inferior fixa), diferente da
+   home (que é uma página de formulário rolável). */
+.view.room-view.active { display: flex; flex-direction: column; height: 100vh; padding: 0; }
 
 .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
 .col { flex: 1 1 400px; min-width: 320px; }
@@ -174,18 +144,7 @@ h3 { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacin
 .btn-danger-ghost { background: transparent; color: var(--accent-strong); border-color: var(--accent-border); }
 .btn-danger-ghost:hover:not(:disabled) { background: var(--accent-soft); }
 
-.video-wrap { position: relative; margin-top: 4px; }
-
-video {
-  width: 100%;
-  max-width: 480px;
-  aspect-ratio: 16 / 9;
-  object-fit: contain;
-  background: #000;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
-  display: block;
-}
+video { display: block; background: #000; }
 
 #monitor-thumbnail {
   display: block;
@@ -322,3 +281,398 @@ textarea {
 .viewer-stats.viewer-stats-limited { color: var(--warning); }
 
 .viewer-list .btn { padding: 5px 12px; font-size: 12px; }
+
+/* ===================== HOME ===================== */
+
+.home-wrap { max-width: 900px; margin: 0 auto; }
+
+.brand-hero { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
+.brand-hero h1 { font-size: 22px; }
+
+.home-cards { margin-top: 0; }
+
+.home-status { text-align: center; margin-top: 18px; }
+
+/* ===================== SALA ===================== */
+
+.room-header {
+  display: flex;
+  align-items: center;
+  padding: 6px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.room-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.room-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.room-stage {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.grid-empty {
+  margin: auto;
+  color: var(--text-faint);
+  font-size: 14px;
+}
+
+.room-status {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  background: rgba(15, 15, 17, 0.85);
+  border: 1px solid var(--border-strong);
+  padding: 6px 14px;
+  border-radius: 999px;
+  margin: 0;
+}
+
+.stream-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-auto-rows: minmax(160px, 1fr);
+  gap: 12px;
+  padding: 16px;
+  overflow: auto;
+  align-content: start;
+}
+
+/* Com só 1 pessoa compartilhando, o mínimo de 280px/160px pensado pra caber
+   várias lado a lado só atrapalha — a janela ficava pequena demais pro
+   card caber e criava barra de rolagem em vez de simplesmente encolher.
+   Nesse caso específico, troca pra ocupar o espaço disponível inteiro. */
+.stream-grid:has(.stream-card:only-child) {
+  display: flex;
+  overflow: hidden;
+}
+
+.stream-grid:has(.stream-card:only-child) .stream-card {
+  width: 100%;
+  height: 100%;
+}
+
+.stream-card {
+  position: relative;
+  background: #000;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+  cursor: pointer;
+  transition: border-color 0.15s ease, transform 0.1s ease;
+}
+
+.stream-card:hover { border-color: var(--border-strong); }
+.stream-card:active { transform: scale(0.99); }
+
+.stream-card video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+.stream-card-name {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  z-index: 2;
+  background: rgba(15, 15, 17, 0.75);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  max-width: calc(100% - 20px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.volume-control {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 3;
+  display: flex;
+  /* o ícone fica ancorado perto da borda e não se move quando o slider
+     aparece — sem isso, ele "pula" pra esquerda no instante em que o hover
+     revela o slider, que é uma causa real de perder o hover sem querer. */
+  flex-direction: row-reverse;
+  align-items: center;
+  gap: 8px;
+}
+
+.volume-icon-btn {
+  width: 34px;
+  height: 34px;
+  border: none;
+  padding: 0;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: rgba(15, 15, 17, 0.75);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.volume-control:hover .volume-icon-btn { background: rgba(15, 15, 17, 0.92); }
+
+.volume-slider-wrap {
+  display: none;
+  align-items: center;
+  background: rgba(15, 15, 17, 0.75);
+  border-radius: 999px;
+  padding: 0 14px;
+  height: 34px;
+}
+
+.volume-control:hover .volume-slider-wrap { display: flex; }
+
+.volume-slider {
+  width: 100px;
+  height: 20px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.focus-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  min-height: 0;
+}
+
+.focus-main {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: #000;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.focus-main video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+
+.focus-strip {
+  display: flex;
+  gap: 8px;
+  height: 96px;
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+
+.focus-thumb {
+  position: relative;
+  flex: 0 0 auto;
+  width: 160px;
+  height: 96px;
+  background: #000;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.focus-thumb:hover { border-color: var(--border-strong); }
+
+.focus-thumb video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+
+/* Fixar/desafixar estilo Discord: ícone central que só aparece enquanto o
+   mouse se mexe por cima (classe .pin-overlay-visible, ligada/desligada via
+   JS — ver ensureMediaTile) e some sozinho depois de 3s parado. Puramente
+   visual (pointer-events: none) — o clique é sempre tratado pelo card/tile
+   inteiro por baixo, então continua funcionando mesmo com o ícone escondido. */
+.pin-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.pin-overlay.pin-overlay-visible { opacity: 1; }
+
+.pin-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: rgba(15, 15, 17, 0.8);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.participants-panel {
+  width: 240px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  background: var(--panel);
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.participants-panel h3 { margin-top: 0; }
+
+.viewer-list .viewer-status-sharing { color: var(--success); }
+
+/* ---- barra inferior: dock flutuante arredondada, estilo Discord/macOS ---- */
+
+.bottom-bar {
+  flex-shrink: 0;
+  position: relative;
+  display: flex;
+  justify-content: center;
+  padding: 0 20px 18px;
+}
+
+.dock {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+}
+
+/* Botão de participantes: bolinha própria, separada da dock principal e
+   fixada na direita, enquanto a dock fica sempre centralizada na barra. */
+.dock-standalone-btn {
+  position: absolute;
+  right: 20px;
+  bottom: 18px;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: var(--panel-raised);
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+  transition: background 0.15s ease, color 0.15s ease, transform 0.08s ease;
+}
+
+.dock-standalone-btn:hover { background: var(--panel-raised-hover); color: var(--text); }
+.dock-standalone-btn:active { transform: scale(0.95); }
+
+.dock-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s ease, color 0.15s ease, transform 0.08s ease;
+}
+
+.dock-btn:hover { background: var(--panel-raised-hover); color: var(--text); }
+.dock-btn:active { transform: scale(0.95); }
+
+.dock-btn-danger { color: var(--accent-strong); }
+.dock-btn-danger:hover { background: var(--accent-soft); }
+
+.share-control { display: flex; align-items: center; gap: 2px; }
+
+.control-btn {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: none;
+  background: var(--panel-raised-hover);
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s ease, color 0.15s ease, transform 0.08s ease;
+}
+
+.control-btn:hover { background: var(--border-strong); }
+.control-btn:active { transform: scale(0.95); }
+
+.control-btn.is-live { background: var(--accent); color: #fff; }
+.control-btn.is-live:hover { background: var(--accent-strong); }
+
+.control-btn-arrow { width: 22px; height: 44px; border-radius: 0 999px 999px 0; margin-left: 1px; }
+.control-btn:not(.control-btn-arrow) { border-radius: 999px 0 0 999px; }
+.share-control:has(.control-btn-arrow[hidden]) .control-btn:not(.control-btn-arrow) { border-radius: 50%; }
+
+/* ---- popovers (setup de compartilhamento / menu de configurações) ---- */
+
+.popover {
+  position: absolute;
+  bottom: 88px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 360px;
+  max-width: calc(100vw - 32px);
+  background: rgba(30, 31, 34, 0.82);
+  backdrop-filter: blur(14px) saturate(150%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 16px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.popover h3 { margin-top: 0; }
+
+.popover .field-block,
+.popover .hint {
+  width: 100%;
+}
+
+.popover .hint { text-align: left; }
+
+.popover .btn-row { justify-content: center; }
+
+.popover #monitor-thumbnail { margin-left: auto; margin-right: auto; }
