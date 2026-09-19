@@ -212,39 +212,44 @@ ipcMain.handle('audio-process:stop', (event, handle) => {
   activeProcessAudioCaptures.get(event.sender.id)?.delete(handle);
 });
 
-// Handshake automático de resposta (ver signal-punch.js): o transmissor abre
-// um "ponto de encontro" UDP (IP local + IP público via STUN) e embute esses
-// candidatos no próprio código de oferta (dentro do payload criptografado
-// pela senha, se houver uma); o espectador manda a resposta direto pra lá,
-// sem precisar colar nada de volta na mão.
-ipcMain.handle('signal:startHost', async (event) => {
+// Canal de sinalização sem servidor (ver signal-punch.js): cada participante
+// de uma sala abre o próprio "ponto de encontro" (UDP local/STUN/UPnP +
+// retransmissor ntfy.sh) e mantém aberto pela sessão inteira — usado tanto
+// pra entrar na sala (o código da sala carrega o ponto de encontro de quem
+// criou) quanto pra formar a malha de conexões WebRTC entre todo mundo
+// depois (oferta/resposta trocadas direto entre cada par, sem passar pelo
+// host de novo).
+ipcMain.handle('signal:startListener', async (event) => {
   const webContents = event.sender;
   let handle;
-  handle = await signalPunch.startHostListener({
-    onAnswer: (code) => {
+  handle = await signalPunch.startListener({
+    onMessage: (message, meta) => {
       if (webContents.isDestroyed()) return;
-      webContents.send('signal:answer', { sessionId: handle.sessionId, code });
+      webContents.send('signal:message', { sessionId: handle.sessionId, message, from: meta.from });
     },
   });
   if (!handle) return null; // nem IP local nem STUN disponíveis — sem atalho automático
 
   if (!activeSignalListeners.has(webContents.id)) activeSignalListeners.set(webContents.id, new Map());
-  activeSignalListeners.get(webContents.id).set(handle.sessionId, handle.stop);
+  activeSignalListeners.get(webContents.id).set(handle.sessionId, handle);
 
   return { sessionId: handle.sessionId, candidates: handle.candidates };
 });
 
-ipcMain.handle('signal:stopHost', (event, sessionId) => {
+ipcMain.handle('signal:stopListener', (event, sessionId) => {
   const listeners = activeSignalListeners.get(event.sender.id);
-  const stop = listeners && listeners.get(sessionId);
-  if (stop) {
-    stop();
+  const handle = listeners && listeners.get(sessionId);
+  if (handle) {
+    handle.stop();
     listeners.delete(sessionId);
   }
 });
 
-ipcMain.handle('signal:sendAnswer', (event, { candidates, sessionId, code }) => {
-  return signalPunch.sendAnswer({ candidates, sessionId, code });
+ipcMain.handle('signal:send', (event, { mySessionId, candidates, targetSessionId, message, opts }) => {
+  const listeners = activeSignalListeners.get(event.sender.id);
+  const handle = listeners && listeners.get(mySessionId);
+  if (!handle) return Promise.resolve({ ok: false, via: null });
+  return handle.send(candidates, targetSessionId, message, opts);
 });
 
 // Lista as telas disponíveis (com miniatura) pra deixar o usuário escolher
@@ -280,6 +285,24 @@ function createWindow() {
       // conseguir abrir o console. Continua disponível rodando via
       // "npm start"/"electron .", já que app.isPackaged só é true num build.
       devTools: !app.isPackaged,
+      // Sem isso, o vídeo (com som) de quem entrou na sala e só começou a
+      // compartilhar bem depois de qualquer clique na janela ficava com o
+      // autoplay bloqueado pela política padrão do Chromium (que existe pra
+      // sites não tocarem som sem permissão do usuário) — a conexão e o
+      // vídeo chegavam certinho, só nunca eram exibidos, sem erro nenhum.
+      // Este é um app desktop nosso, não um site de terceiros; a
+      // transmissão de tela SEMPRE deve tocar automaticamente.
+      autoplayPolicy: 'no-user-gesture-required',
+      // Por padrão o Electron desacelera a renderização de janelas sem foco
+      // (pra economizar recursos) — o processamento de rede/decodificação
+      // do WebRTC continua rodando (confirmado: os frames continuam sendo
+      // decodificados nas estatísticas), mas a pintura do <video> na tela
+      // trava, ficando preso em "nada carregado ainda" até a janela voltar
+      // a ficar em foco. Isso é fatal pra um app que mostra vídeo de várias
+      // pessoas ao mesmo tempo — a pessoa não fica o tempo todo com a
+      // janela em foco, e cada participante da sala roda numa janela
+      // separada.
+      backgroundThrottling: false,
     },
   });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
@@ -294,7 +317,7 @@ function createWindow() {
     }
     const signalListeners = activeSignalListeners.get(win.webContents.id);
     if (signalListeners) {
-      signalListeners.forEach((stop) => stop());
+      signalListeners.forEach((handle) => handle.stop());
       activeSignalListeners.delete(win.webContents.id);
     }
   });

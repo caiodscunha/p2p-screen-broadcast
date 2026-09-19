@@ -1,14 +1,13 @@
-// Handshake automático de resposta, sem servidor próprio, em duas camadas:
+// Canal de sinalização sem servidor próprio, em duas camadas:
 //
-// 1) UDP direto (STUN + IP local + UPnP): o código de oferta carrega embutido
-//    (dentro do mesmo payload criptografado, se houver senha) um "ponto de
-//    encontro" — id de sessão + candidatos IP:porta. Quem cola o código
-//    tenta mandar a resposta direto pra esses endereços por UDP. Funciona
-//    quando o roteador/NAT permite um pacote de entrada não solicitado — mas
-//    alguns roteadores/operadoras não permitem isso de jeito nenhum, mesmo
-//    com regra de firewall liberada no PC (visto na prática: rede "pública"
-//    no Windows já resolvida, e mesmo assim UDP direto não chega entre dois
-//    PCs de verdade — provavelmente o próprio modem/operadora barrando).
+// 1) UDP direto (STUN + IP local + UPnP): cada participante abre um "ponto de
+//    encontro" (id de sessão + candidatos IP:porta) e quem quer falar com ele
+//    manda mensagens JSON direto pra esses endereços por UDP. Funciona quando
+//    o roteador/NAT permite um pacote de entrada não solicitado — mas alguns
+//    roteadores/operadoras não permitem isso de jeito nenhum, mesmo com regra
+//    de firewall liberada no PC (visto na prática: rede "pública" no Windows
+//    já resolvida, e mesmo assim UDP direto não chega entre dois PCs de
+//    verdade — provavelmente o próprio modem/operadora barrando).
 //
 // 2) Retransmissor HTTPS (ntfy.sh) como reforço, tentado em paralelo: os dois
 //    lados só fazem requisições HTTPS de SAÍDA (publicar/consultar mensagens
@@ -19,38 +18,88 @@
 //    serviço público, gratuito, neutro e de código aberto, usado só pra essa
 //    sinalização — o vídeo/áudio continua 100% direto entre os dois lados,
 //    nunca passa por aqui. Só é tentado se o código couber no limite de
-//    tamanho de mensagem do serviço.
+//    tamanho de mensagem do serviço (com chunking pra mensagens grandes).
 //
-// Se nenhuma das duas vias funcionar, cai pro fluxo manual de colar o código
-// de resposta — mesmo caso em que a própria conexão WebRTC (que só usa STUN,
-// sem TURN) também poderia falhar.
+// Usado tanto pro pareamento 1:1 original quanto pro protocolo de salas (ver
+// renderer.js): toda mensagem trocada é um objeto JSON pequeno e genérico
+// ({t: 'join'|'welcome'|'offer'|'answer'|'sharing'|... , ...}), este arquivo
+// não conhece o significado de nenhum campo além do envelope de roteamento
+// (v, sid, t). Cada participante mantém seu próprio `startListener()` aberto
+// durante toda a sessão (sala inteira, não só o primeiro round-trip) e pode
+// mandar mensagens pra qualquer outro participante cujos candidatos conheça,
+// via `sendMessage()` — inclusive par-a-par, sem passar por quem criou a sala.
+//
+// Se nenhuma das duas vias funcionar entre um par específico, aquele par
+// simplesmente não conecta (mesmo caso em que a própria conexão WebRTC — que
+// só usa STUN, sem TURN — também poderia falhar); os outros pares da sala não
+// são afetados.
 const dgram = require('dgram');
 const crypto = require('crypto');
 const os = require('os');
 
 const NTFY_BASE = 'https://ntfy.sh';
-// O código de resposta (com vários candidatos ICE, senha, etc.) costuma
-// passar de 8KB — bem mais do que qualquer serviço de mensagens aguenta
-// numa mensagem só. Em vez de adivinhar um limite e desistir se não couber,
-// divide em pedaços pequenos (bem abaixo de qualquer limite razoável) e
-// remonta do outro lado — funciona não importa o tamanho real do limite.
-const NTFY_CHUNK_SIZE = 2000;
+// Uma oferta/resposta SDP (com vários candidatos ICE) costuma passar de
+// alguns KB — bem mais do que um datagrama UDP ou uma mensagem de ntfy
+// aguentam de forma confiável numa vez só. Em vez de adivinhar um limite e
+// desistir se não couber, TODA mensagem (grande ou pequena) é dividida em
+// pedaços pequenos e remontada do outro lado — funciona não importa o
+// tamanho real da mensagem nem o limite exato do transporte.
+const MESSAGE_CHUNK_SIZE = 2000;
 
-// Vai juntando os pedaços de uma resposta dividida (ver sendAnswerViaHttpRelay)
-// conforme chegam, em qualquer ordem — cada instância corresponde a uma
-// única sessão/resposta. Retorna o código completo assim que tiver todos os
-// pedaços, ou null enquanto ainda faltar algum. Mensagens no formato antigo
-// (sem chunking, "answer" com "code" direto) continuam funcionando.
-function createChunkAssembler() {
-  let parts = null;
-  return (data) => {
-    if (data.t === 'answer' && typeof data.code === 'string') return data.code;
-    if (data.t !== 'answer-chunk' || typeof data.c !== 'string' || !Number.isInteger(data.i) || !Number.isInteger(data.n)) {
+function splitIntoChunks(text, size) {
+  if (text.length === 0) return [''];
+  const chunks = [];
+  for (let i = 0; i < text.length; i += size) chunks.push(text.slice(i, i + size));
+  return chunks;
+}
+
+// Junta os pedaços de mensagens conforme chegam, em qualquer ordem — uma
+// única instância cuida de TODAS as mensagens de uma sessão ao longo da
+// vida dela (uma sala fica trocando várias mensagens, não só uma). Retorna
+// a mensagem original (já com JSON.parse aplicado) assim que um "mid"
+// tiver todos os pedaços, ou null enquanto faltar algum ou se o envelope
+// não for reconhecido. Deduplica: uma vez entregue, o mesmo "mid" nunca é
+// entregue de novo (importa porque a mesma mensagem pode chegar mais de
+// uma vez — reenvios da via UDP, ou UDP e ntfy chegando os dois).
+function createMessageAssembler() {
+  const partial = new Map(); // mid -> pedaços (array com buracos)
+  const delivered = new Set(); // mid's já entregues — não deixa crescer sem limite
+  const MAX_DELIVERED = 500;
+
+  return (envelope) => {
+    if (
+      !envelope ||
+      typeof envelope.mid !== 'string' ||
+      !Number.isInteger(envelope.i) ||
+      !Number.isInteger(envelope.n) ||
+      envelope.n < 1 ||
+      envelope.i < 0 ||
+      envelope.i >= envelope.n ||
+      typeof envelope.c !== 'string'
+    ) {
       return null;
     }
-    if (!parts) parts = new Array(data.n).fill(null);
-    parts[data.i] = data.c;
-    return parts.every((p) => p !== null) ? parts.join('') : null;
+    if (delivered.has(envelope.mid)) return null;
+
+    let parts = partial.get(envelope.mid);
+    if (!parts) {
+      parts = new Array(envelope.n).fill(null);
+      partial.set(envelope.mid, parts);
+    }
+    parts[envelope.i] = envelope.c;
+    if (!parts.every((p) => p !== null)) return null;
+
+    partial.delete(envelope.mid);
+    delivered.add(envelope.mid);
+    if (delivered.size > MAX_DELIVERED) {
+      delivered.delete(delivered.values().next().value);
+    }
+
+    try {
+      return JSON.parse(parts.join(''));
+    } catch {
+      return null;
+    }
   };
 }
 
@@ -290,9 +339,15 @@ function discoverPublicAddress(socket, timeoutMs = 3000) {
   });
 }
 
-// Inicia o "ponto de encontro" do transmissor: escuta pela resposta do
-// espectador, aplica via onAnswer e confirma com um ack.
-async function startHostListener({ onAnswer }) {
+// Abre o "ponto de encontro" de UM participante: um socket UDP + um stream
+// ntfy, mantidos abertos por toda a vida da sessão (sala inteira, não só um
+// round-trip) — usados tanto pra RECEBER mensagens de qualquer outro
+// participante (via `onMessage`) quanto pra MANDAR mensagens pra qualquer
+// outro participante cujo ponto de encontro se conheça (via `send`,
+// devolvido junto). Este arquivo não sabe o que cada mensagem significa —
+// isso é responsabilidade de quem chama (ver protocolo de sala em
+// renderer.js: 'join', 'welcome', 'offer', 'answer', 'sharing' etc.).
+async function startListener({ onMessage }) {
   const socket = dgram.createSocket('udp4');
   await new Promise((resolve, reject) => {
     socket.once('error', reject);
@@ -311,8 +366,8 @@ async function startHostListener({ onAnswer }) {
   // sessionId não depende de STUN/UPnP — gerado já aqui pra poder abrir a
   // conexão do retransmissor HTTPS em paralelo com a descoberta de rede, e
   // ESPERAR ela conectar de verdade antes desta função devolver o controle
-  // (ver openNtfyStream: se o espectador publicar a resposta antes disso,
-  // ela se perde).
+  // (ver openNtfyStream: se alguém publicar uma mensagem antes disso, ela
+  // se perde).
   const sessionId = crypto.randomBytes(8).toString('base64url');
   const ntfyAbort = new AbortController();
 
@@ -343,54 +398,64 @@ async function startHostListener({ onAnswer }) {
     return null;
   }
 
-  // A resposta pode chegar por dois canais em paralelo (UDP direto ou
-  // retransmissor HTTPS, ver topo do arquivo) — e cada um reenvia/reconsulta
-  // várias vezes até confirmar, então mais de uma cópia idêntica pode
-  // aparecer. Aplica só a primeira; as demais só recebem a confirmação de
-  // novo, pra fazer quem mandou parar de tentar.
-  let answered = false;
   let stopped = false;
+  const assembler = createMessageAssembler();
+  // Callbacks "finish" de todo send() ainda em andamento — usado só pra
+  // conseguir encerrar todos de uma vez, como falha, se stop() for chamado
+  // no meio (o socket morre e eles nunca mais receberiam ack nenhum).
+  const pendingSends = new Set();
+  // mid -> callback do send() em andamento esperando o ack; chamado assim
+  // que o ack chegar por QUALQUER via (UDP ou ntfy — a primeira que chegar
+  // resolve, o resto é ignorado porque o mid já sai do mapa).
+  const pendingAcks = new Map();
+
+  // Ponto único por onde toda mensagem recebida passa, venha de UDP
+  // (rinfo preenchido) ou do stream ntfy (rinfo null) — responde no MESMO
+  // canal em que a mensagem chegou.
+  function handleIncoming(envelope, rinfo) {
+    if (!envelope || envelope.v !== 1 || envelope.sid !== sessionId) return;
+
+    if (envelope.t === 'ack') {
+      const onAck = pendingAcks.get(envelope.mid);
+      if (onAck) onAck(rinfo ? { source: 'udp', address: `${rinfo.address}:${rinfo.port}` } : { source: 'http-relay' });
+      return;
+    }
+
+    const from = typeof envelope.from === 'string' ? envelope.from : null;
+    const complete = assembler(envelope);
+    if (!complete) return; // ainda faltam pedaços, ou envelope não reconhecido
+
+    if (from) {
+      const ack = { v: 1, sid: from, t: 'ack', mid: envelope.mid };
+      if (rinfo) {
+        socket.send(Buffer.from(JSON.stringify(ack)), rinfo.port, rinfo.address, () => {});
+      } else {
+        postNtfyMessage(from, ack).catch(() => {});
+      }
+    }
+
+    onMessage(complete, { from });
+  }
 
   socket.on('message', (msg, rinfo) => {
-    let data;
+    let envelope;
     try {
-      data = JSON.parse(msg.toString('utf8'));
+      envelope = JSON.parse(msg.toString('utf8'));
     } catch {
       return; // não é JSON válido (ex: ruído/scan) — ignora
     }
-    if (!data || data.v !== 1 || data.sid !== sessionId || data.t !== 'answer' || typeof data.code !== 'string') return;
-
-    if (!answered) {
-      answered = true;
-      onAnswer(data.code);
-    }
-    const ack = Buffer.from(JSON.stringify({ v: 1, sid: sessionId, t: 'ack' }));
-    socket.send(ack, rinfo.port, rinfo.address, () => {});
+    handleIncoming(envelope, rinfo);
   });
 
-  // Reforço via retransmissor HTTPS: a primeira conexão já foi aberta e
-  // confirmada acima (initialNtfyStream), em paralelo com STUN/UPnP — por
-  // isso o código do convite só sai depois de garantir que já dá pra
-  // escutar. Lê essa conexão, e só reconecta (nova chamada a openNtfyStream)
-  // se ela cair sozinha antes da escuta terminar.
-  const assembleAnswer = createChunkAssembler();
-  const handleNtfyMessage = (data) => {
-    if (!data || data.v !== 1) return;
-    const fullCode = assembleAnswer(data);
-    if (!fullCode) return; // ainda faltam pedaços, ou não é uma mensagem de resposta
-    if (!answered) {
-      console.log('[signal-punch] ntfy: resposta recebida via retransmissor HTTPS');
-      answered = true;
-      onAnswer(fullCode);
-    }
-    postNtfyMessage(`${sessionId}-ack`, { v: 1, t: 'ack' }).catch(() => {});
-  };
-
+  // A primeira conexão ntfy já foi aberta e confirmada acima
+  // (initialNtfyStream), em paralelo com STUN/UPnP. Lê essa conexão, e só
+  // reconecta (nova chamada a openNtfyStream) se ela cair sozinha antes da
+  // sessão terminar.
   (async () => {
     let stream = initialNtfyStream;
     while (!stopped) {
       if (stream) {
-        await readNtfyStream(stream, handleNtfyMessage);
+        await readNtfyStream(stream, (data) => handleIncoming(data, null));
         stream = null;
         if (stopped) break;
       }
@@ -400,141 +465,90 @@ async function startHostListener({ onAnswer }) {
     }
   })().catch(() => {});
 
+  // Manda `message` pro participante identificado por (targetSessionId,
+  // targetCandidates) — divide em pedaços (ver MESSAGE_CHUNK_SIZE) e corre
+  // as duas vias: publica cada pedaço no ntfy UMA vez só (HTTP já garante
+  // entrega se o POST voltar sucesso — repetir isso à toa foi o que
+  // estourou o limite de taxa do ntfy.sh numa versão anterior deste
+  // arquivo), e reenvia por UDP periodicamente (que não tem confirmação
+  // embutida) até o destinatário confirmar com um ack — por qualquer via —
+  // ou estourar o tempo limite.
+  function send(targetCandidates, targetSessionId, message, opts = {}) {
+    const timeoutMs = opts.timeoutMs ?? 6000;
+    const udpRetryIntervalMs = opts.udpRetryIntervalMs ?? 600;
+
+    const mid = crypto.randomBytes(6).toString('base64url');
+    const chunkStrings = splitIntoChunks(JSON.stringify(message), MESSAGE_CHUNK_SIZE);
+    const envelopes = chunkStrings.map((c, i) => ({
+      v: 1,
+      sid: targetSessionId,
+      from: sessionId,
+      mid,
+      i,
+      n: chunkStrings.length,
+      c,
+    }));
+
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (result) => {
+        if (done) return;
+        done = true;
+        clearInterval(udpRetryTimer);
+        clearTimeout(giveUpTimer);
+        pendingAcks.delete(mid);
+        pendingSends.delete(finish);
+        resolve(result);
+      };
+      pendingSends.add(finish);
+
+      pendingAcks.set(mid, (via) => finish({ ok: true, via }));
+
+      envelopes.forEach((env) => postNtfyMessage(targetSessionId, env).catch(() => {}));
+
+      // socket.send() LANÇA de verdade (não é uma Promise rejeitada) se o
+      // socket já tiver sido fechado — pode acontecer se o app fechar ou a
+      // pessoa sair da sala bem no meio de um envio ainda tentando
+      // confirmar (ex: o aviso de "saí da sala" mandado pros outros ao
+      // fechar). Sem o try/catch aqui, isso derrubava o processo inteiro:
+      // uma exceção dentro de um callback de setInterval não tem Promise
+      // nenhuma pra capturá-la, então virava um "Uncaught Exception" fatal
+      // no processo principal.
+      const sendUdpOnce = () => {
+        envelopes.forEach((env) => {
+          const payload = Buffer.from(JSON.stringify(env));
+          (targetCandidates || []).forEach((c) => {
+            try {
+              socket.send(payload, c.port, c.ip, () => {});
+            } catch {
+              // socket já fechado — essa via não serve mais, mas não é
+              // motivo pra derrubar o app; só segue (stop() abaixo já
+              // encerra qualquer send() pendente como falha de qualquer jeito).
+            }
+          });
+        });
+      };
+      sendUdpOnce();
+      const udpRetryTimer = setInterval(sendUdpOnce, udpRetryIntervalMs);
+      const giveUpTimer = setTimeout(() => finish({ ok: false, via: null }), timeoutMs);
+    });
+  }
+
   return {
     sessionId,
     candidates,
+    send,
     stop: () => {
       stopped = true;
       ntfyAbort.abort();
       socket.close();
       if (upnpResult) upnpResult.cleanup();
+      // Nenhum send() ainda em andamento vai conseguir confirmar depois
+      // disso (o socket morreu) — encerra todos como falha na hora, em vez
+      // de deixar cada um esperando pelo próprio timeout individual.
+      pendingSends.forEach((finish) => finish({ ok: false, via: null }));
     },
   };
 }
 
-// Manda a resposta pra TODOS os candidatos UDP ao mesmo tempo (não sabemos de
-// antemão qual vai funcionar — local, LAN ou público — então corre todos em
-// paralelo), com retentativas, até o transmissor confirmar com um ack ou
-// estourar o tempo limite. Retorna qual candidato exatamente respondeu (se
-// algum) — não é só "conectou/não conectou", é "conectou via tal endereço
-// (local/stun/upnp)" — pra dar pra diagnosticar de verdade quando não
-// conectar, em vez de ficar só adivinhando.
-function sendAnswerViaUdp({ candidates, sessionId, code }, { retries = 9, intervalMs = 500, timeoutMs = 5000 } = {}) {
-  const payload = Buffer.from(JSON.stringify({ v: 1, sid: sessionId, t: 'answer', code }));
-
-  return new Promise((resolve) => {
-    const socket = dgram.createSocket('udp4');
-    let done = false;
-
-    const finish = (result) => {
-      if (done) return;
-      done = true;
-      clearInterval(retryTimer);
-      clearTimeout(giveUpTimer);
-      socket.close();
-      resolve(result);
-    };
-
-    socket.on('message', (msg, rinfo) => {
-      let data;
-      try {
-        data = JSON.parse(msg.toString('utf8'));
-      } catch {
-        return;
-      }
-      if (!(data && data.v === 1 && data.sid === sessionId && data.t === 'ack')) return;
-      // O ack chega do endereço que o transmissor "enxerga" como origem —
-      // deve bater com um dos candidatos que mandamos (local direto, ou o
-      // IP:porta público se veio via STUN/UPnP).
-      const via = candidates.find((c) => c.ip === rinfo.address && c.port === rinfo.port) || null;
-      finish({ ok: true, via });
-    });
-    socket.on('error', () => finish({ ok: false, via: null }));
-
-    let attempts = 0;
-    const sendToAll = () => {
-      attempts += 1;
-      candidates.forEach((c) => socket.send(payload, c.port, c.ip, () => {}));
-    };
-    sendToAll();
-    const retryTimer = setInterval(() => {
-      if (attempts >= retries) return;
-      sendToAll();
-    }, intervalMs);
-    const giveUpTimer = setTimeout(() => finish({ ok: false, via: null }), timeoutMs);
-  });
-}
-
-// Reforço via retransmissor HTTPS (ver comentário no topo do arquivo e nota
-// grande em openNtfyStream): abre e CONFIRMA a conexão no tópico de
-// confirmação antes de publicar qualquer coisa — testado na prática que
-// publicar primeiro e conectar depois perde a mensagem sempre que o outro
-// lado responde rápido. Só então divide a resposta em pedaços (ver
-// NTFY_CHUNK_SIZE/createChunkAssembler) e publica todos no "tópico" da
-// sessão.
-async function sendAnswerViaHttpRelay({ sessionId, code, timeoutMs }) {
-  const controller = new AbortController();
-  const ackStream = await openNtfyStream(`${sessionId}-ack`, controller.signal);
-  if (!ackStream) return { ok: false, via: null };
-
-  return new Promise((resolve) => {
-    let done = false;
-
-    const finish = (result) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      controller.abort();
-      resolve(result);
-    };
-
-    const timer = setTimeout(() => {
-      console.error('[signal-punch] ntfy: publicado mas nenhuma confirmação chegou a tempo');
-      finish({ ok: false, via: null });
-    }, timeoutMs);
-
-    readNtfyStream(ackStream, (data) => {
-      if (!(data && data.v === 1 && data.t === 'ack')) return;
-      console.log('[signal-punch] ntfy: confirmação recebida');
-      finish({ ok: true, via: { source: 'http-relay' } });
-    }).catch(() => {});
-
-    (async () => {
-      const chunks = [];
-      for (let i = 0; i < code.length; i += NTFY_CHUNK_SIZE) chunks.push(code.slice(i, i + NTFY_CHUNK_SIZE));
-
-      const posted = await Promise.all(
-        chunks.map((c, i) => postNtfyMessage(sessionId, { v: 1, sid: sessionId, t: 'answer-chunk', i, n: chunks.length, c }))
-      );
-      if (posted.some((ok) => !ok)) {
-        console.error('[signal-punch] ntfy: falha ao publicar um ou mais pedaços da resposta');
-        finish({ ok: false, via: null });
-        return;
-      }
-      console.log(`[signal-punch] ntfy: resposta publicada em ${chunks.length} pedaço(s), aguardando confirmação...`);
-    })();
-  });
-}
-
-// Corre as duas vias em paralelo — o que responder primeiro com sucesso,
-// ganha. Só devolve falha se as duas falharem.
-async function sendAnswer({ candidates, sessionId, code }, opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? 5000;
-
-  return new Promise((resolve) => {
-    let pending = 2;
-    const onSettled = (result) => {
-      if (result.ok) {
-        resolve(result);
-        return;
-      }
-      pending -= 1;
-      if (pending === 0) resolve(result);
-    };
-
-    sendAnswerViaUdp({ candidates, sessionId, code }, opts).then(onSettled);
-    sendAnswerViaHttpRelay({ sessionId, code, timeoutMs }).then(onSettled);
-  });
-}
-
-module.exports = { startHostListener, sendAnswer };
+module.exports = { startListener };
