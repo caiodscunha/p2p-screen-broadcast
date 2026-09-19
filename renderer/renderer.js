@@ -273,6 +273,11 @@ let localStream = null;
 let viewers = []; // { id, pc }
 let viewerCounter = 0;
 
+// Handshake automático (UDP+STUN) do espectador que está no meio da conexão
+// agora — ver signal-punch.js. Null se a rede não permitiu abrir o ponto de
+// escuta (aí só resta o fluxo manual de sempre).
+let pendingSignal = null;
+
 const preview = document.getElementById('preview');
 const btnStartCapture = document.getElementById('btn-start-capture');
 const btnPauseCapture = document.getElementById('btn-pause-capture');
@@ -285,6 +290,7 @@ const answerInputBlock = document.getElementById('answer-input-block');
 const answerCodeInput = document.getElementById('answer-code-input');
 const pasteAnswerBtn = document.getElementById('paste-answer');
 const connectAnswerBtn = document.getElementById('connect-answer');
+const autoConnectStatusEl = document.getElementById('auto-connect-status');
 const viewerListEl = document.getElementById('viewer-list');
 const broadcastPassphraseInput = document.getElementById('broadcast-passphrase');
 const liveBadge = document.getElementById('live-badge');
@@ -623,6 +629,11 @@ function stopCapture() {
   preview.srcObject = null;
   viewers.forEach((v) => v.pc.close());
   viewers = [];
+  if (pendingSignal) {
+    window.api.stopHostSignal(pendingSignal.sessionId);
+    pendingSignal = null;
+  }
+  pendingViewerId = null;
   renderViewerList();
   btnStartCapture.disabled = false;
   btnPauseCapture.disabled = true;
@@ -675,11 +686,34 @@ btnNewViewer.addEventListener('click', async () => {
   await pc.setLocalDescription(offer);
   await waitIceGatheringComplete(pc);
 
+  // Se ainda houver um handshake automático de um espectador anterior sem
+  // resposta, encerra — só um por vez faz sentido (é sempre o pendingViewerId
+  // mais recente que fica esperando resposta).
+  if (pendingSignal) {
+    window.api.stopHostSignal(pendingSignal.sessionId);
+    pendingSignal = null;
+  }
+  pendingSignal = await window.api.startHostSignal(); // null se nem IP local nem STUN disponíveis nessa rede
+
+  // O ponto de encontro (candidatos IP:porta + id de sessão) vai embutido no
+  // mesmo payload que é criptografado com a senha — assim continua tão
+  // protegido quanto o resto do código, em vez de vazar o IP por fora.
+  const offerPayload = { sdp: pc.localDescription.toJSON() };
+  if (pendingSignal) {
+    offerPayload.signal = { sid: pendingSignal.sessionId, cands: pendingSignal.candidates };
+  }
+
   pendingViewerId = id;
-  offerCodeEl.value = await encode(pc.localDescription.toJSON(), broadcastPassphraseInput.value.trim());
+  offerCodeEl.value = await encode(offerPayload, broadcastPassphraseInput.value.trim());
   offerBlock.hidden = false;
   answerInputBlock.hidden = false;
   answerCodeInput.value = '';
+  // Detalhe de candidatos (IPs) só no console — nunca na tela, pra não expor
+  // endereço de rede de quem está transmitindo pra quem só olhar a janela.
+  if (pendingSignal) console.log('[auto-connect] candidatos:', pendingSignal.candidates);
+  autoConnectStatusEl.textContent = pendingSignal
+    ? 'Se a rede permitir, a conexão acontece sozinha assim que a pessoa colar o código.'
+    : 'Conexão automática indisponível nessa rede — só o fluxo manual.';
 });
 
 copyOfferBtn.addEventListener('click', () => {
@@ -690,6 +724,45 @@ pasteAnswerBtn.addEventListener('click', async () => {
   answerCodeInput.value = await window.api.readClipboard();
 });
 
+// Aplica um código de resposta (colado manualmente ou recebido automático
+// via UDP) a um espectador pendente. O nome do espectador vem embutido no
+// código de resposta (não há canal de sinalização contínuo pra mandar isso
+// separado). Formato antigo (só a descrição, sem "sdp"/"name") continua
+// funcionando como fallback.
+async function applyAnswerCode(viewer, codeString) {
+  const decoded = await decode(codeString, broadcastPassphraseInput.value.trim());
+  const answer = decoded && decoded.sdp ? decoded.sdp : decoded;
+  const name = decoded && decoded.name ? String(decoded.name).trim().slice(0, 60) : '';
+  if (name) viewer.name = name;
+  await viewer.pc.setRemoteDescription(answer);
+}
+
+function finishPendingViewerConnection() {
+  if (pendingSignal) {
+    window.api.stopHostSignal(pendingSignal.sessionId);
+    pendingSignal = null;
+  }
+  offerBlock.hidden = true;
+  answerInputBlock.hidden = true;
+  pendingViewerId = null;
+  renderViewerList();
+}
+
+// Resposta chegou sozinha por UDP (ver signal-punch.js) — mesmo efeito de
+// colar o código manualmente e clicar "Conectar espectador".
+window.api.onSignalAnswer(async ({ sessionId, code }) => {
+  if (!pendingSignal || pendingSignal.sessionId !== sessionId) return; // sessão antiga/já encerrada
+  const viewer = viewers.find((v) => v.id === pendingViewerId);
+  if (!viewer) return;
+  try {
+    await applyAnswerCode(viewer, code);
+  } catch (err) {
+    autoConnectStatusEl.textContent = 'Recebi uma resposta automática, mas o código veio inválido — peça pra enviar manualmente.';
+    return;
+  }
+  finishPendingViewerConnection();
+});
+
 connectAnswerBtn.addEventListener('click', async () => {
   const viewer = viewers.find((v) => v.id === pendingViewerId);
   if (!viewer) {
@@ -697,22 +770,12 @@ connectAnswerBtn.addEventListener('click', async () => {
     return;
   }
   try {
-    const decoded = await decode(answerCodeInput.value, broadcastPassphraseInput.value.trim());
-    // O nome do espectador vem embutido no código de resposta (não há canal
-    // de sinalização contínuo para mandar isso separado). Formato antigo
-    // (só a descrição, sem "sdp"/"name") continua funcionando como fallback.
-    const answer = decoded && decoded.sdp ? decoded.sdp : decoded;
-    const name = decoded && decoded.name ? String(decoded.name).trim().slice(0, 60) : '';
-    if (name) viewer.name = name;
-    await viewer.pc.setRemoteDescription(answer);
+    await applyAnswerCode(viewer, answerCodeInput.value);
   } catch (err) {
     alert('Código de resposta inválido: ' + err.message);
     return;
   }
-  offerBlock.hidden = true;
-  answerInputBlock.hidden = true;
-  pendingViewerId = null;
-  renderViewerList();
+  finishPendingViewerConnection();
 });
 
 // Diagnóstico visível na própria UI (sem precisar de DevTools, que fica
@@ -812,6 +875,17 @@ function renderViewerList() {
     removeBtn.addEventListener('click', () => {
       v.pc.close();
       viewers = viewers.filter((x) => x.id !== v.id);
+      if (v.id === pendingViewerId) {
+        // Espectador removido no meio da conexão: não deixa o ponto de
+        // escuta UDP nem os campos de código pendentes penduradas.
+        if (pendingSignal) {
+          window.api.stopHostSignal(pendingSignal.sessionId);
+          pendingSignal = null;
+        }
+        pendingViewerId = null;
+        offerBlock.hidden = true;
+        answerInputBlock.hidden = true;
+      }
       renderViewerList();
     });
 
@@ -840,12 +914,16 @@ const remoteVideo = document.getElementById('remote-video');
 const btnDisconnect = document.getElementById('btn-disconnect');
 const watchPassphraseInput = document.getElementById('watch-passphrase');
 const viewerNameInput = document.getElementById('viewer-name-input');
+const btnShowAnswerCode = document.getElementById('btn-show-answer-code');
 
 pasteOfferBtn.addEventListener('click', async () => {
   offerCodeInput.value = await window.api.readClipboard();
 });
 
-btnGenerateAnswer.addEventListener('click', async () => {
+// A resposta é sempre gerada (precisa existir pra tentar a conexão
+// automática), mas só fica visível pra copiar na mão se a tentativa
+// automática falhar — ver botão "Problemas para conectar?" abaixo.
+async function generateAnswer() {
   let offer;
   try {
     offer = await decode(offerCodeInput.value, watchPassphraseInput.value.trim());
@@ -854,12 +932,17 @@ btnGenerateAnswer.addEventListener('click', async () => {
     return;
   }
 
+  const offerSdp = offer && offer.sdp ? offer.sdp : offer;
+  const signalInfo = offer && offer.signal ? offer.signal : null;
+
   if (viewerPc) {
     viewerPc.close();
   }
 
   viewerPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
   btnDisconnect.disabled = false;
+  btnShowAnswerCode.hidden = true;
+  answerBlock.hidden = true;
 
   viewerPc.addEventListener('track', (event) => {
     remoteVideo.srcObject = event.streams[0];
@@ -869,7 +952,7 @@ btnGenerateAnswer.addEventListener('click', async () => {
     watchStatus.textContent = 'Status: ' + viewerPc.connectionState;
   });
 
-  await viewerPc.setRemoteDescription(offer);
+  await viewerPc.setRemoteDescription(offerSdp);
   const answer = await viewerPc.createAnswer();
   await viewerPc.setLocalDescription(answer);
   await waitIceGatheringComplete(viewerPc);
@@ -878,9 +961,42 @@ btnGenerateAnswer.addEventListener('click', async () => {
     sdp: viewerPc.localDescription.toJSON(),
     name: viewerNameInput.value.trim().slice(0, 60),
   };
-  answerCodeEl.value = await encode(payload, watchPassphraseInput.value.trim());
+  const passphrase = watchPassphraseInput.value.trim();
+  const answerCode = await encode(payload, passphrase);
+  answerCodeEl.value = answerCode;
+
+  if (!signalInfo) {
+    // Sem ponto de encontro embutido no código (nem IP local nem STUN
+    // disponíveis do lado de quem transmite) — direto pro manual.
+    watchStatus.textContent = 'Conexão automática indisponível nessa rede.';
+    answerBlock.hidden = false;
+    return;
+  }
+
+  console.log('[auto-connect] tentando:', signalInfo.cands);
+  watchStatus.textContent = 'Conectando automaticamente...';
+  const { ok, via } = await window.api.sendSignalAnswer({
+    candidates: signalInfo.cands,
+    sessionId: signalInfo.sid,
+    code: answerCode,
+  });
+
+  if (ok) {
+    console.log('[auto-connect] conectado via', via);
+    watchStatus.textContent = via && via.source === 'http-relay'
+      ? 'Conectado automaticamente (via retransmissor)! Aguardando vídeo...'
+      : 'Conectado automaticamente! Aguardando vídeo...';
+  } else {
+    console.log('[auto-connect] falhou, candidatos tentados:', signalInfo.cands);
+    watchStatus.textContent = 'Não conectei automaticamente.';
+    btnShowAnswerCode.hidden = false;
+  }
+}
+
+btnGenerateAnswer.addEventListener('click', generateAnswer);
+
+btnShowAnswerCode.addEventListener('click', () => {
   answerBlock.hidden = false;
-  watchStatus.textContent = 'Envie o código de resposta ao transmissor...';
 });
 
 copyAnswerBtn.addEventListener('click', () => {
@@ -895,5 +1011,6 @@ btnDisconnect.addEventListener('click', () => {
   remoteVideo.srcObject = null;
   btnDisconnect.disabled = true;
   answerBlock.hidden = true;
+  btnShowAnswerCode.hidden = true;
   watchStatus.textContent = 'Desconectado.';
 });

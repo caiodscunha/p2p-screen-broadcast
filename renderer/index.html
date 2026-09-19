@@ -84,7 +84,8 @@
         <div class="card">
           <h2><span class="step-badge">2</span>Adicionar espectador</h2>
           <p class="hint">Cada espectador precisa de um código próprio. Gere um código, envie
-            para a pessoa (WhatsApp, chat, etc.), e cole de volta o código de resposta que ela te mandar.</p>
+            para a pessoa (WhatsApp, chat, etc.) — se a rede permitir, a conexão acontece sozinha
+            assim que ela colar o código; senão, ela te manda um código de resposta pra colar aqui.</p>
           <div class="field-block">
             <label for="broadcast-passphrase">Senha para proteger o código (opcional)</label>
             <input type="text" id="broadcast-passphrase"
@@ -99,6 +100,7 @@
           </div>
 
           <div class="field-block code-block" id="answer-input-block" hidden>
+            <p id="auto-connect-status" class="hint"></p>
             <label>Cole aqui o código de resposta do espectador</label>
             <textarea id="answer-code-input" placeholder="Cole o código aqui..."></textarea>
             <div class="btn-row">
@@ -132,7 +134,8 @@
             <label for="watch-passphrase">Senha combinada com quem transmite (se houver)</label>
             <input type="text" id="watch-passphrase" placeholder="Deixe em branco se não houver senha" />
           </div>
-          <button id="btn-generate-answer" class="btn btn-primary">Gerar código de resposta</button>
+          <button id="btn-generate-answer" class="btn btn-primary">Entrar</button>
+          <button id="btn-show-answer-code" type="button" class="btn btn-ghost" hidden>Problemas para conectar? Gerar código de resposta</button>
 
           <div class="field-block code-block" id="answer-block" hidden>
             <label>Código de resposta (envie de volta ao transmissor)</label>

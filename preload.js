@@ -22,4 +22,15 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('audio-process:error', listener);
     return () => ipcRenderer.removeListener('audio-process:error', listener);
   },
+
+  // Handshake automático de resposta (UDP+STUN, ver signal-punch.js) — os
+  // candidatos vão embutidos no próprio código de oferta, ver renderer.js.
+  startHostSignal: () => ipcRenderer.invoke('signal:startHost'),
+  stopHostSignal: (sessionId) => ipcRenderer.invoke('signal:stopHost', sessionId),
+  sendSignalAnswer: (info) => ipcRenderer.invoke('signal:sendAnswer', info),
+  onSignalAnswer: (callback) => {
+    const listener = (event, data) => callback(data);
+    ipcRenderer.on('signal:answer', listener);
+    return () => ipcRenderer.removeListener('signal:answer', listener);
+  },
 });

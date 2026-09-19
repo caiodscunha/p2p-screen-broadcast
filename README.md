@@ -5,8 +5,11 @@ Windows, macOS and Linux, built with Electron and native WebRTC.
 
 It was created as a **free alternative to Discord's screen sharing**, after
 Discord's streaming/voice features were blocked for users in Brazil. No
-signaling server, no accounts, no infrastructure to maintain, just two
-people exchanging a text code to establish a direct peer-to-peer connection.
+signaling server of our own, no accounts, no infrastructure to maintain: the
+broadcaster generates a code, sends it to a viewer over any chat app, and
+the connection is established directly between the two — automatically
+whenever the network allows it, falling back to pasting one response code
+back manually otherwise.
 
 ## Features
 
@@ -18,10 +21,17 @@ people exchanging a text code to establish a direct peer-to-peer connection.
   via WASAPI Process Loopback — no manual audio device routing required
 - 🔗 Fully peer-to-peer via WebRTC, no relay server ever touches your
   video/audio
-- 🚫 Zero infrastructure, no signaling server, no backend, no account,
-  no database
-- 📋 Manual signaling via copy/paste, one offer/answer code exchange per
-  viewer, sendable over WhatsApp, chat, email, anything
+- ⚡ Automatic connection when possible: tries a direct UDP path first
+  (local network, UPnP router port mapping, STUN-discovered public
+  address), then a free public relay as a second attempt — no manual
+  copy/paste needed when either one works
+- 📋 Manual signaling as a guaranteed fallback: one offer/answer code
+  exchange per viewer, sendable over WhatsApp, chat, email, anything,
+  whenever the automatic path can't get through
+- 🚫 No infrastructure of our own: no backend, no database, no accounts —
+  see [How it works](#how-it-works) for the two free, public, neutral
+  services involved in establishing the connection (never in the actual
+  video/audio)
 - 👥 One broadcaster, multiple simultaneous viewers
 - 🎯 Minimal by design, just screen/audio broadcasting, no chat, no room
   list, no extra features
@@ -35,24 +45,49 @@ service or server. Every participant just runs the same app locally.
 
 ## How it works
 
-There is **no signaling server**, not even a free public one. Instead, the
-SDP handshake required by WebRTC is done manually:
+The SDP handshake required by WebRTC still boils down to one **offer code**
+and one **answer code**, exchanged like before — but delivering the answer
+back to the broadcaster is now automated whenever possible, instead of
+always requiring a manual copy/paste in both directions:
 
 1. The broadcaster starts screen capture and generates a base64-encoded
    **offer code** (ICE gathering is awaited to completion, so it's a single
-   one-shot code, no trickle ICE needed).
+   one-shot code, no trickle ICE needed). This code also embeds a small,
+   passphrase-protected "rendezvous" section (a random session id plus a
+   handful of network addresses) used only for the automatic delivery
+   described below.
 2. The broadcaster sends that code to a viewer through any side channel
    (WhatsApp, Discord text chat, email, etc).
-3. The viewer pastes the code into the app and generates an **answer
-   code**, which they send back to the broadcaster.
-4. The broadcaster pastes the answer code in, the direct P2P connection
-   is established and the stream starts playing for the viewer.
+3. The viewer pastes the code into the app and clicks **Enter**. The app
+   generates the answer, then tries to deliver it back automatically:
+   - First, direct UDP to one of the addresses embedded in the offer (the
+     broadcaster's local network address, a port UPnP mapped on their
+     router, or their public address discovered via STUN).
+   - In parallel, as a second attempt, a free public relay
+     ([ntfy.sh](https://ntfy.sh)) — used only to shuttle the small
+     signaling payload over plain HTTPS, so it works even when direct UDP
+     is blocked by a NAT/firewall/ISP that doesn't allow it (which happens
+     in practice on some networks).
+   - Whichever path succeeds first wins, and the broadcaster's app applies
+     the answer automatically — no code ever needs to be copied back.
+4. If neither automatic path works (e.g. very restrictive network on both
+   ends), the app falls back to showing the same **answer code** as before,
+   for the viewer to send back manually; the broadcaster pastes it in to
+   complete the connection.
 5. Steps 1–4 are repeated once per additional viewer.
 
-The only external service involved is a public Google STUN server
-(`stun.l.google.com:19302`), used only to help discover each participant's
-public IP/port for NAT traversal. No STUN/TURN server ever sees your
-video, audio, or any application data.
+Two free, public, neutral third-party services are involved in setting up
+the connection — never in the actual video/audio, which always flows
+directly between the two peers over WebRTC:
+
+- **Google's public STUN server** (`stun.l.google.com:19302`), used to help
+  each participant discover their own public IP/port for NAT traversal.
+- **[ntfy.sh](https://ntfy.sh)**, a free and open-source pub/sub-over-HTTP
+  service (self-hostable, same code you could run yourself), used only as
+  a best-effort relay for the tiny signaling payload described in step 3.
+  If you'd rather this app never talk to it at all, it's only ever used as
+  a fallback alongside direct UDP — either one failing just means falling
+  back further, down to the fully manual flow.
 
 ### Code encryption (optional)
 
@@ -154,8 +189,10 @@ option in the UI).
    **Start screen capture**.
 2. Click **Generate code for new viewer** and copy the generated code.
 3. Send that code to the viewer through any channel (WhatsApp, chat, etc).
-4. Ask the viewer for their response code, paste it into the "Paste
-   response code here" field, and click **Connect viewer**.
+4. If the network allows it, the viewer's connection completes
+   automatically — nothing else to do. If their app shows "Couldn't connect
+   automatically", ask for the response code it gives them, paste it into
+   the "Paste response code here" field, and click **Connect viewer**.
 5. Repeat steps 2–4 for each additional person who wants to watch.
 
 At any point after step 1, click **Pause sharing** to freeze the video for
@@ -165,18 +202,27 @@ keeps playing); click it again to resume.
 ### Watching
 
 1. Go to the **Watch** tab and paste the code received from the broadcaster.
-2. Click **Generate response code** and copy the generated code.
-3. Send that response code back to the broadcaster.
-4. Once the broadcaster connects, video and audio start playing
-   automatically.
+2. Click **Enter** — the app tries to connect automatically.
+3. If it can't (the status will say so), click **"Couldn't connect?
+   Generate response code"**, copy the code it shows, and send it back to
+   the broadcaster.
+4. Once connected — automatically or after the broadcaster pastes your
+   response code — video and audio start playing.
 
 ## Limitations
 
-- **No TURN server**: if both participants are behind restrictive/symmetric
-  NATs (e.g. some corporate networks), the direct connection may fail.
-  Works reliably on normal home networks.
-- **Manual signaling only**: every new viewer requires one manual
-  offer/answer code exchange, there's no room/lobby system by design.
+- **No TURN server**: this only affects the actual video/audio stream, not
+  the signaling relay above — if both participants are behind
+  restrictive/symmetric NATs (e.g. some corporate networks), the direct
+  WebRTC connection itself may fail regardless of how the offer/answer
+  codes were exchanged. Works reliably on normal home networks.
+- **Automatic connection is best-effort**: it depends on things outside the
+  app's control (router UPnP support, ISP/NAT behavior, ntfy.sh being
+  reachable) and can simply not work on some networks. The manual
+  offer/answer code exchange always remains available as a fallback and
+  never stops working.
+- **No room/lobby system**: every new viewer is added one at a time by
+  design, there's no shared "room code" or viewer list to join from.
 - **No native system-audio loopback on Linux**: `getDisplayMedia` loopback
   audio is only supported by Chromium/Electron on Windows and macOS. On
   Linux the app instead lets you manually pick a PulseAudio/PipeWire
