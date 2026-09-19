@@ -382,6 +382,11 @@ function toPeerInfo(peer) {
 }
 
 function myPeerInfo() {
+  // Mesma proteção de sendToPeer: `myListener` pode ter virado null (saiu da
+  // sala) entre um await e outro de uma função que ainda está no meio de
+  // montar uma mensagem pra mandar — melhor devolver algo inofensivo do que
+  // derrubar com uma exceção não relacionada ao que realmente aconteceu.
+  if (!myListener) return { peerId: myPeerId, name: myName, sid: null, cands: [] };
   return { peerId: myPeerId, name: myName, sid: myListener.sessionId, cands: myListener.candidates };
 }
 
@@ -417,6 +422,13 @@ function handleWelcome(message) {
 }
 
 function sendToPeer(peer, message, opts) {
+  // `myListener` pode virar null no meio de um envio ainda em andamento (ex:
+  // saiu da sala/fechou o app enquanto uma retentativa de sendToPeerReliable
+  // ainda estava pendente) — sem essa checagem, isso derrubava a função com
+  // "Cannot read properties of null (reading 'sessionId')" em vez de só
+  // desistir silenciosamente, algo que só o try/catch de quem chama não
+  // cobria porque a exceção vinha antes de qualquer Promise existir.
+  if (!myListener) return Promise.resolve({ ok: false, via: null });
   return window.api.sendSignalMessage({
     mySessionId: myListener.sessionId,
     candidates: peer.cands,
@@ -464,6 +476,8 @@ function connectToPeer(peerInfo) {
     pendingIceCandidates: [],
     makingOffer: false,
     sharing: false,
+    volume: 1,
+    volumeBeforeMute: 1,
     connectionState: 'new',
   };
   roomPeers.set(peer.peerId, peer);
@@ -1220,10 +1234,20 @@ function sharingItemsList() {
 // track/stream continuando perfeitamente viva (por isso quem assistia via
 // WebRTC nunca via esse problema — o RTCRtpSender usa a track direto, sem
 // passar por nenhum elemento <video>).
-function ensureMediaTile(container) {
+const VOLUME_ICON_SVG =
+  '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>' +
+  '<path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>' +
+  '<path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>';
+const VOLUME_MUTED_ICON_SVG =
+  '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>' +
+  '<line x1="23" y1="9" x2="17" y2="15"></line>' +
+  '<line x1="17" y1="9" x2="23" y2="15"></line></svg>';
+
+function ensureMediaTile(container, isSelf) {
   let video = container.querySelector('video');
   if (!video) {
-    console.log('[room] criando elemento <video> novo (deveria acontecer só 1x por participante)');
     video = document.createElement('video');
     video.autoplay = true;
     video.playsInline = true;
@@ -1242,28 +1266,86 @@ function ensureMediaTile(container) {
     name.className = 'stream-card-name';
     container.appendChild(name);
   }
-  return { video, name };
+
+  // Controle de volume por pessoa — não faz sentido pro próprio preview
+  // (autoexcluído do áudio/sempre mutado). Ícone sempre visível, slider só
+  // aparece ao passar o mouse (puro CSS, ver .volume-control:hover).
+  let volumeSlider = container.querySelector('.volume-slider');
+  if (!isSelf && !volumeSlider) {
+    const volumeControl = document.createElement('div');
+    volumeControl.className = 'volume-control';
+    // Sem isso, clicar/arrastar o slider também dispara o clique do card
+    // (entrar em foco) por baixo dele.
+    volumeControl.addEventListener('click', (event) => event.stopPropagation());
+
+    const volumeBtn = document.createElement('button');
+    volumeBtn.type = 'button';
+    volumeBtn.className = 'volume-icon-btn';
+    volumeBtn.innerHTML = VOLUME_ICON_SVG;
+    volumeControl.appendChild(volumeBtn);
+
+    const sliderWrap = document.createElement('div');
+    sliderWrap.className = 'volume-slider-wrap';
+    volumeSlider = document.createElement('input');
+    volumeSlider.type = 'range';
+    volumeSlider.min = '0';
+    volumeSlider.max = '100';
+    volumeSlider.value = '100';
+    volumeSlider.className = 'volume-slider';
+    sliderWrap.appendChild(volumeSlider);
+    volumeControl.appendChild(sliderWrap);
+
+    container.appendChild(volumeControl);
+  }
+
+  const volumeBtn = container.querySelector('.volume-icon-btn');
+  return { video, name, volumeSlider, volumeBtn };
+}
+
+// Muda o volume de um peer e, se o valor for maior que zero, também guarda
+// como "o volume de antes de mutar" — assim o botão de mute sempre sabe pra
+// onde restaurar, seja o mute tendo vindo de um clique no ícone ou de
+// arrastar o slider até o zero na mão.
+function setPeerVolume(peer, v) {
+  peer.volume = v;
+  if (v > 0) peer.volumeBeforeMute = v;
 }
 
 function updateMediaTile(container, item) {
-  const { video, name } = ensureMediaTile(container);
+  const { video, name, volumeSlider, volumeBtn } = ensureMediaTile(container, item.kind === 'self');
   const desiredStream = item.kind === 'self' ? localStream : item.peer.remoteStream || null;
   video.muted = item.kind === 'self';
-  const changed = video.srcObject !== desiredStream;
-  if (changed) video.srcObject = desiredStream;
+  if (video.srcObject !== desiredStream) video.srcObject = desiredStream;
   name.textContent = item.name;
-  // Rastro fino de cada chamada — as duas últimas tentativas (autoplay
-  // policy, backgroundThrottling) não resolveram e "readyState" continuou
-  // travado em 0 mesmo com frame decodificando de verdade (ver
-  // [recv-stats]); em vez de arriscar mais um chute, isso mostra exatamente
-  // se/quando a atribuição de fato acontece pra esse item.
-  console.log(
-    '[room] updateMediaTile',
-    item.name,
-    '— stream:', desiredStream ? `${desiredStream.id} (${desiredStream.getTracks().map((t) => t.kind).join(',')})` : 'nenhuma',
-    '— mudou agora:', changed,
-    '— srcObject após atribuir:', video.srcObject ? video.srcObject.id : 'nenhum'
-  );
+
+  if (volumeSlider && item.kind !== 'self') {
+    const peer = item.peer;
+    if (peer.volume == null) peer.volume = 1;
+    if (peer.volumeBeforeMute == null) peer.volumeBeforeMute = 1;
+    video.volume = peer.volume;
+    volumeBtn.innerHTML = peer.volume > 0 ? VOLUME_ICON_SVG : VOLUME_MUTED_ICON_SVG;
+    // Não pisa no valor enquanto a pessoa está arrastando (evita "puxar" o
+    // slider de volta pro valor antigo no meio do gesto).
+    if (document.activeElement !== volumeSlider) {
+      volumeSlider.value = String(Math.round(peer.volume * 100));
+    }
+    // Mexer no slider sempre "reativa" (o valor arrastado passa a valer na
+    // hora, mesmo vindo de um estado mutado).
+    volumeSlider.oninput = () => {
+      setPeerVolume(peer, Number(volumeSlider.value) / 100);
+      video.volume = peer.volume;
+      volumeBtn.innerHTML = peer.volume > 0 ? VOLUME_ICON_SVG : VOLUME_MUTED_ICON_SVG;
+    };
+    // Clique no ícone alterna: muta (lembrando o volume atual) ou restaura
+    // pro volume de antes de mutar.
+    volumeBtn.onclick = () => {
+      setPeerVolume(peer, peer.volume > 0 ? 0 : peer.volumeBeforeMute);
+      video.volume = peer.volume;
+      volumeSlider.value = String(Math.round(peer.volume * 100));
+      volumeBtn.innerHTML = peer.volume > 0 ? VOLUME_ICON_SVG : VOLUME_MUTED_ICON_SVG;
+    };
+  }
+
   if (desiredStream) {
     video.play().catch((err) => console.warn('[room] play() recusado pra', item.name, '—', err.message));
   }
@@ -1311,14 +1393,33 @@ function renderGrid() {
   });
 }
 
+// Deixar de renderizar um lado (grid ou foco) só esconde o container por
+// CSS — os elementos <video> continuam vivos e tocando áudio por trás,
+// sem que mais ninguém atualize o volume deles (porque aquele lado parou
+// de renderizar). Sem mutar explicitamente quem vai ficar escondido, dava
+// pra ouvir a mesma pessoa duas vezes (uma pelo card antigo, mudo pro
+// controle de volume; outra pelo novo) até sair e voltar do foco de novo.
+// O lado que vai ficar visível se corrige sozinho (`updateMediaTile` já
+// desmuta quando não é o próprio preview), então só precisa mutar quem
+// está saindo de cena.
+function muteAllVideosIn(elements) {
+  for (const el of elements) {
+    const video = el.querySelector('video');
+    if (video) video.muted = true;
+  }
+}
+
 function enterFocus(id) {
   focusedPeerId = id;
+  muteAllVideosIn(gridTileEls.values());
   renderFocus();
 }
 
 function exitFocus() {
   focusedPeerId = null;
   focusViewEl.hidden = true;
+  muteAllVideosIn(focusStripTileEls.values());
+  muteAllVideosIn([focusMainEl]);
   renderGrid();
 }
 
