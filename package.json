@@ -30,6 +30,7 @@
       "main.js",
       "preload.js",
       "capture.js",
+      "signal-punch.js",
       "renderer/**/*",
       "assets/**/*",
       "package.json",
@@ -61,5 +62,8 @@
       "category": "Network",
       "artifactName": "Sinal-P2P-${version}-linux-${arch}.${ext}"
     }
+  },
+  "dependencies": {
+    "@achingbrain/nat-port-mapper": "^4.0.5"
   }
 }

@@ -22,4 +22,21 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('audio-process:error', listener);
     return () => ipcRenderer.removeListener('audio-process:error', listener);
   },
+
+  // Canal de sinalização sem servidor (UDP+STUN+UPnP+ntfy, ver
+  // signal-punch.js) — usado pra entrar numa sala e depois formar a malha de
+  // conexões WebRTC entre todo mundo (ver protocolo em renderer.js).
+  startSignalListener: () => ipcRenderer.invoke('signal:startListener'),
+  stopSignalListener: (sessionId) => ipcRenderer.invoke('signal:stopListener', sessionId),
+  sendSignalMessage: (info) => ipcRenderer.invoke('signal:send', info),
+  onSignalMessage: (callback) => {
+    const listener = (event, data) => callback(data);
+    ipcRenderer.on('signal:message', listener);
+    return () => ipcRenderer.removeListener('signal:message', listener);
+  },
+
+  // Avisa o processo principal quando este PC começa/para de compartilhar a
+  // própria tela, pra ele poder desabilitar o botão de minimizar da janela
+  // enquanto isso — ver comentário em main.js sobre o bug de travamento.
+  setSharingActive: (active) => ipcRenderer.send('sharing:active', active),
 });

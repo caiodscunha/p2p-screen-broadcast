@@ -1,11 +1,217 @@
-const { app, BrowserWindow, session, ipcMain, clipboard, desktopCapturer } = require('electron');
+const { app, BrowserWindow, session, ipcMain, clipboard, desktopCapturer, dialog } = require('electron');
 const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const { exec } = require('child_process');
 const { registerDisplayMediaHandler, supportsSystemAudioLoopback } = require('./capture');
 const processAudio = require('./native/audio-loopback');
+const signalPunch = require('./signal-punch');
+
+// A conexão automática (ver signal-punch.js) manda um pacote UDP não
+// solicitado pro outro PC. Entre duas instâncias na MESMA máquina isso
+// funciona porque o tráfego local não passa pelo mesmo filtro; entre dois
+// PCs de verdade, o Firewall do Windows bloqueia por padrão qualquer pacote
+// de entrada não solicitado de um app sem regra explícita — daí "funciona
+// só no mesmo PC". Não tem como evitar isso com código: qualquer coisa que
+// aceite uma conexão de rede não solicitada precisa de alguma liberação no
+// firewall, é assim que firewall funciona. A correção real é uma regra
+// bem específica (só este programa, só UDP, só em rede privada — nunca em
+// Wi-Fi público) liberando entrada; como isso exige admin, perguntamos por
+// executável (ver getFirewallRuleId) se o usuário quer liberar, e só paramos
+// de perguntar de novo depois de confirmar que a regra realmente ficou lá.
+//
+// Importante: a regra é específica pro caminho exato do .exe (netsh
+// program="..."). Rodar "npm start" (electron.exe dentro de node_modules) e
+// depois testar o .exe empacotado (dist/Sinal-P2P-*.exe) são dois programas
+// diferentes pro Windows — cada um precisa da sua própria liberação.
+function getFirewallRuleId(exePath) {
+  const hash = crypto.createHash('sha1').update(exePath).digest('hex').slice(0, 10);
+  return { name: `Sinal P2P (auto-connect ${hash})`, exePath };
+}
+
+function getFirewallMarkerPath() {
+  return path.join(app.getPath('appData'), 'sinal-p2p', 'firewall-marker.json');
+}
+
+function readFirewallMarker() {
+  try {
+    return JSON.parse(fs.readFileSync(getFirewallMarkerPath(), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+// Guardado por exe (chave = caminho do executável), não um flag único
+// global — assim cada binário (dev vs. empacotado, ou um portátil movido de
+// pasta) pergunta e é verificado de forma independente.
+function writeFirewallMarkerEntry(exePath, entry) {
+  const markerPath = getFirewallMarkerPath();
+  const marker = readFirewallMarker();
+  marker[exePath] = entry;
+  try {
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    fs.writeFileSync(markerPath, JSON.stringify(marker));
+  } catch {
+    // não crítico — na pior das hipóteses pergunta de novo no próximo início
+  }
+}
+
+// "netsh ... show rule" sai com código 0 quando acha a regra e código 1
+// quando não acha ("Nenhuma regra correspondente..."/"No rules match...",
+// dependendo do idioma do Windows) — checa pelo código de saída em vez de
+// tentar casar o texto, que muda de idioma pra idioma.
+function firewallRuleExists(ruleName) {
+  return new Promise((resolve) => {
+    exec(`netsh advfirewall firewall show rule name="${ruleName}"`, (err) => {
+      resolve(!err);
+    });
+  });
+}
+
+// Roda o netsh elevado (precisa de admin pra mexer em regra de firewall).
+// Escreve um .ps1 temporário em vez de aninhar aspas direto no comando —
+// evita o inferno de escaping de rodar PowerShell dentro de PowerShell.
+//
+// A regra é a mais restrita possível pro que precisa funcionar:
+// - program="<exe>": só esse executável pode receber a conexão, nenhum outro
+//   app do PC ganha nada com isso.
+// - protocol=UDP: nada de TCP (não abre "porta" pra serviços tipo compartilhamento
+//   de arquivo/RDP, só o pacotinho de sinalização).
+// - profile=private,domain: NÃO libera em rede Wi-Fi pública (aeroporto, café
+//   etc.) — só em redes marcadas como "privada" no Windows (casa/trabalho
+//   confiável), que é o único cenário em que isso precisa funcionar mesmo.
+function addFirewallRuleElevated(ruleName, exePath) {
+  return new Promise((resolve) => {
+    const scriptPath = path.join(app.getPath('temp'), `sinal-p2p-add-firewall-rule-${process.pid}.ps1`);
+    const scriptContent =
+      `netsh advfirewall firewall add rule name="${ruleName}" dir=in action=allow protocol=UDP program="${exePath}" enable=yes profile=private,domain\r\n`;
+
+    try {
+      fs.writeFileSync(scriptPath, scriptContent, 'utf8');
+    } catch {
+      resolve(false);
+      return;
+    }
+
+    const elevate = `Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File "${scriptPath}"' -Verb RunAs -WindowStyle Hidden -Wait`;
+    exec(`powershell -NoProfile -Command "${elevate}"`, (err) => {
+      try {
+        fs.unlinkSync(scriptPath);
+      } catch {
+        // arquivo temporário; se sobrar, não afeta nada
+      }
+      resolve(!err);
+    });
+  });
+}
+
+async function ensureFirewallAccess() {
+  if (process.platform !== 'win32') return;
+
+  const { name: ruleName, exePath } = getFirewallRuleId(process.execPath);
+  const marker = readFirewallMarker();
+  const previous = marker[exePath];
+
+  // Só para de perguntar quando já sabemos que a regra existe de verdade ou
+  // quando o usuário recusou explicitamente — uma tentativa que falhou (ex:
+  // cancelou o UAC sem querer) volta a perguntar na próxima abertura, em vez
+  // de ficar quebrado pra sempre em silêncio.
+  if (previous?.rule === 'added' || previous?.rule === 'declined') return;
+
+  if (await firewallRuleExists(ruleName)) {
+    writeFirewallMarkerEntry(exePath, { rule: 'added' });
+    return;
+  }
+
+  const { response } = await dialog.showMessageBox({
+    type: 'question',
+    buttons: ['Liberar agora', 'Agora não'],
+    defaultId: 0,
+    cancelId: 1,
+    title: 'Conexão automática entre PCs diferentes',
+    message:
+      'Pra conexão automática funcionar entre PCs diferentes (não só entre duas janelas no mesmo PC), o Windows precisa liberar este app no Firewall. Isso pede permissão de administrador, só essa vez.',
+    detail:
+      'A regra é restrita: só vale pra este programa, só UDP, e só em redes marcadas como privada (nunca em Wi-Fi público). ' +
+      'Se preferir não liberar agora, o app continua funcionando normalmente — só sempre cai no código de resposta manual.',
+  });
+
+  if (response !== 0) {
+    writeFirewallMarkerEntry(exePath, { rule: 'declined' });
+    return;
+  }
+
+  await addFirewallRuleElevated(ruleName, exePath);
+  // Confirma de verdade em vez de assumir que o netsh elevado funcionou —
+  // se o usuário cancelar o UAC, o "Start-Process -Verb RunAs" não retorna
+  // erro pro processo que o chamou, então só dá pra saber checando de novo.
+  const confirmed = await firewallRuleExists(ruleName);
+  writeFirewallMarkerEntry(exePath, { rule: confirmed ? 'added' : 'failed' });
+
+  await dialog.showMessageBox({
+    type: confirmed ? 'info' : 'warning',
+    title: 'Conexão automática entre PCs diferentes',
+    message: confirmed
+      ? 'Regra adicionada com sucesso.'
+      : 'Não consegui confirmar que a regra foi adicionada (talvez o UAC tenha sido cancelado).',
+    detail: confirmed
+      ? 'Se ainda assim a conexão automática não funcionar entre PCs, confira se a rede de ambos está marcada como "privada" ' +
+        '(Configurações > Rede e Internet), não "pública" — a regra só vale pra redes privadas.'
+      : 'O app continua funcionando normalmente pelo fluxo manual. Pra tentar de novo, feche e abra o app.',
+  });
+}
+
+// Minimizar a janela enquanto está compartilhando a tela trava o PC inteiro
+// nalgumas máquinas (não só o app) — reproduzido em mais de uma máquina.
+// Pesquisa aponta pra uma classe de bug conhecida e documentada (inclusive
+// pela própria Intel) de driver de GPU híbrida (Intel+dedicada, Optimus e
+// afins): MINIMIZAR é, no Win32, um evento de RESIZE da janela pro estado
+// iconificado — e redimensionar uma janela acelerada por GPU enquanto a
+// mesma GPU está sob carga pesada (aqui: captura de tela + codificação de
+// vídeo por hardware rodando ao mesmo tempo) é o gatilho documentado desse
+// tipo de travamento em laptops com GPU híbrida. Não tem como consertar o
+// driver da Intel/NVIDIA a partir daqui — mas dá pra evitar o gatilho: só
+// desabilita o próprio botão/atalho de minimizar da janela enquanto uma
+// transmissão estiver ativa (ver 'sharing:active' abaixo), o que remove a
+// ação perigosa em vez de tentar reagir depois que ela já travou tudo.
+// Não cobre 100% dos jeitos de minimizar no Windows (Win+D "Mostrar área de
+// trabalho" ainda minimiza todas as janelas de qualquer forma), mas cobre o
+// caminho mais comum (botão da barra de título, clique com botão direito na
+// barra de tarefas, Alt+Espaço).
+function getMinimizeWarningMarkerPath() {
+  return path.join(app.getPath('appData'), 'sinal-p2p', 'minimize-warning-shown.json');
+}
+
+async function maybeExplainMinimizeDisabled() {
+  const markerPath = getMinimizeWarningMarkerPath();
+  if (fs.existsSync(markerPath)) return;
+
+  try {
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    fs.writeFileSync(markerPath, JSON.stringify({ shown: true }));
+  } catch {
+    // não crítico — na pior das hipóteses mostra de novo na próxima vez
+  }
+
+  await dialog.showMessageBox({
+    type: 'info',
+    title: 'Minimizar desabilitado durante a transmissão',
+    message: 'Enquanto você está compartilhando a tela, o botão de minimizar desta janela fica desativado.',
+    detail:
+      'Minimizar durante a transmissão pode travar o computador inteiro em algumas máquinas (driver de vídeo, ' +
+      'principalmente notebooks com GPU híbrida). Pra tirar a janela do caminho sem minimizar, é só trocar de ' +
+      'janela normalmente (Alt+Tab ou clicando em outro app) — o Sinal P2P continua transmitindo por trás.',
+  });
+}
 
 // Handles de captura por processo ativos, por WebContents (pra poder parar
 // tudo se a janela fechar/recarregar sem que o usuário clique "Parar").
 const activeProcessAudioCaptures = new Map();
+
+// Handshakes automáticos (UDP+STUN) ativos, por WebContents, indexados pelo
+// sessionId — ver signal-punch.js. Mesmo motivo do Map acima: limpar se a
+// janela fechar sem o usuário completar a conexão.
+const activeSignalListeners = new Map();
 
 // É comum abrir duas instâncias deste app na mesma máquina para testar
 // transmissor e espectador ao mesmo tempo. Por padrão o Electron usa a mesma
@@ -49,6 +255,54 @@ ipcMain.handle('audio-process:stop', (event, handle) => {
   activeProcessAudioCaptures.get(event.sender.id)?.delete(handle);
 });
 
+// Ver comentário grande acima (maybeExplainMinimizeDisabled) sobre o porquê.
+ipcMain.on('sharing:active', (event, active) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win || win.isDestroyed()) return;
+  win.setMinimizable(!active);
+  if (active) maybeExplainMinimizeDisabled();
+});
+
+// Canal de sinalização sem servidor (ver signal-punch.js): cada participante
+// de uma sala abre o próprio "ponto de encontro" (UDP local/STUN/UPnP +
+// retransmissor ntfy.sh) e mantém aberto pela sessão inteira — usado tanto
+// pra entrar na sala (o código da sala carrega o ponto de encontro de quem
+// criou) quanto pra formar a malha de conexões WebRTC entre todo mundo
+// depois (oferta/resposta trocadas direto entre cada par, sem passar pelo
+// host de novo).
+ipcMain.handle('signal:startListener', async (event) => {
+  const webContents = event.sender;
+  let handle;
+  handle = await signalPunch.startListener({
+    onMessage: (message, meta) => {
+      if (webContents.isDestroyed()) return;
+      webContents.send('signal:message', { sessionId: handle.sessionId, message, from: meta.from });
+    },
+  });
+  if (!handle) return null; // nem IP local nem STUN disponíveis — sem atalho automático
+
+  if (!activeSignalListeners.has(webContents.id)) activeSignalListeners.set(webContents.id, new Map());
+  activeSignalListeners.get(webContents.id).set(handle.sessionId, handle);
+
+  return { sessionId: handle.sessionId, candidates: handle.candidates };
+});
+
+ipcMain.handle('signal:stopListener', (event, sessionId) => {
+  const listeners = activeSignalListeners.get(event.sender.id);
+  const handle = listeners && listeners.get(sessionId);
+  if (handle) {
+    handle.stop();
+    listeners.delete(sessionId);
+  }
+});
+
+ipcMain.handle('signal:send', (event, { mySessionId, candidates, targetSessionId, message, opts }) => {
+  const listeners = activeSignalListeners.get(event.sender.id);
+  const handle = listeners && listeners.get(mySessionId);
+  if (!handle) return Promise.resolve({ ok: false, via: null });
+  return handle.send(candidates, targetSessionId, message, opts);
+});
+
 // Lista as telas disponíveis (com miniatura) pra deixar o usuário escolher
 // qual monitor compartilhar — inclusive pra trocar de monitor com a
 // transmissão já rolando, sem depender do seletor nativo do SO (que só
@@ -82,9 +336,33 @@ function createWindow() {
       // conseguir abrir o console. Continua disponível rodando via
       // "npm start"/"electron .", já que app.isPackaged só é true num build.
       devTools: !app.isPackaged,
+      // Sem isso, o vídeo (com som) de quem entrou na sala e só começou a
+      // compartilhar bem depois de qualquer clique na janela ficava com o
+      // autoplay bloqueado pela política padrão do Chromium (que existe pra
+      // sites não tocarem som sem permissão do usuário) — a conexão e o
+      // vídeo chegavam certinho, só nunca eram exibidos, sem erro nenhum.
+      // Este é um app desktop nosso, não um site de terceiros; a
+      // transmissão de tela SEMPRE deve tocar automaticamente.
+      autoplayPolicy: 'no-user-gesture-required',
+      // Por padrão o Electron desacelera a renderização de janelas sem foco
+      // (pra economizar recursos) — o processamento de rede/decodificação
+      // do WebRTC continua rodando (confirmado: os frames continuam sendo
+      // decodificados nas estatísticas), mas a pintura do <video> na tela
+      // trava, ficando preso em "nada carregado ainda" até a janela voltar
+      // a ficar em foco. Isso é fatal pra um app que mostra vídeo de várias
+      // pessoas ao mesmo tempo — a pessoa não fica o tempo todo com a
+      // janela em foco, e cada participante da sala roda numa janela
+      // separada.
+      backgroundThrottling: false,
     },
   });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+
+  // Toda vez que a página carrega/recarrega, o estado de "compartilhando"
+  // do renderer começa do zero — sem isso, um reload em pleno
+  // compartilhamento (ex: DevTools) deixaria minimizar desabilitado pra
+  // sempre, já que só o renderer avisa quando volta a compartilhar de novo.
+  win.webContents.on('did-finish-load', () => win.setMinimizable(true));
 
   // Evita vazar uma thread de captura nativa rodando pra sempre se a janela
   // fechar/recarregar sem que o usuário clique em "Parar".
@@ -93,6 +371,11 @@ function createWindow() {
     if (handles) {
       handles.forEach((handle) => processAudio.stopCapture(handle));
       activeProcessAudioCaptures.delete(win.webContents.id);
+    }
+    const signalListeners = activeSignalListeners.get(win.webContents.id);
+    if (signalListeners) {
+      signalListeners.forEach((handle) => handle.stop());
+      activeSignalListeners.delete(win.webContents.id);
     }
   });
 }
@@ -106,6 +389,7 @@ app.whenReady().then(() => {
   registerDisplayMediaHandler(session.defaultSession);
 
   createWindow();
+  ensureFirewallAccess(); // não bloqueia a abertura da janela — a caixa de diálogo aparece por cima
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
