@@ -188,7 +188,6 @@ let mySharing = false;
 let localStream = null;
 
 const roomNameLabel = document.getElementById('room-name-label');
-const myNameLabel = document.getElementById('my-name-label');
 const btnCopyRoomCode = document.getElementById('btn-copy-room-code');
 const btnLeaveRoom = document.getElementById('btn-leave-room');
 const btnToggleParticipants = document.getElementById('btn-toggle-participants');
@@ -225,7 +224,6 @@ async function enterRoom({ name, passphrase, hostSid, hostCands }) {
   unsubscribeSignal = window.api.onSignalMessage(({ message, from }) => handleSignalMessage(message, from));
 
   roomNameLabel.textContent = hostSid ? 'Sala' : `Sala de ${myName}`;
-  myNameLabel.textContent = myName;
   myInviteCodePromise = encode({ v: 1, sid: myListener.sessionId, cands: myListener.candidates }, myPassphrase);
 
   showRoomScreen();
