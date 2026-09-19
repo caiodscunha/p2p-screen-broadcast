@@ -19,12 +19,19 @@ whichever two people need to talk to each other.
   anyone in the room can start sharing their screen at any time, and
   everyone else sees it appear in the grid automatically
 - 🟦 **Discord-style grid & focus**: all active screen shares laid out in a
-  grid; click one to focus it full-size with the rest as a thumbnail strip,
-  click again (or "back to grid") to undo
-- ▶️ **One-click share bar**: a bottom bar with a share button that opens a
-  picker (monitor + audio source) the first time, turns into a red "stop
-  sharing" button while live, with an arrow beside it to change monitor/
-  audio source mid-stream
+  grid; hover a tile and click the pin icon that appears to focus it
+  full-size, with the rest as a thumbnail strip below — hover the focused
+  tile for the "unpin" icon to go back, exactly like Discord's pin/unpin
+  behavior (the hover overlay fades out after a couple of seconds of no
+  mouse movement, but clicking still always works)
+- 🔊 **Per-peer volume control**: hover any tile you're watching for a
+  volume slider, click the icon to mute/unmute instantly, drag the slider
+  to reactivate if it was muted
+- ▶️ **One-click share bar**: a floating, rounded dock at the bottom
+  (room code / share / leave, with a separate participants button) with a
+  share button that opens a picker (monitor + audio source) the first
+  time, turns into a red "stop sharing" button while live, with an arrow
+  beside it to change monitor/audio source mid-stream
 - 🚪 **Stopping your share doesn't drop you from the room**: your connection
   to everyone stays up, your tile just disappears from the grid until you
   share again
@@ -32,8 +39,15 @@ whichever two people need to talk to each other.
   loopback on Windows and macOS; manual PulseAudio/PipeWire monitor-source
   selection on Linux)
 - 🎚️ Per-app audio capture on Windows: include only one app's audio, or
-  exclude one app (e.g. share your game/music but not your Discord call),
-  via WASAPI Process Loopback — no manual audio device routing required
+  exclude one app (e.g. share your game/music but not your Discord call) —
+  picking this mode auto-selects "exclude" and auto-picks any app whose
+  window title ends in "Discord", since that's the overwhelmingly common
+  case. Uses WASAPI Process Loopback, and switching audio source works
+  live, mid-share, without interrupting anything
+- 🔇 **No self-echo**: whichever audio mode you pick (including plain
+  "system audio"), Sinal P2P's own output is automatically excluded from
+  what you broadcast on Windows — so a room-mate's voice playing on your
+  speakers never loops back into your own stream
 - 🔗 Fully peer-to-peer via WebRTC mesh, no relay server ever touches your
   video/audio — every pair of participants in a room talks directly to
   each other
@@ -118,7 +132,10 @@ The audio source picker in the share popover has a "Specific process"
 option that lets you include only one running app's audio, or exclude one
 app from an otherwise full system-audio share — e.g. share your game or
 music but keep a Discord voice call out of the stream, without routing
-anything to a separate audio device manually.
+anything to a separate audio device manually. Picking this option
+automatically switches to "exclude" mode and auto-selects any running app
+whose window title ends in "Discord" (falling back to just the first app in
+the list if none matches) — you can always change it manually afterward.
 
 This uses WASAPI's Process Loopback Capture (`AUDIOCLIENT_ACTIVATION_TYPE_
 PROCESS_LOOPBACK`, Windows 10 2004+), the same API OBS Studio uses for its
@@ -129,6 +146,17 @@ process (and its child processes) and streams it to the renderer, where a
 Web Audio `AudioWorklet` turns it into a real `MediaStreamTrack` that gets
 added to the share alongside the video. Windows-only — on macOS and Linux
 this option simply doesn't appear.
+
+Plain "system audio" also uses this same native addon on Windows (targeting
+this app's own process in exclude mode) instead of Electron's built-in
+loopback, so it can be switched to/from at any point during a share — not
+just chosen once at the very start — and so it never includes Sinal P2P's
+own output (preventing the echo a room-mate's voice would otherwise cause).
+Since the audio no longer needs to ride along with the screen picker, the
+monitor dropdown also stays usable with "system audio" selected on Windows.
+On macOS/Linux (no native addon), "system audio" keeps the older behavior:
+tied to `getDisplayMedia`'s one-time OS picker grant, not switchable
+mid-share, and not self-excluding.
 
 ## Tech stack
 
@@ -212,8 +240,10 @@ option in the UI).
    sala**, fill in your name and the passphrase if one was set, and click
    **Entrar**.
 2. You'll see the grid of whoever's currently sharing (or an empty state if
-   nobody is yet) and a participants list of everyone in the room. Click
-   any tile to focus it full-size; click "Voltar pro grid" to undo.
+   nobody is yet) and a participants list of everyone in the room (toggle it
+   with the people icon on the right of the bottom dock). Hover a tile and
+   click the pin icon to focus it full-size; hover the focused tile and
+   click "unpin" to go back to the grid.
 3. Share your own screen the same way described above whenever you want to.
 
 ## Limitations
@@ -242,6 +272,41 @@ option in the UI).
   one, only video is captured.
 - Intentionally minimal: no chat, no recording, no accounts, just rooms +
   screen/audio sharing.
+
+## Known issues
+
+Unlike [Limitations](#limitations) above (things that are inherent to the
+architecture), these are real bugs/rough edges that just haven't been fixed
+yet:
+
+- **ntfy.sh rate limiting**: the free public relay used for automatic room
+  signaling (see [How it works](#how-it-works)) rate-limits by IP address,
+  not by app — if a lot of signaling traffic comes from the same public IP
+  in a short window (e.g. repeated join attempts while debugging a
+  connection issue), it can start rejecting requests with HTTP 429 for a
+  while. This is rare in normal one-off usage, but can show up during heavy
+  testing, and can also affect multiple unrelated people sharing the same
+  IP behind CGNAT. When it happens, automatic signaling degrades to just the
+  direct UDP path (still often enough on its own); there's no in-app
+  indicator of this yet.
+- **Screen/audio capture is still rough on Linux**: unlike Windows/macOS,
+  there's no single API Electron can rely on across distros — behavior
+  varies by desktop environment and audio server (PulseAudio/PipeWire vs.
+  something else), and both screen picking and audio-source selection are
+  more likely to need manual fiddling or simply not work on some setups.
+  Not yet systematically tested across distros.
+- **Minimizing the window can freeze the share, and sometimes the OS/Chrome
+  itself**: when the broadcaster minimizes the app (or another window fully
+  covers it), the video reliably freezes for viewers until the window is
+  restored — confirmed via WebRTC stats that frames keep arriving but stop
+  being decoded while minimized. On top of that, minimizing has also been
+  observed to freeze the whole app, or possibly Windows/Chrome itself, in
+  ways not yet root-caused. Several fixes were already tried (disabling
+  Chromium's window-occlusion throttling, disabling hardware acceleration,
+  forcing process priority) — none of them helped, so the actual cause is
+  still unidentified. Avoid minimizing the window while sharing for now;
+  covering it with another window instead of minimizing may also trigger
+  the video-freeze part of this.
 
 ## License
 
