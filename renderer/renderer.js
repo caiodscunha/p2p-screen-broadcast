@@ -805,7 +805,9 @@ async function refreshAudioSources() {
   if (supportsLoopback) {
     const loopbackOption = document.createElement('option');
     loopbackOption.value = LOOPBACK_VALUE;
-    loopbackOption.textContent = 'Áudio do sistema (tudo, padrão)';
+    loopbackOption.textContent = supportsProcessAudio
+      ? 'Áudio do sistema (tudo, exceto este app)'
+      : 'Áudio do sistema (tudo, padrão)';
     audioSourceSelect.appendChild(loopbackOption);
   }
 
@@ -853,22 +855,54 @@ const processAudioSelect = document.getElementById('process-audio-select');
 const processAudioMode = document.getElementById('process-audio-mode');
 const btnRefreshAudioProcesses = document.getElementById('btn-refresh-audio-processes');
 
-// "Áudio do sistema" só pode vir junto com getDisplayMedia (é assim que o
-// Electron expõe loopback), que por sua vez decide sozinho qual tela captura
-// (seletor nativo do SO no Windows/macOS, ou a primeira tela no Linux) — o
-// dropdown de monitor deste popover não tem efeito nesse modo específico.
-function updateAudioSourceUiState() {
+// O vídeo de "Áudio do sistema" sempre vem do getDisplayMedia (é assim que o
+// Electron expõe o seletor nativo do SO no Windows/macOS, ou a primeira tela
+// no Linux) — o dropdown de monitor deste popover não tem efeito nesse modo
+// específico. O ÁUDIO desse modo, quando o addon nativo de captura por
+// processo está disponível (Windows), vem dele em vez do loopback embutido
+// do Electron — ver acquireAudioTrack() — o que deixa trocável em pleno
+// andamento e evita ecoar o próprio som do Sinal P2P.
+// Lembra o último valor visto de audioSourceSelect só pra saber se estamos
+// ENTRANDO no modo "Processo específico" agora (pra pré-selecionar excluir +
+// Discord automaticamente) ou só atualizando a lista de apps de um modo em
+// que já estávamos (nesse caso não mexe no que a pessoa já escolheu).
+let lastAudioSourceMode = null;
+
+async function updateAudioSourceUiState() {
   const isProcessMode = audioSourceSelect.value === PROCESS_VALUE;
   processAudioBlock.hidden = !isProcessMode;
-  if (isProcessMode) refreshAudioProcesses();
+  if (isProcessMode) {
+    // Espera a lista de apps carregar antes de deixar trocar a fonte de
+    // fato — sem isso, escolher "Processo específico" tentava trocar
+    // imediatamente, antes do <select> de apps ter qualquer opção, e sempre
+    // falhava com "Escolha um app...".
+    await refreshAudioProcesses();
+    if (lastAudioSourceMode !== PROCESS_VALUE) autoPickDiscordExclude();
+  }
+  lastAudioSourceMode = audioSourceSelect.value;
 
-  const isLoopback = audioSourceSelect.value === LOOPBACK_VALUE;
-  monitorSelect.disabled = isLoopback;
-  document.getElementById('loopback-hint').hidden = !isLoopback;
+  const monitorIgnored = monitorSelectIgnoredByAudioMode();
+  monitorSelect.disabled = monitorIgnored;
+  document.getElementById('loopback-hint').hidden = !monitorIgnored;
 }
 
-audioSourceSelect.addEventListener('change', () => {
-  updateAudioSourceUiState();
+// Ao entrar em "Processo específico" pela primeira vez, já deixa pronto pro
+// caso de uso mais comum: excluir a chamada de voz do Discord do que é
+// compartilhado. Procura um app cujo título termine em "discord"
+// (case-insensitive, ex: janelas do Discord costumam terminar assim); se
+// não achar nenhum, ainda assim liga o modo excluir e escolhe o primeiro
+// app da lista (melhor um alvo qualquer em modo excluir, que a pessoa troca
+// se quiser, do que deixar sem nada selecionado).
+function autoPickDiscordExclude() {
+  processAudioMode.value = 'exclude';
+  const options = Array.from(processAudioSelect.options);
+  const discordOption = options.find((o) => /discord$/i.test(o.textContent.trim()));
+  const pick = discordOption || options[0];
+  if (pick) processAudioSelect.value = pick.value;
+}
+
+audioSourceSelect.addEventListener('change', async () => {
+  await updateAudioSourceUiState();
   switchAudioSourceInRoom();
 });
 
@@ -910,6 +944,12 @@ async function acquireAudioTrack() {
   const selected = audioSourceSelect.value;
 
   if (selected === LOOPBACK_VALUE) {
+    // Com o addon nativo (Windows), "áudio do sistema" também passa pela
+    // captura por processo — pid 0 é o sentinela de "tudo, exceto este
+    // próprio app" (ver process_loopback.cpp) — o que deixa esse modo
+    // trocável a qualquer momento, igual ao "processo específico".
+    if (supportsProcessAudio) return startProcessAudioTrack(0, true);
+
     if (!loopbackAudioTrack) {
       throw new Error('"Áudio do sistema" só pode ser escolhido ao começar a compartilhar.');
     }
@@ -1015,9 +1055,18 @@ function updateShareButtonUI() {
   if (!mySharing) hideSharePopover();
 }
 
+// O seletor de monitor só é realmente ignorado quando o vídeo em si vem do
+// getDisplayMedia com o seletor nativo do SO (que escolhe a tela sozinho) —
+// isso só acontece pra "Áudio do sistema" SEM o addon nativo (Windows tem o
+// addon, então lá o vídeo sempre vem do seletor de monitor normal, mesmo
+// nesse modo de áudio — ver confirmStartSharing()).
+function monitorSelectIgnoredByAudioMode() {
+  return audioSourceSelect.value === LOOPBACK_VALUE && !supportsProcessAudio;
+}
+
 function showSharePopover() {
   sharePopover.hidden = false;
-  monitorSelect.disabled = audioSourceSelect.value === LOOPBACK_VALUE;
+  monitorSelect.disabled = monitorSelectIgnoredByAudioMode();
   updateMonitorThumbnail();
 }
 
@@ -1063,12 +1112,18 @@ monitorSelect.addEventListener('change', () => {
 btnConfirmShare.addEventListener('click', () => confirmStartSharing());
 
 async function confirmStartSharing() {
-  const useLoopback = audioSourceSelect.value === LOOPBACK_VALUE;
+  // Sem o addon nativo (Windows), "Áudio do sistema" só existe junto do
+  // getDisplayMedia (só assim o Electron expõe loopback), que por sua vez
+  // escolhe a tela sozinho via seletor nativo do SO. Com o addon, o áudio já
+  // não depende mais disso (ver acquireAudioTrack()), então o vídeo segue o
+  // caminho normal — seletor de monitor deste popover — igual aos outros
+  // modos de áudio, o que deixa trocar de monitor funcionando também aqui.
+  const useNativeDisplayMediaLoopback = audioSourceSelect.value === LOOPBACK_VALUE && !supportsProcessAudio;
 
   let videoTrack;
   let audioTrack;
   try {
-    if (useLoopback) {
+    if (useNativeDisplayMediaLoopback) {
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: { width: { ideal: 1920, max: 1920 }, height: { ideal: 1080, max: 1080 }, frameRate: { ideal: 60, max: 60 } },
         audio: true,

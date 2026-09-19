@@ -315,8 +315,14 @@ void CaptureThreadProc(CaptureSession* session) {
   format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
   format.cbSize = 0;
 
+  // pid=0 é o sentinela de "áudio do sistema inteiro, exceto este próprio
+  // app" (ver comentário em StartCapture) — nesse caso o alvo da exclusão é
+  // o próprio processo, e uma única sessão já basta: o WASAPI já exclui o
+  // alvo no nível do SO, sem precisar da subtração de DualCaptureThreadProc.
+  DWORD targetPid = session->pid == 0 ? GetCurrentProcessId() : session->pid;
+
   AudioEndpoint ep;
-  if (!ActivateEndpoint(session, session->pid, session->exclude, format, &ep, "ActivateAudioInterfaceAsync")) {
+  if (!ActivateEndpoint(session, targetPid, session->exclude, format, &ep, "ActivateAudioInterfaceAsync")) {
     session->tsfn.Release();
     CoUninitialize();
     return;
@@ -457,13 +463,16 @@ Napi::Value StartCapture(const Napi::CallbackInfo& info) {
   session->exclude = info[1].As<Napi::Boolean>().Value();
   session->tsfn = Napi::ThreadSafeFunction::New(env, info[2].As<Napi::Function>(), "AudioLoopbackCallback", 0, 1);
 
-  // Excluir sempre também tira o eco deste próprio app junto (ver
-  // DualCaptureThreadProc) — ninguém que exclui um app específico (ex:
-  // Discord) quer que a voz de quem está assistindo na sala volte
-  // retransmitida por cima. No modo "incluir só X", isso não é necessário:
-  // só o áudio de X já sai, o resto (inclusive este app) já fica de fora
-  // naturalmente.
-  session->worker = std::thread(session->exclude ? DualCaptureThreadProc : CaptureThreadProc, session);
+  // Excluir um app específico (pid != 0) sempre também tira o eco deste
+  // próprio app junto (ver DualCaptureThreadProc) — ninguém que exclui um
+  // app específico (ex: Discord) quer que a voz de quem está assistindo na
+  // sala volte retransmitida por cima. No modo "incluir só X", isso não é
+  // necessário: só o áudio de X já sai, o resto (inclusive este app) já
+  // fica de fora naturalmente. E no modo "sistema inteiro, exceto este app"
+  // (pid == 0) a exclusão do WASAPI já é o próprio alvo, então uma única
+  // captura basta — ver CaptureThreadProc.
+  bool useDualCapture = session->exclude && session->pid != 0;
+  session->worker = std::thread(useDualCapture ? DualCaptureThreadProc : CaptureThreadProc, session);
 
   int handle;
   {
