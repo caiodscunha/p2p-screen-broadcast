@@ -214,6 +214,12 @@ async function enterRoom({ name, passphrase, hostSid, hostCands }) {
   focusedPeerId = null;
   roomPeers = new Map();
   localStream = null;
+  // Limpa qualquer mensagem deixada por uma tentativa anterior (ex: "não
+  // consegui entrar na sala" de um código antigo que falhou) — sem isso, ela
+  // ficava perdida em #room-status e reaparecia na sala nova, mesmo
+  // funcionando normalmente, porque só o fluxo de "Entrar" (hostSid) mexe
+  // nesse texto: criar uma sala nova nunca escrevia nada nele pra sobrescrever.
+  setRoomStatus('');
 
   myListener = await window.api.startSignalListener();
   if (!myListener) {
@@ -297,6 +303,11 @@ function leaveRoom() {
   resetMediaTileRegistries();
   participantsPanel.hidden = true;
   hideSharePopover();
+  // Sem isso, uma mensagem tipo "Criando sala..."/"Entrando na sala..." que
+  // ficou parada em #home-status (nunca sobrescrita porque a sala anterior
+  // abriu com sucesso e nunca mais voltou pra tela inicial) reaparecia do
+  // nada ao sair da sala, como se algo ainda estivesse em andamento.
+  setHomeStatus('', false);
   showHomeScreen();
 }
 
