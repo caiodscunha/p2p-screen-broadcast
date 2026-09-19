@@ -474,6 +474,7 @@ textarea {
   border-radius: var(--radius);
   border: 1px solid var(--border);
   overflow: hidden;
+  cursor: pointer;
 }
 
 .focus-main video { width: 100%; height: 100%; object-fit: contain; background: #000; }
@@ -502,7 +503,36 @@ textarea {
 
 .focus-thumb video { width: 100%; height: 100%; object-fit: contain; background: #000; }
 
-.btn-exit-focus { align-self: flex-start; }
+/* Fixar/desafixar estilo Discord: ícone central que só aparece enquanto o
+   mouse se mexe por cima (classe .pin-overlay-visible, ligada/desligada via
+   JS — ver ensureMediaTile) e some sozinho depois de 3s parado. Puramente
+   visual (pointer-events: none) — o clique é sempre tratado pelo card/tile
+   inteiro por baixo, então continua funcionando mesmo com o ícone escondido. */
+.pin-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.pin-overlay.pin-overlay-visible { opacity: 1; }
+
+.pin-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: rgba(15, 15, 17, 0.8);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
 
 .participants-panel {
   width: 240px;

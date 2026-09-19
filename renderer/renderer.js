@@ -201,7 +201,6 @@ const streamGridEl = document.getElementById('stream-grid');
 const focusViewEl = document.getElementById('focus-view');
 const focusMainEl = document.getElementById('focus-main');
 const focusStripEl = document.getElementById('focus-strip');
-const btnExitFocus = document.getElementById('btn-exit-focus');
 
 function setRoomStatus(text) {
   roomStatusEl.textContent = text;
@@ -1244,6 +1243,15 @@ const VOLUME_MUTED_ICON_SVG =
   '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>' +
   '<line x1="23" y1="9" x2="17" y2="15"></line>' +
   '<line x1="17" y1="9" x2="23" y2="15"></line></svg>';
+const PIN_ICON_SVG =
+  '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<line x1="12" y1="17" x2="12" y2="22"></line>' +
+  '<path d="M5 17h14l-1.6-1.6a2 2 0 0 1-.6-1.42V9a4.8 4.8 0 0 0-9.6 0v5c0 .53-.21 1.04-.58 1.42L5 17z"></path></svg>';
+const UNPIN_ICON_SVG =
+  '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<line x1="12" y1="17" x2="12" y2="22"></line>' +
+  '<path d="M5 17h14l-1.6-1.6a2 2 0 0 1-.6-1.42V9a4.8 4.8 0 0 0-9.6 0v5c0 .53-.21 1.04-.58 1.42L5 17z"></path>' +
+  '<line x1="3" y1="3" x2="21" y2="21"></line></svg>';
 
 function ensureMediaTile(container, isSelf) {
   let video = container.querySelector('video');
@@ -1299,7 +1307,38 @@ function ensureMediaTile(container, isSelf) {
   }
 
   const volumeBtn = container.querySelector('.volume-icon-btn');
-  return { video, name, volumeSlider, volumeBtn };
+
+  // Overlay de fixar/desafixar (estilo Discord): ícone centralizado que só
+  // aparece enquanto o mouse se MEXE por cima — some depois de 3s parado,
+  // mas o clique continua valendo em qualquer lugar do card mesmo com o
+  // ícone escondido (é só uma pista visual, nunca intercepta clique —
+  // pointer-events: none — e o onclick de fixar/desafixar fica no
+  // card/tile inteiro, não no ícone). Escuta o movimento no CONTAINER, não
+  // no overlay (que não recebe evento nenhum de propósito).
+  let pinOverlay = container.querySelector('.pin-overlay');
+  if (!pinOverlay) {
+    pinOverlay = document.createElement('div');
+    pinOverlay.className = 'pin-overlay';
+    pinOverlay.innerHTML = '<span class="pin-icon"></span>';
+    container.appendChild(pinOverlay);
+
+    let idleTimer = null;
+    const showPinOverlay = () => {
+      pinOverlay.classList.add('pin-overlay-visible');
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => pinOverlay.classList.remove('pin-overlay-visible'), 2000);
+    };
+    const hidePinOverlay = () => {
+      clearTimeout(idleTimer);
+      pinOverlay.classList.remove('pin-overlay-visible');
+    };
+    container.addEventListener('mouseenter', showPinOverlay);
+    container.addEventListener('mousemove', showPinOverlay);
+    container.addEventListener('mouseleave', hidePinOverlay);
+  }
+  const pinIcon = pinOverlay.querySelector('.pin-icon');
+
+  return { video, name, volumeSlider, volumeBtn, pinIcon };
 }
 
 // Muda o volume de um peer e, se o valor for maior que zero, também guarda
@@ -1311,12 +1350,15 @@ function setPeerVolume(peer, v) {
   if (v > 0) peer.volumeBeforeMute = v;
 }
 
-function updateMediaTile(container, item) {
-  const { video, name, volumeSlider, volumeBtn } = ensureMediaTile(container, item.kind === 'self');
+// `pinMode`: 'pin' pro grid/tira de miniaturas (clicar fixa esse em foco) ou
+// 'unpin' pro card grande do foco (clicar volta pro grid).
+function updateMediaTile(container, item, pinMode) {
+  const { video, name, volumeSlider, volumeBtn, pinIcon } = ensureMediaTile(container, item.kind === 'self');
   const desiredStream = item.kind === 'self' ? localStream : item.peer.remoteStream || null;
   video.muted = item.kind === 'self';
   if (video.srcObject !== desiredStream) video.srcObject = desiredStream;
   name.textContent = item.name;
+  pinIcon.innerHTML = pinMode === 'unpin' ? UNPIN_ICON_SVG : PIN_ICON_SVG;
 
   if (volumeSlider && item.kind !== 'self') {
     const peer = item.peer;
@@ -1389,7 +1431,7 @@ function renderGrid() {
       gridTileEls.set(item.id, el);
     }
     el.onclick = () => enterFocus(item.id);
-    updateMediaTile(el, item);
+    updateMediaTile(el, item, 'pin');
   });
 }
 
@@ -1423,7 +1465,10 @@ function exitFocus() {
   renderGrid();
 }
 
-btnExitFocus.addEventListener('click', exitFocus);
+// Clicar em qualquer lugar do card grande do foco desafixa e volta pro grid
+// — não muda por quem está focado, então é fixado uma vez só, fora do
+// ciclo de render (evita reatribuir o mesmo handler sem necessidade).
+focusMainEl.onclick = () => exitFocus();
 
 function renderFocusIfShowing() {
   if (focusedPeerId !== null) renderFocus();
@@ -1441,7 +1486,7 @@ function renderFocus() {
   gridEmptyEl.hidden = true;
   focusViewEl.hidden = false;
 
-  updateMediaTile(focusMainEl, focusedItem);
+  updateMediaTile(focusMainEl, focusedItem, 'unpin');
 
   const stripItems = items.filter((item) => item.id !== focusedPeerId);
   const stripIds = new Set(stripItems.map((item) => item.id));
@@ -1462,7 +1507,7 @@ function renderFocus() {
       focusStripTileEls.set(item.id, el);
     }
     el.onclick = () => enterFocus(item.id);
-    updateMediaTile(el, item);
+    updateMediaTile(el, item, 'pin');
   });
 }
 
