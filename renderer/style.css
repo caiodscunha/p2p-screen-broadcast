@@ -650,12 +650,29 @@ textarea {
   transform: translateX(-50%);
   width: 360px;
   max-width: calc(100vw - 32px);
-  background: var(--panel);
+  background: rgba(30, 31, 34, 0.82);
+  backdrop-filter: blur(14px) saturate(150%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
   padding: 16px;
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
   z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
 }
 
 .popover h3 { margin-top: 0; }
+
+.popover .field-block,
+.popover .hint {
+  width: 100%;
+}
+
+.popover .hint { text-align: left; }
+
+.popover .btn-row { justify-content: center; }
+
+.popover #monitor-thumbnail { margin-left: auto; margin-right: auto; }
