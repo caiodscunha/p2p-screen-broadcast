@@ -5,6 +5,31 @@ const SHARE_ICON_SVG =
   '<rect x="2" y="4" width="20" height="13" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>';
 const STOP_ICON_SVG =
   '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"></rect></svg>';
+const ENTER_FULLSCREEN_ICON_SVG =
+  '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M8 3H5a2 2 0 0 0-2 2v3"></path><path d="M21 8V5a2 2 0 0 0-2-2h-3"></path><path d="M3 16v3a2 2 0 0 0 2 2h3"></path><path d="M16 21h3a2 2 0 0 0 2-2v-3"></path></svg>';
+const EXIT_FULLSCREEN_ICON_SVG =
+  '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M8 3v3a2 2 0 0 1-2 2H3"></path><path d="M21 8h-3a2 2 0 0 1-2-2V3"></path><path d="M3 16h3a2 2 0 0 1 2 2v3"></path><path d="M16 21v-3a2 2 0 0 1 2-2h3"></path></svg>';
+// Ícone composto (seta + pessoas, lado a lado, não empilhado) do botão que
+// oculta/mostra a tira de miniaturas dos outros participantes na view de
+// foco: seta pra cima quando a tira já está escondida (modo exclusivo),
+// seta pra baixo quando ainda está visível (clicar entra no modo
+// exclusivo).
+const PEOPLE_CHEVRON_UP_SVG =
+  '<svg viewBox="0 0 36 20" width="28" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<polyline points="2 12 6 4 10 12"></polyline>' +
+  '<g transform="translate(14,2) scale(0.667)" stroke-width="3">' +
+  '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle>' +
+  '<path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path>' +
+  '</g></svg>';
+const PEOPLE_CHEVRON_DOWN_SVG =
+  '<svg viewBox="0 0 36 20" width="28" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<polyline points="2 4 6 12 10 4"></polyline>' +
+  '<g transform="translate(14,2) scale(0.667)" stroke-width="3">' +
+  '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle>' +
+  '<path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path>' +
+  '</g></svg>';
 
 // ---------- utilidades de código (criptografia/codificação) ----------
 
@@ -101,14 +126,23 @@ function randomPeerId() {
 const viewHome = document.getElementById('view-home');
 const viewRoom = document.getElementById('view-room');
 
+// O aviso de "deixe a rede como Privada" só faz sentido no Windows (é lá
+// que o Firewall do SO bloqueia conexão direta em rede Pública), sem IPC
+// dedicado pra isso, `navigator.platform` já resolve dentro do Electron.
+if (/^Win/.test(navigator.platform)) {
+  document.getElementById('home-windows-note').hidden = false;
+}
+
 function showHomeScreen() {
   viewRoom.classList.remove('active');
   viewHome.classList.add('active');
+  stopDockAutoHide();
 }
 
 function showRoomScreen() {
   viewHome.classList.remove('active');
   viewRoom.classList.add('active');
+  startDockAutoHide();
 }
 
 // ===================================================================
@@ -184,6 +218,7 @@ let unsubscribeSignal = null;
 let roomPeers = new Map(); // peerId -> { peerId, name, sid, cands, pc, videoSender, audioSender, remoteStream, sharing, connectionState }
 let myInviteCodePromise = null;
 let focusedPeerId = null; // null | 'self' | peerId
+let focusStripCollapsed = false; // esconde a tira de miniaturas na view de foco (ver btnToggleFocusStrip)
 let mySharing = false;
 let localStream = null;
 // Agenda a saída automática dessa "sala fantasma" (só você, ninguém
@@ -197,6 +232,7 @@ const roomNameLabel = document.getElementById('room-name-label');
 const btnCopyRoomCode = document.getElementById('btn-copy-room-code');
 const btnLeaveRoom = document.getElementById('btn-leave-room');
 const btnToggleParticipants = document.getElementById('btn-toggle-participants');
+const btnToggleFullscreen = document.getElementById('btn-toggle-fullscreen');
 const participantsPanel = document.getElementById('participants-panel');
 const participantsListEl = document.getElementById('participants-list');
 const roomStatusEl = document.getElementById('room-status');
@@ -206,6 +242,8 @@ const streamGridEl = document.getElementById('stream-grid');
 const focusViewEl = document.getElementById('focus-view');
 const focusMainEl = document.getElementById('focus-main');
 const focusStripEl = document.getElementById('focus-strip');
+const btnToggleFocusStrip = document.getElementById('btn-toggle-focus-strip');
+btnToggleFocusStrip.innerHTML = PEOPLE_CHEVRON_DOWN_SVG;
 
 function setRoomStatus(text) {
   roomStatusEl.textContent = text;
@@ -311,6 +349,45 @@ btnToggleParticipants.addEventListener('click', () => {
   participantsPanel.hidden = !participantsPanel.hidden;
 });
 
+// Modo "tela cheia": o palco passa a ocupar também a linha reservada pra
+// dock (que vira overlay flutuando por cima do vídeo, encostando nele por
+// baixo) e a moldura ao redor do vídeo fica só com uma borda mínima de
+// 10px, sem cantos arredondados (ver .stage-zoomed no CSS). A dock e o
+// botão de participantes continuam funcionando normalmente por cima, só
+// somem junto com o resto da dock quando o mouse fica parado (ver
+// startDockAutoHide abaixo).
+let stageZoomed = false;
+btnToggleFullscreen.addEventListener('click', () => {
+  stageZoomed = !stageZoomed;
+  viewRoom.classList.toggle('stage-zoomed', stageZoomed);
+  btnToggleFullscreen.classList.toggle('active-toggle', stageZoomed);
+  btnToggleFullscreen.innerHTML = stageZoomed ? EXIT_FULLSCREEN_ICON_SVG : ENTER_FULLSCREEN_ICON_SVG;
+  btnToggleFullscreen.title = stageZoomed ? 'Sair da tela cheia' : 'Tela cheia';
+});
+
+// Dock some sozinha (estilo player de vídeo/PiP): mouse parado por 2s
+// dentro da sala esconde a dock e o botão de participantes; mexer o mouse
+// (ou o mouse sair da janela) mostra/esconde na hora.
+let dockIdleTimer = null;
+function showDockControls() {
+  viewRoom.classList.remove('controls-hidden');
+  clearTimeout(dockIdleTimer);
+  dockIdleTimer = setTimeout(() => viewRoom.classList.add('controls-hidden'), 2000);
+}
+function stopDockAutoHide() {
+  clearTimeout(dockIdleTimer);
+  viewRoom.classList.remove('controls-hidden');
+}
+function startDockAutoHide() {
+  showDockControls();
+}
+viewRoom.addEventListener('mousemove', showDockControls);
+viewRoom.addEventListener('mouseenter', showDockControls);
+viewRoom.addEventListener('mouseleave', () => {
+  clearTimeout(dockIdleTimer);
+  viewRoom.classList.add('controls-hidden');
+});
+
 btnLeaveRoom.addEventListener('click', () => leaveRoom());
 
 function leaveRoom() {
@@ -342,6 +419,19 @@ function leaveRoom() {
   resetMediaTileRegistries();
   participantsPanel.hidden = true;
   hideSharePopover();
+  if (focusStripCollapsed) {
+    focusStripCollapsed = false;
+    btnToggleFocusStrip.innerHTML = PEOPLE_CHEVRON_DOWN_SVG;
+    btnToggleFocusStrip.title = 'Ocultar as outras transmissões';
+    viewRoom.classList.remove('focus-strip-collapsed');
+  }
+  if (stageZoomed) {
+    stageZoomed = false;
+    viewRoom.classList.remove('stage-zoomed');
+    btnToggleFullscreen.classList.remove('active-toggle');
+    btnToggleFullscreen.innerHTML = ENTER_FULLSCREEN_ICON_SVG;
+    btnToggleFullscreen.title = 'Tela cheia';
+  }
   // Sem isso, uma mensagem tipo "Criando sala..."/"Entrando na sala..." que
   // ficou parada em #home-status (nunca sobrescrita porque a sala anterior
   // abriu com sucesso e nunca mais voltou pra tela inicial) reaparecia do
@@ -1443,13 +1533,15 @@ function ensureMediaTile(container, isSelf) {
 
   const volumeBtn = container.querySelector('.volume-icon-btn');
 
-  // Overlay de fixar/desafixar (estilo Discord): ícone centralizado que só
-  // aparece enquanto o mouse se MEXE por cima — some depois de 3s parado,
-  // mas o clique continua valendo em qualquer lugar do card mesmo com o
-  // ícone escondido (é só uma pista visual, nunca intercepta clique —
-  // pointer-events: none — e o onclick de fixar/desafixar fica no
-  // card/tile inteiro, não no ícone). Escuta o movimento no CONTAINER, não
-  // no overlay (que não recebe evento nenhum de propósito).
+  // Overlay de fixar/desafixar (estilo Discord) e o ícone de volume: os dois
+  // só aparecem enquanto o mouse se MEXE por cima do card, somem depois de
+  // 2s parado, igual ao resto da UI (dock etc). Controlados pela mesma
+  // classe no CONTAINER (.tile-controls-active, ver .pin-overlay/
+  // .volume-control no CSS) em vez de cada um ter seu próprio timer. O
+  // clique de fixar/desafixar continua valendo em qualquer lugar do card
+  // mesmo com o ícone escondido (é só uma pista visual, nunca intercepta
+  // clique — pointer-events: none — e o onclick fica no card/tile inteiro,
+  // não no ícone); o de volume já reaparece antes de poder ser clicado.
   let pinOverlay = container.querySelector('.pin-overlay');
   if (!pinOverlay) {
     pinOverlay = document.createElement('div');
@@ -1458,18 +1550,18 @@ function ensureMediaTile(container, isSelf) {
     container.appendChild(pinOverlay);
 
     let idleTimer = null;
-    const showPinOverlay = () => {
-      pinOverlay.classList.add('pin-overlay-visible');
+    const showTileControls = () => {
+      container.classList.add('tile-controls-active');
       clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => pinOverlay.classList.remove('pin-overlay-visible'), 2000);
+      idleTimer = setTimeout(() => container.classList.remove('tile-controls-active'), 2000);
     };
-    const hidePinOverlay = () => {
+    const hideTileControls = () => {
       clearTimeout(idleTimer);
-      pinOverlay.classList.remove('pin-overlay-visible');
+      container.classList.remove('tile-controls-active');
     };
-    container.addEventListener('mouseenter', showPinOverlay);
-    container.addEventListener('mousemove', showPinOverlay);
-    container.addEventListener('mouseleave', hidePinOverlay);
+    container.addEventListener('mouseenter', showTileControls);
+    container.addEventListener('mousemove', showTileControls);
+    container.addEventListener('mouseleave', hideTileControls);
   }
   const pinIcon = pinOverlay.querySelector('.pin-icon');
 
@@ -1605,6 +1697,24 @@ function exitFocus() {
 // ciclo de render (evita reatribuir o mesmo handler sem necessidade).
 focusMainEl.onclick = () => exitFocus();
 
+// Oculta/mostra a tira com a transmissão de todo mundo além da pessoa
+// fixada, só a visibilidade, sem mexer no áudio (continuam ouvíveis
+// mesmo escondidos, só o vídeo some).
+btnToggleFocusStrip.addEventListener('click', (event) => {
+  event.stopPropagation(); // não deixa o clique "vazar" pro fundo (ex.: sair do foco)
+  focusStripCollapsed = !focusStripCollapsed;
+  // "^" indica que já está no modo exclusivo (só a pessoa fixada); "v"
+  // indica que clicar entra no modo exclusivo (esconde os outros).
+  btnToggleFocusStrip.innerHTML = focusStripCollapsed ? PEOPLE_CHEVRON_UP_SVG : PEOPLE_CHEVRON_DOWN_SVG;
+  btnToggleFocusStrip.title = focusStripCollapsed ? 'Mostrar as outras transmissões' : 'Ocultar as outras transmissões';
+  focusStripEl.hidden = focusStripCollapsed || focusStripEl.childElementCount === 0;
+  // Só no modo exclusivo o vídeo pinado desce até o fundo da tela, é só aí
+  // que o botão precisa subir pra não ficar atrás da dock em tela cheia
+  // (ver .room-view.stage-zoomed.focus-strip-collapsed no CSS). Com a tira
+  // visível ele já sobra bem acima da dock, sem precisar disso.
+  viewRoom.classList.toggle('focus-strip-collapsed', focusStripCollapsed);
+});
+
 function renderFocusIfShowing() {
   if (focusedPeerId !== null) renderFocus();
 }
@@ -1625,6 +1735,12 @@ function renderFocus() {
 
   const stripItems = items.filter((item) => item.id !== focusedPeerId);
   const stripIds = new Set(stripItems.map((item) => item.id));
+
+  // O botão só faz sentido quando tem alguém além da pessoa fixada pra
+  // esconder; sem ninguém na tira não há o que ocultar.
+  const hasOthers = stripItems.length > 0;
+  btnToggleFocusStrip.hidden = !hasOthers;
+  focusStripEl.hidden = !hasOthers || focusStripCollapsed;
 
   focusStripTileEls.forEach((el, id) => {
     if (!stripIds.has(id)) {

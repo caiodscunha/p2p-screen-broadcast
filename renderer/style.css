@@ -26,6 +26,7 @@
 
   --font-body: 'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
   --font-mono: Consolas, 'Cascadia Code', 'SF Mono', Menlo, monospace;
+  --font-display: 'Bahnschrift', 'Segoe UI Semibold', var(--font-body);
 }
 
 * { box-sizing: border-box; }
@@ -57,63 +58,18 @@ body {
   display: block;
 }
 
-h1 {
-  margin: 0;
-  font-size: 16px;
-  font-weight: 700;
-  letter-spacing: 0.01em;
-}
-
-.brand-tagline {
-  margin: 1px 0 0;
-  font-size: 12px;
-  color: var(--text-faint);
-}
-
 .view { display: none; padding: 24px 28px 40px; }
 .view.active { display: block; }
 
 /* Salas ocupam a janela inteira (grid + barra inferior fixa), diferente da
-   home (que é uma página de formulário rolável). */
-.view.room-view.active { display: flex; flex-direction: column; height: 100vh; padding: 0; }
-
-.row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
-.col { flex: 1 1 400px; min-width: 320px; }
-
-.card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 20px;
-}
-
-.card + .card { margin-top: 16px; }
-
-h2 {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-  margin: 0 0 16px;
-}
-
-.step-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  border-radius: 6px;
-  background: var(--accent-soft);
-  color: var(--accent-strong);
-  font-size: 11px;
-  font-weight: 700;
-  flex-shrink: 0;
-}
+   home (que é uma página de formulário rolável). position: relative pra
+   servir de âncora pra barra inferior virar overlay no modo "tela cheia"
+   (ver .stage-zoomed) e pro grupo de botões flutuantes do canto. overflow:
+   hidden porque o translateY da dock escondida (ver .controls-hidden)
+   empurra a caixa dela alguns px pra fora da viewport de 100vh — sem isso
+   o body ganhava uma barra de rolagem vertical por causa desses poucos
+   pixels "vazando" por baixo. */
+.view.room-view.active { display: flex; flex-direction: column; height: 100vh; padding: 0; position: relative; overflow: hidden; }
 
 h3 { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint); margin: 20px 0 8px; }
 
@@ -143,6 +99,8 @@ h3 { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacin
 
 .btn-danger-ghost { background: transparent; color: var(--accent-strong); border-color: var(--accent-border); }
 .btn-danger-ghost:hover:not(:disabled) { background: var(--accent-soft); }
+
+.btn-block { width: 100%; padding: 12px 16px; font-size: 14px; }
 
 video { display: block; background: #000; }
 
@@ -284,14 +242,235 @@ textarea {
 
 /* ===================== HOME ===================== */
 
-.home-wrap { max-width: 900px; margin: 0 auto; }
+/* Fundo com um brilho vermelho bem sutil vindo de cima (ecoa o acento da
+   sala) e uma textura fina de pontos, dá profundidade de "console" sem
+   virar um gradiente genérico. Só na home: a sala já tem o próprio vídeo
+   como fundo. */
+#view-home.view {
+  min-height: 100vh;
+  padding: 24px 32px 28px;
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(640px 340px at 50% -60px, rgba(237, 66, 69, 0.14), transparent 70%),
+    radial-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size: auto, 26px 26px;
+  background-position: 0 0, 0 0;
+  background-repeat: no-repeat, repeat;
+}
 
-.brand-hero { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
-.brand-hero h1 { font-size: 22px; }
+.home-wrap { max-width: 880px; margin: 0 auto; }
 
-.home-cards { margin-top: 0; }
+@keyframes home-rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
 
-.home-status { text-align: center; margin-top: 18px; }
+/* ---- hero: marca pulsante e título, bem espaçados, mas é o título que
+   fica centralizado na tela, não o conjunto dos dois. Truque do grid de 3
+   colunas (1fr auto 1fr): a coluna do meio ("auto", só o tamanho do
+   título) fica exatamente no centro porque as duas colunas "1fr" nas
+   pontas dividem o espaço restante igualmente entre si, mesmo só a da
+   esquerda tendo conteúdo (a marca, encostada na borda direita dela). */
+.home-hero {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  column-gap: 40px;
+  margin-bottom: 18px;
+  animation: home-rise 0.55s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Aviso só pro Windows (ligado via JS conferindo a plataforma, ver
+   renderer.js) de que a rede precisa estar como "Privada", senão o
+   Firewall barra a conexão direta entre as pessoas. Tom de "warning", não
+   de erro: é um aviso preventivo, não uma falha que já aconteceu. */
+.home-note {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 8px;
+  max-width: 640px;
+  margin: 0 auto 16px;
+  padding: 8px 16px;
+  background: var(--warning-soft);
+  border: 1px solid rgba(240, 178, 50, 0.35);
+  border-radius: var(--radius);
+  color: var(--warning);
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: left;
+}
+
+.home-note svg { margin-top: 2px; flex-shrink: 0; }
+.home-note strong { color: inherit; }
+
+.signal-mark {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  justify-self: end;
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+}
+
+.home-brand-mark { position: relative; z-index: 1; border-radius: 14px; }
+
+/* Dois anéis que pulsam pra fora a partir da marca, em fases diferentes,
+   a "assinatura" visual do nome do app (Sinal = sinal se propagando). Puro
+   CSS, discreto o bastante pra não distrair de quem está preenchendo o
+   formulário. */
+.signal-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 14px;
+  border: 1.5px solid var(--accent);
+  opacity: 0;
+  animation: signal-pulse 3.2s cubic-bezier(0.2, 0.6, 0.4, 1) infinite;
+}
+
+.signal-ring-2 { animation-delay: 1.6s; }
+
+@keyframes signal-pulse {
+  0% { transform: scale(1); opacity: 0.55; }
+  100% { transform: scale(1.9); opacity: 0; }
+}
+
+.home-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.1;
+}
+
+.home-title-accent { color: var(--accent); }
+
+/* ---- console: os dois caminhos (criar/entrar) lado a lado num painel só,
+   em vez de dois cards soltos e idênticos ---- */
+
+.home-console {
+  display: flex;
+  align-items: stretch;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+  animation: home-rise 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.1s both;
+}
+
+.home-console-pane {
+  flex: 1 1 0;
+  min-width: 280px;
+  display: flex;
+  flex-direction: column;
+  padding: 18px 28px;
+}
+
+/* Leve wash vermelho no topo do primeiro painel, sinaliza sem gritar que
+   criar a sala é o caminho "principal" (quem cria é o ponto de encontro). */
+.home-console-pane:first-child {
+  background: linear-gradient(180deg, rgba(237, 66, 69, 0.05), transparent 160px);
+}
+
+.pane-kicker {
+  margin: 0 0 4px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent-strong);
+}
+
+.pane-title {
+  margin: 0 0 8px;
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/* Empurra o botão de ação pro fundo do painel, alinhando os dois CTAs numa
+   linha só mesmo quando um formulário é mais alto que o outro. Espaçamento
+   um pouco mais compacto que o padrão (usado nos popovers) pra os dois
+   formulários caberem sem rolar na altura padrão da janela. */
+.home-console-pane .btn-block { margin-top: auto; }
+.home-console-pane .field-block { margin: 8px 0; }
+.home-console-pane .hint { margin: 0 0 10px; }
+.home-console-pane textarea { min-height: 64px; }
+
+/* Mini-roteiro de "como funciona", preenche o painel de criar sala (que
+   tem menos campos que o de entrar) com conteúdo útil em vez de deixar um
+   vão vazio, e ainda ensina o fluxo de convite pra quem nunca usou. */
+.pane-steps {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pane-steps li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.pane-steps li span {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.home-console-divider {
+  position: relative;
+  width: 1px;
+  flex-shrink: 0;
+  background: var(--border);
+}
+
+.divider-badge {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--panel-raised);
+  border: 1px solid var(--border-strong);
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+@media (max-width: 760px) {
+  .home-console { flex-direction: column; }
+  .home-console-pane:first-child { background: linear-gradient(90deg, rgba(237, 66, 69, 0.05), transparent 220px); }
+  .home-console-divider { width: auto; height: 1px; }
+}
+
+.home-status { text-align: center; margin-top: 22px; }
 
 /* ===================== SALA ===================== */
 
@@ -352,7 +531,7 @@ textarea {
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   grid-auto-rows: minmax(160px, 1fr);
   gap: 12px;
-  padding: 16px;
+  padding: 10px;
   overflow: auto;
   align-content: start;
 }
@@ -421,6 +600,17 @@ textarea {
   flex-direction: row-reverse;
   align-items: center;
   gap: 8px;
+  /* Some junto com o ícone de fixar/desafixar quando o mouse fica parado
+     por 2s (mesma classe .tile-controls-active do card/tile, ver
+     ensureMediaTile no JS), igual ao resto dos controles flutuantes. */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+.tile-controls-active .volume-control {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .volume-icon-btn {
@@ -452,6 +642,11 @@ textarea {
 
 .volume-control:hover .volume-slider-wrap { display: flex; }
 
+/* Nas miniaturas da tira de foco só cabe o ícone de mutar/desmutar, sem
+   slider de volume, que não tem espaço nem faz muito sentido num card tão
+   pequeno (ver .focus-thumb mais abaixo). */
+.focus-thumb .volume-control:hover .volume-slider-wrap { display: none; }
+
 .volume-slider {
   width: 100px;
   height: 20px;
@@ -464,13 +659,24 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 16px;
+  padding: 10px;
   min-height: 0;
+}
+
+/* Envelope em volta do vídeo pinado, existe só pra servir de âncora pro
+   botão de ocultar/mostrar a tira de miniaturas (ver .focus-strip-toggle-btn),
+   que precisa ficar por fora de #focus-main (senão some sempre que
+   ensureMediaTile recria o conteúdo do card). */
+.focus-main-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
 }
 
 .focus-main {
   flex: 1;
-  min-height: 0;
+  min-width: 0;
   position: relative;
   background: #000;
   border-radius: var(--radius);
@@ -480,6 +686,41 @@ textarea {
 }
 
 .focus-main video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+
+/* Botão centralizado embaixo do vídeo pinado pra esconder/mostrar a tira
+   com a transmissão de todo mundo mais (ver btnToggleFocusStrip no JS), só
+   aparece quando existe alguém além da pessoa fixada pra esconder. */
+.focus-strip-toggle-btn {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  z-index: 4;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(15, 15, 17, 0.75);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s ease, opacity 0.2s ease, transform 0.15s ease;
+}
+
+.focus-strip-toggle-btn:hover { background: rgba(15, 15, 17, 0.92); }
+.focus-strip-toggle-btn:active { transform: translateX(-50%) scale(0.95); }
+
+/* Some junto com o resto da dock quando o mouse fica parado, mesma classe
+   .controls-hidden ligada/desligada pelo timer de idle no JS
+   (showDockControls/hideDockControls), só com o transform próprio porque
+   esse botão já parte de translateX(-50%) pra ficar centralizado. */
+.room-view.controls-hidden .focus-strip-toggle-btn {
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, 10px);
+}
 
 .focus-strip {
   display: flex;
@@ -506,10 +747,12 @@ textarea {
 .focus-thumb video { width: 100%; height: 100%; object-fit: contain; background: #000; }
 
 /* Fixar/desafixar estilo Discord: ícone central que só aparece enquanto o
-   mouse se mexe por cima (classe .pin-overlay-visible, ligada/desligada via
-   JS — ver ensureMediaTile) e some sozinho depois de 3s parado. Puramente
-   visual (pointer-events: none) — o clique é sempre tratado pelo card/tile
-   inteiro por baixo, então continua funcionando mesmo com o ícone escondido. */
+   mouse se mexe por cima (classe .tile-controls-active no card/tile,
+   ligada/desligada via JS, ver ensureMediaTile) e some sozinho depois de 2s
+   parado, mesma classe que controla o ícone de volume (ver .volume-control
+   acima). Puramente visual (pointer-events: none): o clique é sempre
+   tratado pelo card/tile inteiro por baixo, então continua funcionando
+   mesmo com o ícone escondido. */
 .pin-overlay {
   position: absolute;
   inset: 0;
@@ -523,7 +766,7 @@ textarea {
   transition: opacity 0.2s ease;
 }
 
-.pin-overlay.pin-overlay-visible { opacity: 1; }
+.tile-controls-active .pin-overlay { opacity: 1; }
 
 .pin-icon {
   width: 48px;
@@ -551,33 +794,104 @@ textarea {
 
 /* ---- barra inferior: dock flutuante arredondada, estilo Discord/macOS ---- */
 
+/* Fora do modo tela cheia, a barra ocupa sua própria linha no layout flex,
+   mas só do tamanho que a dock realmente precisa (padding enxuto), não uma
+   faixa vazia enorme sobrando embaixo. */
 .bottom-bar {
   flex-shrink: 0;
   position: relative;
   display: flex;
   justify-content: center;
-  padding: 0 20px 18px;
+  padding: 0 16px 10px;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+/* Modo "tela cheia" (zoom): aí sim a barra vira overlay e flutua por cima
+   do vídeo (encostando um pouco nele por baixo), já que o palco toma toda
+   a altura da sala nesse modo, ver .room-view.stage-zoomed abaixo. */
+.room-view.stage-zoomed .bottom-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 15;
+  /* A barra inteira (footer full-width) ficava captando clique mesmo nos
+     trechos vazios/transparentes fora da pílula da dock, dava pra "não
+     conseguir clicar" numa faixa bem maior que a dock em si. Desliga o
+     clique na barra toda e liga de volta só nos elementos que realmente
+     aparecem (dock e grupo de tela cheia/participantes). */
+  pointer-events: none;
+}
+
+.room-view.stage-zoomed .dock,
+.room-view.stage-zoomed .standalone-btn-group {
+  pointer-events: auto;
+}
+
+/* Some sozinha (estilo player de vídeo/PiP): o mouse parado por 2s some com
+   ela, mexer o mouse na sala traz de volta, ver o timer de idle no JS
+   (showDockControls/hideDockControls). pointer-events some junto pra não
+   bloquear clique na transmissão por baixo enquanto invisível. */
+.room-view.controls-hidden .bottom-bar,
+.room-view.controls-hidden .standalone-btn-group {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(10px);
+}
+
+/* Modo "tela cheia" (zoom): fica só a moldura mínima (10px) ao redor do
+   vídeo, sem cantos arredondados, perto do fora do modo zoom, que segue
+   com o respiro normal de .stream-grid/.focus-view (10px) e cantos
+   arredondados nos cards. */
+.room-view.stage-zoomed .stream-card,
+.room-view.stage-zoomed .focus-main {
+  border: none;
+  border-radius: 0;
+}
+
+/* Só quando tela cheia E modo exclusivo (tira escondida) o vídeo pinado
+   desce até o fundo da tela de verdade, caindo atrás da dock flutuante, é
+   só nesse caso que o botão precisa subir pra cima dela. Com a tira
+   visível ele já sobra bem acima da dock (a tira ocupa esse espaço), e fora
+   da tela cheia a dock nem é overlay, nenhum dos dois casos precisa disso. */
+.room-view.stage-zoomed.focus-strip-collapsed .focus-strip-toggle-btn {
+  bottom: 74px;
+}
+
+/* Mesma lógica pro ícone de volume do vídeo pinado, ele também mora colado
+   no fundo do card (bottom: 8px) e cairia atrás da dock nesse modo. */
+.room-view.stage-zoomed.focus-strip-collapsed #focus-main .volume-control {
+  bottom: 74px;
 }
 
 .dock {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 14px;
+  gap: 8px;
+  padding: 6px 10px;
   background: var(--panel-raised);
   border: 1px solid var(--border-strong);
   border-radius: 999px;
   box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
 }
 
-/* Botão de participantes: bolinha própria, separada da dock principal e
-   fixada na direita, enquanto a dock fica sempre centralizada na barra. */
-.dock-standalone-btn {
+/* Grupo com o botão de tela cheia e o de participantes: bolinhas próprias,
+   separadas da dock principal e fixadas na direita, enquanto a dock fica
+   sempre centralizada na barra. */
+.standalone-btn-group {
   position: absolute;
-  right: 20px;
-  bottom: 18px;
-  width: 52px;
-  height: 52px;
+  right: 16px;
+  bottom: 10px;
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.dock-standalone-btn {
+  width: 44px;
+  height: 44px;
   border-radius: 50%;
   border: 1px solid var(--border-strong);
   background: var(--panel-raised);
@@ -592,10 +906,11 @@ textarea {
 
 .dock-standalone-btn:hover { background: var(--panel-raised-hover); color: var(--text); }
 .dock-standalone-btn:active { transform: scale(0.95); }
+.dock-standalone-btn.active-toggle { background: var(--accent-soft); color: var(--accent-strong); }
 
 .dock-btn {
-  width: 40px;
-  height: 40px;
+  width: 36px;
+  height: 36px;
   border-radius: 50%;
   border: none;
   background: transparent;
@@ -617,8 +932,8 @@ textarea {
 .share-control { display: flex; align-items: center; gap: 2px; }
 
 .control-btn {
-  width: 44px;
-  height: 44px;
+  width: 38px;
+  height: 38px;
   border-radius: 50%;
   border: none;
   background: var(--panel-raised-hover);
@@ -637,7 +952,7 @@ textarea {
 .control-btn.is-live { background: var(--accent); color: #fff; }
 .control-btn.is-live:hover { background: var(--accent-strong); }
 
-.control-btn-arrow { width: 22px; height: 44px; border-radius: 0 999px 999px 0; margin-left: 1px; }
+.control-btn-arrow { width: 20px; height: 38px; border-radius: 0 999px 999px 0; margin-left: 1px; }
 .control-btn:not(.control-btn-arrow) { border-radius: 999px 0 0 999px; }
 .share-control:has(.control-btn-arrow[hidden]) .control-btn:not(.control-btn-arrow) { border-radius: 50%; }
 
@@ -645,7 +960,7 @@ textarea {
 
 .popover {
   position: absolute;
-  bottom: 88px;
+  bottom: 72px;
   left: 50%;
   transform: translateX(-50%);
   width: 360px;
