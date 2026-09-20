@@ -65,6 +65,14 @@ function createMessageAssembler() {
   const partial = new Map(); // mid -> pedaços (array com buracos)
   const delivered = new Set(); // mid's já entregues — não deixa crescer sem limite
   const MAX_DELIVERED = 500;
+  // Mensagens cujo último pedaço nunca chega (perdido nas duas vias — UDP e
+  // ntfy — ao mesmo tempo) ficavam presas aqui pra sempre: era o único mapa
+  // deste arquivo sem limite nenhum, um vazamento de memória real e sem
+  // relação com nenhum modo de áudio, só com o tempo de uma sessão de sala
+  // (quanto mais renegociações/candidatos ICE trocados, mais mensagens
+  // fragmentadas passam por aqui). Mesma técnica de `delivered` abaixo:
+  // `Map` preserva ordem de inserção, então descarta a mais antiga.
+  const MAX_PARTIAL = 200;
 
   return (envelope) => {
     if (
@@ -85,6 +93,9 @@ function createMessageAssembler() {
     if (!parts) {
       parts = new Array(envelope.n).fill(null);
       partial.set(envelope.mid, parts);
+      if (partial.size > MAX_PARTIAL) {
+        partial.delete(partial.keys().next().value);
+      }
     }
     parts[envelope.i] = envelope.c;
     if (!parts.every((p) => p !== null)) return null;
@@ -103,6 +114,13 @@ function createMessageAssembler() {
   };
 }
 
+// Devolve um resultado rico (não só sucesso/falha) pra quem chama poder
+// distinguir POR QUE falhou — usado por `send()` pra montar um diagnóstico
+// que chega até a UI (ver `ntfyOutcome`/mensagens de erro em renderer.js).
+// `networkError: true` é a categoria "fetch failed" de verdade (relé
+// inalcançável — DNS, conexão recusada, bloqueio de IP etc.), diferente de
+// uma resposta HTTP com erro (relé alcançável, mas recusou o pedido — ex:
+// 429 de limite de taxa).
 async function postNtfyMessage(topic, obj) {
   try {
     const res = await fetch(`${NTFY_BASE}/${encodeURIComponent(topic)}`, {
@@ -110,11 +128,27 @@ async function postNtfyMessage(topic, obj) {
       body: JSON.stringify(obj),
     });
     if (!res.ok) console.error('[signal-punch] ntfy: publicar falhou, status', res.status);
-    return res.ok;
+    return { ok: res.ok, networkError: false, status: res.status };
   } catch (err) {
     console.error('[signal-punch] ntfy: publicar deu erro de rede:', err.message);
-    return false;
+    return { ok: false, networkError: true, status: null };
   }
+}
+
+// Reduz a lista de resultados de `postNtfyMessage` (um por pedaço da
+// mensagem) numa única categoria pra UI mostrar. 'unreachable' (só erros de
+// rede — o caso confirmado na prática em 2026-09-19: `fetch failed` puro,
+// nem chega a trocar HTTP com o servidor) e 'rate-limited' (HTTP 429) são as
+// duas categorias que já se repetiram de verdade neste projeto. 'ok' quer
+// dizer que o ntfy funcionou normalmente mas mesmo assim ninguém confirmou
+// receber — ou seja, o problema não é o relé, é o código/sessão de destino
+// (expirado, digitado errado, a pessoa já não está mais lá).
+function summarizeNtfyOutcome(results) {
+  if (results.length === 0) return 'unknown'; // nenhum pedaço chegou a ser tentado ainda
+  if (results.every((r) => r.ok)) return 'ok';
+  if (results.every((r) => r.networkError)) return 'unreachable';
+  if (results.some((r) => r.status === 429)) return 'rate-limited';
+  return 'error';
 }
 
 // Mantém UMA conexão HTTP aberta (streaming, sem "poll=1") num tópico da
@@ -504,7 +538,15 @@ async function startListener({ onMessage }) {
 
       pendingAcks.set(mid, (via) => finish({ ok: true, via }));
 
-      envelopes.forEach((env) => postNtfyMessage(targetSessionId, env).catch(() => {}));
+      // Agrega o resultado de cada pedaço publicado no ntfy num diagnóstico
+      // só (ver `summarizeNtfyOutcome`) — é o que deixa a UI (renderer.js)
+      // mostrar uma mensagem específica ("relé inalcançável" vs "limite de
+      // taxa" vs "código não existe mais") em vez de um erro genérico só,
+      // se o ack nunca chegar por nenhuma via.
+      const ntfyResults = [];
+      Promise.all(
+        envelopes.map((env) => postNtfyMessage(targetSessionId, env).then((r) => ntfyResults.push(r)))
+      ).catch(() => {});
 
       // socket.send() LANÇA de verdade (não é uma Promise rejeitada) se o
       // socket já tiver sido fechado — pode acontecer se o app fechar ou a
@@ -530,7 +572,10 @@ async function startListener({ onMessage }) {
       };
       sendUdpOnce();
       const udpRetryTimer = setInterval(sendUdpOnce, udpRetryIntervalMs);
-      const giveUpTimer = setTimeout(() => finish({ ok: false, via: null }), timeoutMs);
+      const giveUpTimer = setTimeout(
+        () => finish({ ok: false, via: null, ntfy: summarizeNtfyOutcome(ntfyResults) }),
+        timeoutMs
+      );
     });
   }
 
