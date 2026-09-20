@@ -26,6 +26,7 @@
 
   --font-body: 'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
   --font-mono: Consolas, 'Cascadia Code', 'SF Mono', Menlo, monospace;
+  --font-display: 'Bahnschrift', 'Segoe UI Semibold', var(--font-body);
 }
 
 * { box-sizing: border-box; }
@@ -57,19 +58,6 @@ body {
   display: block;
 }
 
-h1 {
-  margin: 0;
-  font-size: 16px;
-  font-weight: 700;
-  letter-spacing: 0.01em;
-}
-
-.brand-tagline {
-  margin: 1px 0 0;
-  font-size: 12px;
-  color: var(--text-faint);
-}
-
 .view { display: none; padding: 24px 28px 40px; }
 .view.active { display: block; }
 
@@ -82,44 +70,6 @@ h1 {
    o body ganhava uma barra de rolagem vertical por causa desses poucos
    pixels "vazando" por baixo. */
 .view.room-view.active { display: flex; flex-direction: column; height: 100vh; padding: 0; position: relative; overflow: hidden; }
-
-.row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
-.col { flex: 1 1 400px; min-width: 320px; }
-
-.card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 20px;
-}
-
-.card + .card { margin-top: 16px; }
-
-h2 {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-  margin: 0 0 16px;
-}
-
-.step-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  border-radius: 6px;
-  background: var(--accent-soft);
-  color: var(--accent-strong);
-  font-size: 11px;
-  font-weight: 700;
-  flex-shrink: 0;
-}
 
 h3 { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint); margin: 20px 0 8px; }
 
@@ -149,6 +99,8 @@ h3 { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacin
 
 .btn-danger-ghost { background: transparent; color: var(--accent-strong); border-color: var(--accent-border); }
 .btn-danger-ghost:hover:not(:disabled) { background: var(--accent-soft); }
+
+.btn-block { width: 100%; padding: 12px 16px; font-size: 14px; }
 
 video { display: block; background: #000; }
 
@@ -290,14 +242,211 @@ textarea {
 
 /* ===================== HOME ===================== */
 
-.home-wrap { max-width: 900px; margin: 0 auto; }
+/* Fundo com um brilho vermelho bem sutil vindo de cima (ecoa o acento da
+   sala) e uma textura fina de pontos, dá profundidade de "console" sem
+   virar um gradiente genérico. Só na home: a sala já tem o próprio vídeo
+   como fundo. */
+#view-home.view {
+  min-height: 100vh;
+  padding: 24px 32px 28px;
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(640px 340px at 50% -60px, rgba(237, 66, 69, 0.14), transparent 70%),
+    radial-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size: auto, 26px 26px;
+  background-position: 0 0, 0 0;
+  background-repeat: no-repeat, repeat;
+}
 
-.brand-hero { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
-.brand-hero h1 { font-size: 22px; }
+.home-wrap { max-width: 880px; margin: 0 auto; }
 
-.home-cards { margin-top: 0; }
+@keyframes home-rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
 
-.home-status { text-align: center; margin-top: 18px; }
+/* ---- hero: marca pulsante e título, bem espaçados, mas é o título que
+   fica centralizado na tela, não o conjunto dos dois. Truque do grid de 3
+   colunas (1fr auto 1fr): a coluna do meio ("auto", só o tamanho do
+   título) fica exatamente no centro porque as duas colunas "1fr" nas
+   pontas dividem o espaço restante igualmente entre si, mesmo só a da
+   esquerda tendo conteúdo (a marca, encostada na borda direita dela). */
+.home-hero {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  column-gap: 40px;
+  margin-bottom: 18px;
+  animation: home-rise 0.55s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.signal-mark {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  justify-self: end;
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+}
+
+.home-brand-mark { position: relative; z-index: 1; border-radius: 14px; }
+
+/* Dois anéis que pulsam pra fora a partir da marca, em fases diferentes,
+   a "assinatura" visual do nome do app (Sinal = sinal se propagando). Puro
+   CSS, discreto o bastante pra não distrair de quem está preenchendo o
+   formulário. */
+.signal-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 14px;
+  border: 1.5px solid var(--accent);
+  opacity: 0;
+  animation: signal-pulse 3.2s cubic-bezier(0.2, 0.6, 0.4, 1) infinite;
+}
+
+.signal-ring-2 { animation-delay: 1.6s; }
+
+@keyframes signal-pulse {
+  0% { transform: scale(1); opacity: 0.55; }
+  100% { transform: scale(1.9); opacity: 0; }
+}
+
+.home-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.1;
+}
+
+.home-title-accent { color: var(--accent); }
+
+/* ---- console: os dois caminhos (criar/entrar) lado a lado num painel só,
+   em vez de dois cards soltos e idênticos ---- */
+
+.home-console {
+  display: flex;
+  align-items: stretch;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+  animation: home-rise 0.55s cubic-bezier(0.16, 1, 0.3, 1) 0.1s both;
+}
+
+.home-console-pane {
+  flex: 1 1 0;
+  min-width: 280px;
+  display: flex;
+  flex-direction: column;
+  padding: 18px 28px;
+}
+
+/* Leve wash vermelho no topo do primeiro painel, sinaliza sem gritar que
+   criar a sala é o caminho "principal" (quem cria é o ponto de encontro). */
+.home-console-pane:first-child {
+  background: linear-gradient(180deg, rgba(237, 66, 69, 0.05), transparent 160px);
+}
+
+.pane-kicker {
+  margin: 0 0 4px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent-strong);
+}
+
+.pane-title {
+  margin: 0 0 8px;
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/* Empurra o botão de ação pro fundo do painel, alinhando os dois CTAs numa
+   linha só mesmo quando um formulário é mais alto que o outro. Espaçamento
+   um pouco mais compacto que o padrão (usado nos popovers) pra os dois
+   formulários caberem sem rolar na altura padrão da janela. */
+.home-console-pane .btn-block { margin-top: auto; }
+.home-console-pane .field-block { margin: 8px 0; }
+.home-console-pane .hint { margin: 0 0 10px; }
+.home-console-pane textarea { min-height: 64px; }
+
+/* Mini-roteiro de "como funciona", preenche o painel de criar sala (que
+   tem menos campos que o de entrar) com conteúdo útil em vez de deixar um
+   vão vazio, e ainda ensina o fluxo de convite pra quem nunca usou. */
+.pane-steps {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pane-steps li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.pane-steps li span {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.home-console-divider {
+  position: relative;
+  width: 1px;
+  flex-shrink: 0;
+  background: var(--border);
+}
+
+.divider-badge {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--panel-raised);
+  border: 1px solid var(--border-strong);
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+@media (max-width: 760px) {
+  .home-console { flex-direction: column; }
+  .home-console-pane:first-child { background: linear-gradient(90deg, rgba(237, 66, 69, 0.05), transparent 220px); }
+  .home-console-divider { width: auto; height: 1px; }
+}
+
+.home-status { text-align: center; margin-top: 22px; }
 
 /* ===================== SALA ===================== */
 
