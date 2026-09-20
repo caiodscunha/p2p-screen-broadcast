@@ -1,7 +1,7 @@
 {
   "name": "transmissao-p2p",
   "productName": "Sinal P2P",
-  "version": "1.0.0",
+  "version": "0.2.1",
   "description": "Transmissão de tela e áudio ponto-a-ponto (sem servidor)",
   "main": "main.js",
   "author": "Caio Cunha",
