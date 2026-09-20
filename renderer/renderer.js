@@ -212,6 +212,25 @@ function setRoomStatus(text) {
   roomStatusEl.hidden = !text;
 }
 
+// Traduz o diagnóstico vindo de signal-punch.js (`result.ntfy`, ver
+// `summarizeNtfyOutcome` lá) numa mensagem específica — em vez de um erro
+// genérico só, dá pra saber pelo front se o problema foi o relé ntfy.sh
+// (inalcançável ou limitando taxa) ou o código/sessão de destino em si.
+function joinFailureMessage(ntfyOutcome) {
+  switch (ntfyOutcome) {
+    case 'unreachable':
+      return 'Não consegui entrar — o servidor de retransmissão (ntfy.sh) está inacessível agora, provavelmente bloqueado temporariamente por excesso de uso. Tente de novo mais tarde.';
+    case 'rate-limited':
+      return 'Não consegui entrar — o servidor de retransmissão (ntfy.sh) está limitando conexões por excesso de uso. Tente de novo em alguns minutos.';
+    case 'error':
+      return 'Não consegui entrar — o servidor de retransmissão (ntfy.sh) recusou a mensagem. Tente de novo em alguns minutos.';
+    case 'ok':
+      return 'Não consegui entrar — código expirado ou a pessoa não está mais na sala. Confira o código e tente de novo.';
+    default:
+      return 'Não consegui entrar — código expirado, offline, ou problema de rede.';
+  }
+}
+
 async function enterRoom({ name, passphrase, hostSid, hostCands }) {
   myPeerId = randomPeerId();
   myName = name;
@@ -264,9 +283,7 @@ async function enterRoom({ name, passphrase, hostSid, hostCands }) {
       message: joinMessage,
     });
     if (!result.ok) {
-      setRoomStatus(
-        'Não consegui entrar — código expirado, offline, ou limite temporário do ntfy.sh. Voltando ao início...'
-      );
+      setRoomStatus(joinFailureMessage(result.ntfy) + ' Voltando ao início...');
       // Sem isso a pessoa ficava presa numa "sala" sozinha, sem ninguém
       // conectado, até clicar em "Sair da sala" por conta própria — agora
       // volta pra tela inicial sozinha depois de um tempo pra dar chance de
@@ -483,7 +500,10 @@ async function sendToPeerReliable(peer, message, { attempts = 3, opts } = {}) {
   for (let i = 0; i < attempts; i++) {
     result = await sendToPeer(peer, message, opts);
     if (result.ok) return result;
-    console.warn(`[room] envio de "${message.t}" pra`, peer.name, `falhou (tentativa ${i + 1}/${attempts})`);
+    console.warn(
+      `[room] envio de "${message.t}" pra`, peer.name,
+      `falhou (tentativa ${i + 1}/${attempts}) — ntfy:`, result.ntfy || 'n/d'
+    );
   }
   return result;
 }
@@ -509,6 +529,8 @@ function connectToPeer(peerInfo) {
     volume: 1,
     volumeBeforeMute: 1,
     connectionState: 'new',
+    connectionTimedOut: false,
+    iceWatchdogTimer: null,
   };
   roomPeers.set(peer.peerId, peer);
   setupPeerConnection(peer);
@@ -524,6 +546,26 @@ function connectToPeer(peerInfo) {
 async function setupPeerConnection(peer) {
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
   peer.pc = pc;
+
+  // Alguns pares nunca chegam a 'failed' sozinhos mesmo quando o NAT estrito
+  // de um dos lados torna essa conexão P2P (só STUN, sem TURN aqui — ver
+  // ICE_SERVERS) impossível de verdade: o agente de ICE do Chromium pode
+  // ficar preso em 'checking'/'new' pra sempre, sem nunca avisar. Sem isso,
+  // a pessoa ficava "conectando" na lista de participantes indefinidamente,
+  // com a tela preta, sem feedback nenhum de que aquele par específico
+  // nunca vai conectar. Não fecha a conexão (ainda pode conectar de
+  // verdade, só devagar) — só avisa visualmente; `connectionstatechange`
+  // limpa isso se ela realmente conectar depois.
+  peer.iceWatchdogTimer = setTimeout(() => {
+    if (pc.connectionState !== 'connected') {
+      console.warn(
+        '[room] conexão com', peer.name, 'não fechou em 20s — provável NAT estrito sem TURN',
+        'nessa combinação de redes (connectionState:', pc.connectionState + ')'
+      );
+      peer.connectionTimedOut = true;
+      renderParticipants();
+    }
+  }, 20000);
 
   // Associa os dois transceivers a UM MediaStream próprio (mesmo sem track
   // nenhuma ainda) — sem isso, o m-line negociado não carrega um "msid"
@@ -565,6 +607,10 @@ async function setupPeerConnection(peer) {
   pc.addEventListener('connectionstatechange', () => {
     peer.connectionState = pc.connectionState;
     console.log('[room] conexão com', peer.name, '->', pc.connectionState);
+    if (pc.connectionState === 'connected') {
+      clearTimeout(peer.iceWatchdogTimer);
+      peer.connectionTimedOut = false;
+    }
     if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
       removePeer(peer.peerId);
       return;
@@ -748,6 +794,7 @@ async function flushPendingIceCandidates(peer) {
 function removePeer(peerId) {
   const peer = roomPeers.get(peerId);
   if (!peer) return;
+  clearTimeout(peer.iceWatchdogTimer);
   if (peer.pc) peer.pc.close();
   roomPeers.delete(peerId);
   if (focusedPeerId === peerId) focusedPeerId = null;
@@ -1636,6 +1683,13 @@ function renderParticipants() {
       statusText = 'conectado';
     } else if (entry.connectionState === 'failed' || entry.connectionState === 'disconnected') {
       statusClass = 'status-failed';
+    } else if (entry.connectionTimedOut) {
+      // Ver o setTimeout em setupPeerConnection: o navegador às vezes nunca
+      // marca a conexão como 'failed' sozinho, mesmo quando ela realmente
+      // não vai dar certo (NAT estrito, sem TURN) — sem isso a pessoa ficava
+      // "conectando" pra sempre sem nenhum aviso.
+      statusClass = 'status-failed';
+      statusText = 'sem conexão (rede)';
     }
     if (entry.sharing) statusText = 'compartilhando';
     pill.className = 'status-pill ' + statusClass;
