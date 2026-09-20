@@ -5,6 +5,12 @@ const SHARE_ICON_SVG =
   '<rect x="2" y="4" width="20" height="13" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>';
 const STOP_ICON_SVG =
   '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"></rect></svg>';
+const ENTER_FULLSCREEN_ICON_SVG =
+  '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M8 3H5a2 2 0 0 0-2 2v3"></path><path d="M21 8V5a2 2 0 0 0-2-2h-3"></path><path d="M3 16v3a2 2 0 0 0 2 2h3"></path><path d="M16 21h3a2 2 0 0 0 2-2v-3"></path></svg>';
+const EXIT_FULLSCREEN_ICON_SVG =
+  '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M8 3v3a2 2 0 0 1-2 2H3"></path><path d="M21 8h-3a2 2 0 0 1-2-2V3"></path><path d="M3 16h3a2 2 0 0 1 2 2v3"></path><path d="M16 21v-3a2 2 0 0 1 2-2h3"></path></svg>';
 
 // ---------- utilidades de código (criptografia/codificação) ----------
 
@@ -104,11 +110,13 @@ const viewRoom = document.getElementById('view-room');
 function showHomeScreen() {
   viewRoom.classList.remove('active');
   viewHome.classList.add('active');
+  stopDockAutoHide();
 }
 
 function showRoomScreen() {
   viewHome.classList.remove('active');
   viewRoom.classList.add('active');
+  startDockAutoHide();
 }
 
 // ===================================================================
@@ -197,6 +205,7 @@ const roomNameLabel = document.getElementById('room-name-label');
 const btnCopyRoomCode = document.getElementById('btn-copy-room-code');
 const btnLeaveRoom = document.getElementById('btn-leave-room');
 const btnToggleParticipants = document.getElementById('btn-toggle-participants');
+const btnToggleFullscreen = document.getElementById('btn-toggle-fullscreen');
 const participantsPanel = document.getElementById('participants-panel');
 const participantsListEl = document.getElementById('participants-list');
 const roomStatusEl = document.getElementById('room-status');
@@ -311,6 +320,45 @@ btnToggleParticipants.addEventListener('click', () => {
   participantsPanel.hidden = !participantsPanel.hidden;
 });
 
+// Modo "tela cheia": o palco passa a ocupar também a linha reservada pra
+// dock (que vira overlay flutuando por cima do vídeo, encostando nele por
+// baixo) e a moldura ao redor do vídeo fica só com uma borda mínima de
+// 10px, sem cantos arredondados (ver .stage-zoomed no CSS). A dock e o
+// botão de participantes continuam funcionando normalmente por cima, só
+// somem junto com o resto da dock quando o mouse fica parado (ver
+// startDockAutoHide abaixo).
+let stageZoomed = false;
+btnToggleFullscreen.addEventListener('click', () => {
+  stageZoomed = !stageZoomed;
+  viewRoom.classList.toggle('stage-zoomed', stageZoomed);
+  btnToggleFullscreen.classList.toggle('active-toggle', stageZoomed);
+  btnToggleFullscreen.innerHTML = stageZoomed ? EXIT_FULLSCREEN_ICON_SVG : ENTER_FULLSCREEN_ICON_SVG;
+  btnToggleFullscreen.title = stageZoomed ? 'Sair da tela cheia' : 'Tela cheia';
+});
+
+// Dock some sozinha (estilo player de vídeo/PiP): mouse parado por 2s
+// dentro da sala esconde a dock e o botão de participantes; mexer o mouse
+// (ou o mouse sair da janela) mostra/esconde na hora.
+let dockIdleTimer = null;
+function showDockControls() {
+  viewRoom.classList.remove('controls-hidden');
+  clearTimeout(dockIdleTimer);
+  dockIdleTimer = setTimeout(() => viewRoom.classList.add('controls-hidden'), 2000);
+}
+function stopDockAutoHide() {
+  clearTimeout(dockIdleTimer);
+  viewRoom.classList.remove('controls-hidden');
+}
+function startDockAutoHide() {
+  showDockControls();
+}
+viewRoom.addEventListener('mousemove', showDockControls);
+viewRoom.addEventListener('mouseenter', showDockControls);
+viewRoom.addEventListener('mouseleave', () => {
+  clearTimeout(dockIdleTimer);
+  viewRoom.classList.add('controls-hidden');
+});
+
 btnLeaveRoom.addEventListener('click', () => leaveRoom());
 
 function leaveRoom() {
@@ -342,6 +390,13 @@ function leaveRoom() {
   resetMediaTileRegistries();
   participantsPanel.hidden = true;
   hideSharePopover();
+  if (stageZoomed) {
+    stageZoomed = false;
+    viewRoom.classList.remove('stage-zoomed');
+    btnToggleFullscreen.classList.remove('active-toggle');
+    btnToggleFullscreen.innerHTML = ENTER_FULLSCREEN_ICON_SVG;
+    btnToggleFullscreen.title = 'Tela cheia';
+  }
   // Sem isso, uma mensagem tipo "Criando sala..."/"Entrando na sala..." que
   // ficou parada em #home-status (nunca sobrescrita porque a sala anterior
   // abriu com sucesso e nunca mais voltou pra tela inicial) reaparecia do
