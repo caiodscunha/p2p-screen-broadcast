@@ -280,6 +280,30 @@ textarea {
   animation: home-rise 0.55s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
+/* Aviso só pro Windows (ligado via JS conferindo a plataforma, ver
+   renderer.js) de que a rede precisa estar como "Privada", senão o
+   Firewall barra a conexão direta entre as pessoas. Tom de "warning", não
+   de erro: é um aviso preventivo, não uma falha que já aconteceu. */
+.home-note {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 8px;
+  max-width: 640px;
+  margin: 0 auto 16px;
+  padding: 8px 16px;
+  background: var(--warning-soft);
+  border: 1px solid rgba(240, 178, 50, 0.35);
+  border-radius: var(--radius);
+  color: var(--warning);
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: left;
+}
+
+.home-note svg { margin-top: 2px; flex-shrink: 0; }
+.home-note strong { color: inherit; }
+
 .signal-mark {
   position: relative;
   display: flex;

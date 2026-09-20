@@ -217,6 +217,11 @@ option in the UI).
 
 ## Usage
 
+> **Windows**: your network must be set to **Private** (Settings → Network
+> & Internet → your network → Network profile type). On a **Public**
+> profile, Windows Firewall blocks the inbound connections Sinal P2P needs
+> for direct peer-to-peer networking, and rooms can fail to connect.
+
 ### Creating a room
 
 1. On the home screen, fill in your name and (optionally) a passphrase

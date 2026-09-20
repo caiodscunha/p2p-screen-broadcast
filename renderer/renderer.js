@@ -126,6 +126,13 @@ function randomPeerId() {
 const viewHome = document.getElementById('view-home');
 const viewRoom = document.getElementById('view-room');
 
+// O aviso de "deixe a rede como Privada" só faz sentido no Windows (é lá
+// que o Firewall do SO bloqueia conexão direta em rede Pública), sem IPC
+// dedicado pra isso, `navigator.platform` já resolve dentro do Electron.
+if (/^Win/.test(navigator.platform)) {
+  document.getElementById('home-windows-note').hidden = false;
+}
+
 function showHomeScreen() {
   viewRoom.classList.remove('active');
   viewHome.classList.add('active');
