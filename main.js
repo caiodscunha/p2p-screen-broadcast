@@ -307,10 +307,17 @@ ipcMain.handle('signal:send', (event, { mySessionId, candidates, targetSessionId
 // qual monitor compartilhar — inclusive pra trocar de monitor com a
 // transmissão já rolando, sem depender do seletor nativo do SO (que só
 // aparece no início, e nem existe no Linux).
+//
+// No Linux (testado num Wayland/Mutter), pedir a miniatura em si — o
+// thumbnailSize abaixo — parece ser o que causa aquela piscada rápida na
+// tela ao entrar numa sala (o compositor grava um frame de verdade da tela
+// pra gerar a imagem). Testando sem miniatura nenhuma lá (só o nome/id de
+// cada tela) pra ver se é isso mesmo; se for, o preview visual do seletor de
+// monitor fica sem imagem no Linux, só com o nome.
 ipcMain.handle('capture:listScreens', async () => {
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
-    thumbnailSize: { width: 320, height: 180 },
+    thumbnailSize: process.platform === 'linux' ? { width: 0, height: 0 } : { width: 320, height: 180 },
   });
   return sources.map((s) => ({
     id: s.id,
@@ -327,6 +334,13 @@ function createWindow() {
     title: 'Sinal P2P',
     icon: path.join(__dirname, 'assets', 'icon.png'),
     backgroundColor: '#15161a',
+    // Sem isso, a janela aparece assim que criada e só ganha conteúdo
+    // depois que renderer/index.html termina de carregar/pintar — nesse
+    // intervalo dá pra ver uma piscada (janela em branco/cor de fundo do SO
+    // por um instante antes do primeiro frame real). Escondida até
+    // 'ready-to-show' (que só dispara depois do primeiro frame já pintado)
+    // evita esse intervalo visível inteiro.
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -357,6 +371,7 @@ function createWindow() {
     },
   });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  win.once('ready-to-show', () => win.show());
 
   // Toda vez que a página carrega/recarrega, o estado de "compartilhando"
   // do renderer começa do zero — sem isso, um reload em pleno
