@@ -1028,10 +1028,10 @@ const btnRefreshAudioProcesses = document.getElementById('btn-refresh-audio-proc
 // O vídeo de "Áudio do sistema" sempre vem do getDisplayMedia (é assim que o
 // Electron expõe o seletor nativo do SO no Windows/macOS, ou a primeira tela
 // no Linux) — o dropdown de monitor deste popover não tem efeito nesse modo
-// específico. O ÁUDIO desse modo, quando o addon nativo de captura por
-// processo está disponível (Windows), vem dele em vez do loopback embutido
-// do Electron — ver acquireAudioTrack() — o que deixa trocável em pleno
-// andamento e evita ecoar o próprio som do Sinal P2P.
+// específico. O ÁUDIO desse modo, quando a captura por processo está
+// disponível (Windows/Linux, ver native/audio-loopback), vem dela em vez do
+// loopback embutido do Electron — ver acquireAudioTrack() — o que deixa
+// trocável em pleno andamento e evita ecoar o próprio som do Sinal P2P.
 // Lembra o último valor visto de audioSourceSelect só pra saber se estamos
 // ENTRANDO no modo "Processo específico" agora (pra pré-selecionar excluir +
 // Discord automaticamente) ou só atualizando a lista de apps de um modo em

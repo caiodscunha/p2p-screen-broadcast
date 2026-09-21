@@ -35,6 +35,7 @@
       "assets/**/*",
       "package.json",
       "native/audio-loopback/index.js",
+      "native/audio-loopback/linux-pipewire.js",
       "native/audio-loopback/build/Release/audio_loopback.node"
     ],
     "asarUnpack": [

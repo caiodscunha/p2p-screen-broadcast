@@ -6,8 +6,8 @@ contextBridge.exposeInMainWorld('api', {
   supportsSystemAudio: () => ipcRenderer.invoke('capture:supportsSystemAudio'),
   listScreens: () => ipcRenderer.invoke('capture:listScreens'),
 
-  // Captura de áudio por processo (só Windows) — deixa incluir só um app
-  // específico, ou excluir um app específico do resto.
+  // Captura de áudio por processo (Windows e Linux) — deixa incluir só um
+  // app específico, ou excluir um app específico do resto.
   supportsProcessAudio: () => ipcRenderer.invoke('audio-process:supported'),
   listAudioProcesses: () => ipcRenderer.invoke('audio-process:list'),
   startProcessAudioCapture: (pid, exclude) => ipcRenderer.invoke('audio-process:start', { pid, exclude }),

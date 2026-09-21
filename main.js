@@ -227,16 +227,17 @@ ipcMain.handle('clipboard:write', (event, text) => clipboard.writeText(text));
 ipcMain.handle('clipboard:read', () => clipboard.readText());
 ipcMain.handle('capture:supportsSystemAudio', () => supportsSystemAudioLoopback);
 
-// Captura de áudio por processo (Windows apenas, via módulo nativo em
-// native/audio-loopback). Deixa incluir só um app específico, ou excluir um
-// app específico do resto — útil pra tirar uma chamada de voz (Discord, etc)
-// do que é compartilhado, sem depender de rotear áudio manualmente pro SO.
+// Captura de áudio por processo (Windows via módulo nativo, Linux via
+// PipeWire — ver native/audio-loopback). Deixa incluir só um app específico,
+// ou excluir um app específico do resto — útil pra tirar uma chamada de voz
+// (Discord, etc) do que é compartilhado, sem depender de rotear áudio
+// manualmente pro SO.
 ipcMain.handle('audio-process:supported', () => processAudio.supported);
 ipcMain.handle('audio-process:list', () => processAudio.listProcesses());
 
-ipcMain.handle('audio-process:start', (event, { pid, exclude }) => {
+ipcMain.handle('audio-process:start', async (event, { pid, exclude }) => {
   const webContents = event.sender;
-  const handle = processAudio.startCapture(pid, exclude, (error, samples, sampleRate, channels) => {
+  const handle = await processAudio.startCapture(pid, exclude, (error, samples, sampleRate, channels) => {
     if (webContents.isDestroyed()) return;
     if (error) {
       webContents.send('audio-process:error', error);
