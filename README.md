@@ -38,16 +38,18 @@ whichever two people need to talk to each other.
 - 🖥️ Screen + system audio capture (native picker and system-audio
   loopback on Windows and macOS; manual PulseAudio/PipeWire monitor-source
   selection on Linux)
-- 🎚️ Per-app audio capture on Windows: include only one app's audio, or
-  exclude one app (e.g. share your game/music but not your Discord call);
-  picking this mode auto-selects "exclude" and auto-picks any app whose
-  window title ends in "Discord", since that's the overwhelmingly common
-  case. Uses WASAPI Process Loopback, and switching audio source works
-  live, mid-share, without interrupting anything
+- 🎚️ Per-app audio capture on Windows and Linux (PipeWire): include only one
+  app's audio, or exclude one app (e.g. share your game/music but not your
+  Discord call); picking this mode auto-selects "exclude" and auto-picks any
+  app whose window title (or app name, on Linux) ends in "Discord", since
+  that's the overwhelmingly common case. Uses WASAPI Process Loopback on
+  Windows and a `pw-loopback`/`pw-link`/`pw-record` PipeWire pipeline on
+  Linux, and switching audio source works live, mid-share, without
+  interrupting anything
 - 🔇 **No self-echo**: whichever audio mode you pick (including plain
   "system audio"), Sinal P2P's own output is automatically excluded from
-  what you broadcast on Windows, so a room-mate's voice playing on your
-  speakers never loops back into your own stream
+  what you broadcast on Windows and Linux, so a room-mate's voice playing on
+  your speakers never loops back into your own stream
 - 🔗 Fully peer-to-peer via WebRTC mesh, no relay server ever touches your
   video/audio: every pair of participants in a room talks directly to
   each other
@@ -126,7 +128,7 @@ protection if the passphrase is agreed through a different channel than the
 one used to send the code (e.g. code over chat, passphrase said out loud on
 a call). Leaving the passphrase blank keeps the previous plain behavior.
 
-### Per-app audio capture (Windows only)
+### Per-app audio capture (Windows and Linux)
 
 The audio source picker in the share popover has a "Specific process"
 option that lets you include only one running app's audio, or exclude one
@@ -134,29 +136,42 @@ app from an otherwise full system-audio share, e.g. share your game or
 music but keep a Discord voice call out of the stream, without routing
 anything to a separate audio device manually. Picking this option
 automatically switches to "exclude" mode and auto-selects any running app
-whose window title ends in "Discord" (falling back to just the first app in
-the list if none matches); you can always change it manually afterward.
+whose window title (Windows) or app name (Linux) ends in "Discord" (falling
+back to just the first app in the list if none matches); you can always
+change it manually afterward.
 
-This uses WASAPI's Process Loopback Capture (`AUDIOCLIENT_ACTIVATION_TYPE_
-PROCESS_LOOPBACK`, Windows 10 2004+), the same API OBS Studio uses for its
-"Application Audio Capture" source. It isn't exposed by Chromium/Electron's
-JS APIs, so it's implemented as a small native addon
-(`native/audio-loopback/`, C++/N-API) that captures raw PCM for a target
-process (and its child processes) and streams it to the renderer, where a
-Web Audio `AudioWorklet` turns it into a real `MediaStreamTrack` that gets
-added to the share alongside the video. Windows-only: on macOS and Linux
-this option simply doesn't appear.
+On **Windows**, this uses WASAPI's Process Loopback Capture
+(`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, Windows 10 2004+), the same
+API OBS Studio uses for its "Application Audio Capture" source. It isn't
+exposed by Chromium/Electron's JS APIs, so it's implemented as a small
+native addon (`native/audio-loopback/`, C++/N-API) that captures raw PCM
+for a target process (and its child processes) and streams it to the
+renderer, where a Web Audio `AudioWorklet` turns it into a real
+`MediaStreamTrack` that gets added to the share alongside the video.
 
-Plain "system audio" also uses this same native addon on Windows (targeting
-this app's own process in exclude mode) instead of Electron's built-in
-loopback, so it can be switched to/from at any point during a share, not
-just chosen once at the very start, and so it never includes Sinal P2P's
-own output (preventing the echo a room-mate's voice would otherwise cause).
-Since the audio no longer needs to ride along with the screen picker, the
-monitor dropdown also stays usable with "system audio" selected on Windows.
-On macOS/Linux (no native addon), "system audio" keeps the older behavior:
-tied to `getDisplayMedia`'s one-time OS picker grant, not switchable
-mid-share, and not self-excluding.
+On **Linux**, there's no equivalent single API, so this shells out to
+PipeWire's own CLI tools instead of a native addon
+(`native/audio-loopback/linux-pipewire.js`): `pw-loopback` creates a pair of
+virtual sink/source nodes, `pw-link` connects the target app's output ports
+into that virtual sink by numeric port ID (never by name, since two
+processes can share the same app name) without removing the app's existing
+link to your real speakers — so it keeps playing normally while also being
+captured — and `pw-record` reads the virtual source as raw PCM. Requires an
+actual PipeWire session (not plain PulseAudio) with `pw-loopback`,
+`pw-link`, `pw-record` and `pw-dump` available, which is the default on
+current mainstream distros (Ubuntu, Fedora, etc.); if any of those binaries
+are missing, this option simply doesn't appear, same as on macOS.
+
+Plain "system audio" also uses this same per-process mechanism on Windows
+and Linux (targeting this app's own process in exclude mode) instead of
+Electron's built-in loopback, so it can be switched to/from at any point
+during a share, not just chosen once at the very start, and so it never
+includes Sinal P2P's own output (preventing the echo a room-mate's voice
+would otherwise cause). Since the audio no longer needs to ride along with
+the screen picker, the monitor dropdown also stays usable with "system
+audio" selected. On macOS (no native addon and no PipeWire path), "system
+audio" keeps the older behavior: tied to `getDisplayMedia`'s one-time OS
+picker grant, not switchable mid-share, and not self-excluding.
 
 ## Tech stack
 
@@ -213,7 +228,10 @@ per-process audio module (see below), which requires the C++ workload of
 Visual Studio Build Tools (`Desktop development with C++`) to be installed.
 Without it, `npm install`/`npm run dist:win` still work, but per-process
 audio capture is silently unavailable (falls back to not offering that
-option in the UI).
+option in the UI). Linux needs no build step for this feature — it shells
+out to PipeWire's CLI tools at runtime instead of a compiled addon (see
+above), so it works as long as those tools are present on whoever's running
+the app, on any machine that built or downloaded the Linux release.
 
 ## Usage
 
@@ -273,11 +291,14 @@ option in the UI).
   participant; there's a per-connection bitrate cap, but nothing that
   budgets total bandwidth across a room with many simultaneous
   broadcasters.
-- **No native system-audio loopback on Linux**: `getDisplayMedia` loopback
-  audio is only supported by Chromium/Electron on Windows and macOS. On
-  Linux the app instead lets you manually pick a PulseAudio/PipeWire
-  monitor source as a regular input device; if your distro doesn't expose
-  one, only video is captured.
+- **No native `getDisplayMedia` system-audio loopback on Linux**: that
+  specific API is only supported by Chromium/Electron on Windows and macOS.
+  Linux instead gets its own audio path: on a PipeWire session, per-app
+  capture (see above) covers both "specific app" and "whole system audio"
+  the same way it does on Windows; without PipeWire's CLI tools, the app
+  falls back to letting you manually pick a PulseAudio/PipeWire monitor
+  source as a regular input device, and if your distro doesn't expose one,
+  only video is captured.
 - Intentionally minimal: no chat, no recording, no accounts, just rooms +
   screen/audio sharing.
 
@@ -299,10 +320,13 @@ yet:
   indicator of this yet.
 - **Screen/audio capture is still rough on Linux**: unlike Windows/macOS,
   there's no single API Electron can rely on across distros: behavior
-  varies by desktop environment and audio server (PulseAudio/PipeWire vs.
-  something else), and both screen picking and audio-source selection are
-  more likely to need manual fiddling or simply not work on some setups.
-  Not yet systematically tested across distros.
+  varies by desktop environment and audio server. Per-app capture (see
+  above) was built and manually tested against one PipeWire session
+  (Ubuntu), not across distros/desktop environments yet — on a system
+  running plain PulseAudio (no PipeWire), it falls back to the older manual
+  monitor-source selection, same as before this existed. Screen picking is
+  also more likely to need manual fiddling or simply not work on some
+  setups.
 - **Minimizing while sharing could freeze the whole computer (fixed, but not
   a driver fix: the trigger is avoided instead)**: on some machines, mainly
   laptops with hybrid graphics (an Intel integrated GPU alongside a
