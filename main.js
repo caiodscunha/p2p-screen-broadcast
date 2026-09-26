@@ -221,22 +221,75 @@ const activeSignalListeners = new Map();
 // pode derrubar o processo de GPU de uma delas e travar o vídeo. O app não
 // guarda nenhum estado entre execuções, então isolar o userData por processo
 // não perde nada e elimina esse conflito.
-app.setPath('userData', path.join(app.getPath('temp'), `p2p-screen-broadcast-${process.pid}`));
+//
+// Onde fica essa pasta importa no Linux: lá /tmp costuma ser tmpfs (montado
+// NA RAM — padrão em Arch, Fedora, Debian 13+ e várias outras), então todo
+// cache que o Chromium escreve nela (GPU/shader, código, blobs...) ocupa
+// memória de verdade, não disco. E como era uma pasta nova por PID que
+// ninguém apagava, cada abertura do app deixava mais uma pra trás — RAM que
+// só voltava reiniciando o PC, e que não aparece como memória do processo
+// (fica em "shared"/"buff/cache" no `free`). No Linux vai pra ~/.cache
+// (disco), e em qualquer SO a pasta é apagada ao sair, com as órfãs de
+// execuções anteriores (crash/kill) limpas ao abrir.
+const INSTANCE_DIR_PREFIX = 'p2p-screen-broadcast-';
+const instanceDirsBase = process.platform === 'linux'
+  ? path.join(app.getPath('cache'), 'sinal-p2p', 'instances')
+  : app.getPath('temp');
+const instanceUserData = path.join(instanceDirsBase, `${INSTANCE_DIR_PREFIX}${process.pid}`);
+app.setPath('userData', instanceUserData);
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM'; // existe, só não é nosso
+  }
+}
+
+function removeStaleInstanceDirs() {
+  const bases = new Set([instanceDirsBase, app.getPath('temp')]); // temp: sobras de versões anteriores no Linux
+  bases.forEach((base) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(base);
+    } catch {
+      return;
+    }
+    entries.forEach((entry) => {
+      if (!entry.startsWith(INSTANCE_DIR_PREFIX)) return;
+      const pid = Number(entry.slice(INSTANCE_DIR_PREFIX.length));
+      if (!Number.isInteger(pid) || pid === process.pid || processIsAlive(pid)) return;
+      fs.rm(path.join(base, entry), { recursive: true, force: true }, () => {});
+    });
+  });
+}
+
+// No Windows o Chromium ainda pode estar segurando arquivos aqui e isso
+// falha em parte — tudo bem, o removeStaleInstanceDirs da próxima abertura pega.
+app.on('quit', () => {
+  try {
+    fs.rmSync(instanceUserData, { recursive: true, force: true });
+  } catch {
+    // não crítico
+  }
+});
 
 ipcMain.handle('clipboard:write', (event, text) => clipboard.writeText(text));
 ipcMain.handle('clipboard:read', () => clipboard.readText());
 ipcMain.handle('capture:supportsSystemAudio', () => supportsSystemAudioLoopback);
 
-// Captura de áudio por processo (Windows apenas, via módulo nativo em
-// native/audio-loopback). Deixa incluir só um app específico, ou excluir um
-// app específico do resto — útil pra tirar uma chamada de voz (Discord, etc)
-// do que é compartilhado, sem depender de rotear áudio manualmente pro SO.
+// Captura de áudio por processo (Windows via módulo nativo, Linux via
+// PipeWire — ver native/audio-loopback). Deixa incluir só um app específico,
+// ou excluir um app específico do resto — útil pra tirar uma chamada de voz
+// (Discord, etc) do que é compartilhado, sem depender de rotear áudio
+// manualmente pro SO.
 ipcMain.handle('audio-process:supported', () => processAudio.supported);
 ipcMain.handle('audio-process:list', () => processAudio.listProcesses());
 
-ipcMain.handle('audio-process:start', (event, { pid, exclude }) => {
+ipcMain.handle('audio-process:start', async (event, { pid, exclude }) => {
   const webContents = event.sender;
-  const handle = processAudio.startCapture(pid, exclude, (error, samples, sampleRate, channels) => {
+  const handle = await processAudio.startCapture(pid, exclude, (error, samples, sampleRate, channels) => {
     if (webContents.isDestroyed()) return;
     if (error) {
       webContents.send('audio-process:error', error);
@@ -307,10 +360,17 @@ ipcMain.handle('signal:send', (event, { mySessionId, candidates, targetSessionId
 // qual monitor compartilhar — inclusive pra trocar de monitor com a
 // transmissão já rolando, sem depender do seletor nativo do SO (que só
 // aparece no início, e nem existe no Linux).
+//
+// No Linux (testado num Wayland/Mutter), pedir a miniatura em si — o
+// thumbnailSize abaixo — parece ser o que causa aquela piscada rápida na
+// tela ao entrar numa sala (o compositor grava um frame de verdade da tela
+// pra gerar a imagem). Testando sem miniatura nenhuma lá (só o nome/id de
+// cada tela) pra ver se é isso mesmo; se for, o preview visual do seletor de
+// monitor fica sem imagem no Linux, só com o nome.
 ipcMain.handle('capture:listScreens', async () => {
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
-    thumbnailSize: { width: 320, height: 180 },
+    thumbnailSize: process.platform === 'linux' ? { width: 0, height: 0 } : { width: 320, height: 180 },
   });
   return sources.map((s) => ({
     id: s.id,
@@ -327,6 +387,13 @@ function createWindow() {
     title: 'Sinal P2P',
     icon: path.join(__dirname, 'assets', 'icon.png'),
     backgroundColor: '#15161a',
+    // Sem isso, a janela aparece assim que criada e só ganha conteúdo
+    // depois que renderer/index.html termina de carregar/pintar — nesse
+    // intervalo dá pra ver uma piscada (janela em branco/cor de fundo do SO
+    // por um instante antes do primeiro frame real). Escondida até
+    // 'ready-to-show' (que só dispara depois do primeiro frame já pintado)
+    // evita esse intervalo visível inteiro.
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -357,6 +424,7 @@ function createWindow() {
     },
   });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  win.once('ready-to-show', () => win.show());
 
   // Toda vez que a página carrega/recarrega, o estado de "compartilhando"
   // do renderer começa do zero — sem isso, um reload em pleno
@@ -385,6 +453,9 @@ app.whenReady().then(() => {
   // código/senha/nome, não precisam disso, e o serviço de spellcheck do
   // Chromium carrega dicionários inteiros na memória à toa.
   session.defaultSession.setSpellCheckerEnabled(false);
+
+  removeStaleInstanceDirs();
+  processAudio.cleanupOrphans();
 
   registerDisplayMediaHandler(session.defaultSession);
 
