@@ -483,6 +483,16 @@ function handleSignalMessage(message, from) {
       if (peer) handleIceCandidate(peer, message.candidate);
       break;
     }
+    // Lote de candidatos (ver o 'icecandidate' em setupPeerConnection) — o
+    // caso singular acima fica pra aceitar versões antigas do app.
+    case 'ice-candidates': {
+      if (message.sender) connectToPeer(message.sender);
+      const peer = findPeerBySid(from);
+      if (peer && Array.isArray(message.candidates)) {
+        message.candidates.forEach((candidate) => handleIceCandidate(peer, candidate));
+      }
+      break;
+    }
     case 'answer': {
       if (message.sender) connectToPeer(message.sender);
       const peer = findPeerBySid(from);
@@ -614,12 +624,17 @@ function connectToPeer(peerInfo) {
     remoteStream: null,
     remoteStreamFromEvent: false,
     pendingIceCandidates: [],
+    unsentLocalCandidates: [],
+    gatheredLocalCandidates: [],
+    localCandidateFlushTimer: null,
+    remoteCandidatesReceived: 0,
     makingOffer: false,
     sharing: false,
     volume: 1,
     volumeBeforeMute: 1,
     connectionState: 'new',
     connectionTimedOut: false,
+    timeoutReason: null, // 'signaling' | 'ice' — ver o watchdog em setupPeerConnection
     iceWatchdogTimer: null,
   };
   roomPeers.set(peer.peerId, peer);
@@ -637,24 +652,52 @@ async function setupPeerConnection(peer) {
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
   peer.pc = pc;
 
-  // Alguns pares nunca chegam a 'failed' sozinhos mesmo quando o NAT estrito
-  // de um dos lados torna essa conexão P2P (só STUN, sem TURN aqui — ver
-  // ICE_SERVERS) impossível de verdade: o agente de ICE do Chromium pode
-  // ficar preso em 'checking'/'new' pra sempre, sem nunca avisar. Sem isso,
-  // a pessoa ficava "conectando" na lista de participantes indefinidamente,
-  // com a tela preta, sem feedback nenhum de que aquele par específico
-  // nunca vai conectar. Não fecha a conexão (ainda pode conectar de
-  // verdade, só devagar) — só avisa visualmente; `connectionstatechange`
-  // limpa isso se ela realmente conectar depois.
+  // Alguns pares nunca chegam a 'failed' sozinhos: o agente de ICE do
+  // Chromium pode ficar preso pra sempre sem avisar. Sem isso, a pessoa
+  // ficava "conectando" na lista de participantes indefinidamente, com a
+  // tela preta, sem feedback nenhum. Não fecha a conexão (ainda pode
+  // conectar de verdade, só devagar) — só avisa visualmente;
+  // `connectionstatechange` limpa isso se ela realmente conectar depois.
+  //
+  // O estado em que ficou preso diz ONDE está o problema, e são causas bem
+  // diferentes (a versão anterior culpava NAT nos dois casos, o que
+  // mandou uma investigação real pro lado errado — log de 2026-09-21 com
+  // `connectionState: new`):
+  // - 'new': o ICE nem começou a testar caminhos — oferta/resposta ou os
+  //   candidatos do outro lado nunca chegaram pela sinalização (UDP/ntfy).
+  //   Não tem nada a ver com NAT/TURN. Aqui dá pra tentar recuperar:
+  //   reenviar a oferta (se sou eu quem oferece) e todos os meus candidatos.
+  // - 'connecting' (ICE em 'checking'): os dois lados trocaram tudo e estão
+  //   testando caminhos, mas nenhum passa — aí sim é NAT estrito sem TURN.
   peer.iceWatchdogTimer = setTimeout(() => {
-    if (pc.connectionState !== 'connected') {
+    if (pc.connectionState === 'connected') return;
+    const diag = {
+      connectionState: pc.connectionState,
+      iceConnectionState: pc.iceConnectionState,
+      signalingState: pc.signalingState,
+      temDescricaoRemota: !!pc.remoteDescription,
+      candidatosRemotosRecebidos: peer.remoteCandidatesReceived,
+      candidatosLocaisColetados: peer.gatheredLocalCandidates.length,
+    };
+    if (pc.connectionState === 'new') {
+      peer.timeoutReason = 'signaling';
       console.warn(
-        '[room] conexão com', peer.name, 'não fechou em 20s — provável NAT estrito sem TURN',
-        'nessa combinação de redes (connectionState:', pc.connectionState + ')'
+        '[room] conexão com', peer.name, 'não começou em 20s — a sinalização não completou',
+        '(oferta/resposta ou candidatos ICE não chegaram); NÃO é NAT. Tentando reenviar.', diag
       );
-      peer.connectionTimedOut = true;
-      renderParticipants();
+      if (!pc.remoteDescription && !isPolite(peer)) negotiate(peer);
+      if (peer.gatheredLocalCandidates.length) {
+        sendToPeerReliable(peer, { t: 'ice-candidates', sender: myPeerInfo(), candidates: peer.gatheredLocalCandidates }).catch(() => {});
+      }
+    } else {
+      peer.timeoutReason = 'ice';
+      console.warn(
+        '[room] conexão com', peer.name, 'não fechou em 20s — sinalização ok, mas nenhum caminho de rede',
+        'passou: provável NAT estrito sem TURN nessa combinação de redes', diag
+      );
     }
+    peer.connectionTimedOut = true;
+    renderParticipants();
   }, 20000);
 
   // Associa os dois transceivers a UM MediaStream próprio (mesmo sem track
@@ -700,6 +743,9 @@ async function setupPeerConnection(peer) {
     if (pc.connectionState === 'connected') {
       clearTimeout(peer.iceWatchdogTimer);
       peer.connectionTimedOut = false;
+      peer.timeoutReason = null;
+    } else if (pc.connectionState === 'connecting' && peer.connectionTimedOut) {
+      peer.timeoutReason = 'ice'; // a sinalização completou depois do aviso — agora é só rede
     }
     if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
       removePeer(peer.peerId);
@@ -709,16 +755,46 @@ async function setupPeerConnection(peer) {
     renderParticipants();
   });
 
-  // ICE incremental ("trickle"): manda cada candidato assim que é
-  // descoberto, em vez de esperar a descoberta inteira terminar pra só
-  // então mandar a oferta/resposta completa (como era antes). Best-effort
-  // (sem retentativa) — perder um candidato específico não é fatal, o ICE
-  // só não vai poder tentar aquele caminho de rede, desde que outros
-  // cheguem. Ver `handleIceCandidate`/`flushPendingIceCandidates` do lado
-  // de quem recebe.
+  // ICE incremental ("trickle"): os candidatos vão sendo mandados conforme
+  // são descobertos, em vez de esperar a descoberta inteira terminar pra só
+  // então mandar a oferta/resposta completa (como era antes). Ver
+  // `handleIceCandidate`/`flushPendingIceCandidates` do lado de quem recebe.
+  //
+  // A oferta/resposta sai ANTES de qualquer candidato existir, então ela
+  // própria não carrega nenhum — se NENHUMA mensagem de candidato chegar, o
+  // outro lado nunca tem com quem testar e a conexão fica em 'new' pra
+  // sempre. Era exatamente isso que acontecia: cada candidato ia numa
+  // mensagem separada, sem retentativa, numa rajada (um POST no ntfy.sh por
+  // candidato, mais o ack de volta de cada um — o tipo de rajada que já
+  // estourou o limite de taxa do ntfy.sh antes, ver signal-punch.js).
+  // Agora: agrupa os candidatos descobertos em ~300ms numa mensagem só, com
+  // retentativa, e ao fim da descoberta reenvia a lista COMPLETA mais uma
+  // vez — assim um lote perdido no meio do caminho não é fatal.
+  // Candidato repetido do outro lado é inofensivo (o navegador ignora).
+  pc.addEventListener('icegatheringstatechange', () => {
+    if (pc.iceGatheringState === 'gathering') {
+      // nova rodada de descoberta (ex: ICE restart) — candidatos antigos não servem mais
+      peer.gatheredLocalCandidates = [];
+      peer.unsentLocalCandidates = [];
+    }
+  });
   pc.addEventListener('icecandidate', (event) => {
-    if (!event.candidate) return; // null = descoberta terminou, nada a mandar
-    sendToPeer(peer, { t: 'ice-candidate', sender: myPeerInfo(), candidate: event.candidate.toJSON() }).catch(() => {});
+    if (event.candidate) {
+      const candidate = event.candidate.toJSON();
+      peer.gatheredLocalCandidates.push(candidate);
+      peer.unsentLocalCandidates.push(candidate);
+      if (!peer.localCandidateFlushTimer) {
+        peer.localCandidateFlushTimer = setTimeout(() => flushLocalCandidates(peer), 300);
+      }
+      return;
+    }
+    // null = descoberta terminou: o lote pendente vira redundante com a lista completa
+    clearTimeout(peer.localCandidateFlushTimer);
+    peer.localCandidateFlushTimer = null;
+    peer.unsentLocalCandidates = [];
+    if (peer.gatheredLocalCandidates.length) {
+      sendToPeerReliable(peer, { t: 'ice-candidates', sender: myPeerInfo(), candidates: peer.gatheredLocalCandidates }).catch(() => {});
+    }
   });
 
   // Desempate de quem manda a oferta inicial: o peerId lexicograficamente
@@ -855,7 +931,8 @@ async function handleAnswer(peer, sdp) {
 // `flushPendingIceCandidates`, chamada logo depois de cada
 // `setRemoteDescription` acima).
 async function handleIceCandidate(peer, candidate) {
-  if (!peer.pc) return;
+  if (!peer.pc || !candidate) return;
+  peer.remoteCandidatesReceived++;
   if (!peer.pc.remoteDescription) {
     peer.pendingIceCandidates = peer.pendingIceCandidates || [];
     peer.pendingIceCandidates.push(candidate);
@@ -866,6 +943,14 @@ async function handleIceCandidate(peer, candidate) {
   } catch (err) {
     console.warn('[room] falha ao aplicar candidato ICE de', peer.name, err);
   }
+}
+
+function flushLocalCandidates(peer) {
+  peer.localCandidateFlushTimer = null;
+  if (!peer.unsentLocalCandidates.length) return;
+  const candidates = peer.unsentLocalCandidates;
+  peer.unsentLocalCandidates = [];
+  sendToPeerReliable(peer, { t: 'ice-candidates', sender: myPeerInfo(), candidates }).catch(() => {});
 }
 
 async function flushPendingIceCandidates(peer) {
@@ -885,6 +970,7 @@ function removePeer(peerId) {
   const peer = roomPeers.get(peerId);
   if (!peer) return;
   clearTimeout(peer.iceWatchdogTimer);
+  clearTimeout(peer.localCandidateFlushTimer);
   if (peer.pc) peer.pc.close();
   roomPeers.delete(peerId);
   if (focusedPeerId === peerId) focusedPeerId = null;
@@ -1801,11 +1887,10 @@ function renderParticipants() {
       statusClass = 'status-failed';
     } else if (entry.connectionTimedOut) {
       // Ver o setTimeout em setupPeerConnection: o navegador às vezes nunca
-      // marca a conexão como 'failed' sozinho, mesmo quando ela realmente
-      // não vai dar certo (NAT estrito, sem TURN) — sem isso a pessoa ficava
+      // marca a conexão como 'failed' sozinho — sem isso a pessoa ficava
       // "conectando" pra sempre sem nenhum aviso.
       statusClass = 'status-failed';
-      statusText = 'sem conexão (rede)';
+      statusText = entry.timeoutReason === 'signaling' ? 'sem conexão (sinalização)' : 'sem conexão (rede)';
     }
     if (entry.sharing) statusText = 'compartilhando';
     pill.className = 'status-pill ' + statusClass;

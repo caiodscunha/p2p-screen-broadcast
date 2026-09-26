@@ -221,7 +221,59 @@ const activeSignalListeners = new Map();
 // pode derrubar o processo de GPU de uma delas e travar o vídeo. O app não
 // guarda nenhum estado entre execuções, então isolar o userData por processo
 // não perde nada e elimina esse conflito.
-app.setPath('userData', path.join(app.getPath('temp'), `p2p-screen-broadcast-${process.pid}`));
+//
+// Onde fica essa pasta importa no Linux: lá /tmp costuma ser tmpfs (montado
+// NA RAM — padrão em Arch, Fedora, Debian 13+ e várias outras), então todo
+// cache que o Chromium escreve nela (GPU/shader, código, blobs...) ocupa
+// memória de verdade, não disco. E como era uma pasta nova por PID que
+// ninguém apagava, cada abertura do app deixava mais uma pra trás — RAM que
+// só voltava reiniciando o PC, e que não aparece como memória do processo
+// (fica em "shared"/"buff/cache" no `free`). No Linux vai pra ~/.cache
+// (disco), e em qualquer SO a pasta é apagada ao sair, com as órfãs de
+// execuções anteriores (crash/kill) limpas ao abrir.
+const INSTANCE_DIR_PREFIX = 'p2p-screen-broadcast-';
+const instanceDirsBase = process.platform === 'linux'
+  ? path.join(app.getPath('cache'), 'sinal-p2p', 'instances')
+  : app.getPath('temp');
+const instanceUserData = path.join(instanceDirsBase, `${INSTANCE_DIR_PREFIX}${process.pid}`);
+app.setPath('userData', instanceUserData);
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM'; // existe, só não é nosso
+  }
+}
+
+function removeStaleInstanceDirs() {
+  const bases = new Set([instanceDirsBase, app.getPath('temp')]); // temp: sobras de versões anteriores no Linux
+  bases.forEach((base) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(base);
+    } catch {
+      return;
+    }
+    entries.forEach((entry) => {
+      if (!entry.startsWith(INSTANCE_DIR_PREFIX)) return;
+      const pid = Number(entry.slice(INSTANCE_DIR_PREFIX.length));
+      if (!Number.isInteger(pid) || pid === process.pid || processIsAlive(pid)) return;
+      fs.rm(path.join(base, entry), { recursive: true, force: true }, () => {});
+    });
+  });
+}
+
+// No Windows o Chromium ainda pode estar segurando arquivos aqui e isso
+// falha em parte — tudo bem, o removeStaleInstanceDirs da próxima abertura pega.
+app.on('quit', () => {
+  try {
+    fs.rmSync(instanceUserData, { recursive: true, force: true });
+  } catch {
+    // não crítico
+  }
+});
 
 ipcMain.handle('clipboard:write', (event, text) => clipboard.writeText(text));
 ipcMain.handle('clipboard:read', () => clipboard.readText());
@@ -401,6 +453,9 @@ app.whenReady().then(() => {
   // código/senha/nome, não precisam disso, e o serviço de spellcheck do
   // Chromium carrega dicionários inteiros na memória à toa.
   session.defaultSession.setSpellCheckerEnabled(false);
+
+  removeStaleInstanceDirs();
+  processAudio.cleanupOrphans();
 
   registerDisplayMediaHandler(session.defaultSession);
 

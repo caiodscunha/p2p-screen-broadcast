@@ -24,7 +24,7 @@
 // Reconecta periodicamente (syncLinks) porque um app pode abrir um novo
 // stream de áudio depois que a captura já começou (ex: nova aba tocando som).
 
-const { spawn, execFileSync } = require('child_process');
+const { spawn, execFile, execFileSync } = require('child_process');
 const fs = require('fs');
 
 const REQUIRED_BINARIES = ['pw-dump', 'pw-loopback', 'pw-link', 'pw-record'];
@@ -87,8 +87,30 @@ function ownProcessTree() {
 
 // ---------- grafo do PipeWire ----------
 
+const PW_DUMP_MAX_BUFFER = 32 * 1024 * 1024;
+
 function dumpGraph() {
-  const raw = execFileSync('pw-dump', [], { maxBuffer: 32 * 1024 * 1024, encoding: 'utf8' });
+  return parseGraph(execFileSync('pw-dump', [], { maxBuffer: PW_DUMP_MAX_BUFFER, encoding: 'utf8' }));
+}
+
+// Versão assíncrona pro syncLinks periódico: a síncrona trava o processo
+// principal inteiro (IPC, sinalização, repasse do próprio áudio capturado)
+// enquanto o pw-dump roda e o JSON — que pode ter vários MB num sistema
+// com muitos nós — é lido, e isso a cada poucos centésimos de segundo.
+function dumpGraphAsync() {
+  return new Promise((resolve, reject) => {
+    execFile('pw-dump', [], { maxBuffer: PW_DUMP_MAX_BUFFER, encoding: 'utf8' }, (err, stdout) => {
+      if (err) return reject(err);
+      try {
+        resolve(parseGraph(stdout));
+      } catch (parseErr) {
+        reject(parseErr);
+      }
+    });
+  });
+}
+
+function parseGraph(raw) {
   const objects = JSON.parse(raw);
   const nodes = [];
   const ports = [];
@@ -150,6 +172,52 @@ function listProcesses() {
   return Array.from(byPid, ([pid, title]) => ({ pid, title }));
 }
 
+const NODE_NAME_PREFIX = 'sinalp2p_cap_';
+
+// Processos filhos NÃO morrem junto com o app no Linux: se ele fechar sem
+// passar por stopCapture (crash, kill, OOM — justamente o que acontece
+// quando a memória enche), o pw-loopback fica rodando pra sempre, com o
+// sink virtual e os links pros apps capturados, e a cada nova queda sobra
+// mais um. Chamado ao abrir o app: mata os de execuções que já morreram
+// (o PID embutido no nome do nó, ver startCapture).
+function cleanupOrphans() {
+  if (process.platform !== 'linux') return;
+  let entries;
+  try {
+    entries = fs.readdirSync('/proc');
+  } catch {
+    return;
+  }
+  const pattern = new RegExp(`${NODE_NAME_PREFIX}(\\d+)_\\d+`);
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    let cmdline;
+    try {
+      cmdline = fs.readFileSync(`/proc/${entry}/cmdline`, 'utf8');
+    } catch {
+      continue;
+    }
+    const argv0 = cmdline.split('\0')[0].split('/').pop();
+    if (argv0 !== 'pw-loopback' && argv0 !== 'pw-record') continue;
+    const match = cmdline.match(pattern);
+    if (!match) continue;
+    const ownerPid = Number(match[1]);
+    if (ownerPid === process.pid) continue;
+    let ownerAlive = true;
+    try {
+      process.kill(ownerPid, 0);
+    } catch (err) {
+      ownerAlive = err.code === 'EPERM';
+    }
+    if (ownerAlive) continue;
+    try {
+      process.kill(Number(entry), 'SIGTERM');
+    } catch {
+      // já morreu, ou não é nosso
+    }
+  }
+}
+
 let nextHandle = 1;
 const sessions = new Map();
 
@@ -180,7 +248,10 @@ async function startCapture(pid, exclude, callback) {
   }
 
   const handle = nextHandle++;
-  const name = `sinalp2p_cap_${handle}`;
+  // O PID no nome serve pra cleanupOrphans() saber de qual execução do app
+  // cada pw-loopback/pw-record é — e evita que um nó órfão de uma execução
+  // anterior (mesmo "handle 1") seja confundido com o desta.
+  const name = `${NODE_NAME_PREFIX}${process.pid}_${handle}`;
   const own = ownProcessTree();
   const targetPid = pid || null; // pid 0/undefined é o sentinela "sem alvo específico"
 
@@ -221,14 +292,25 @@ async function startCapture(pid, exclude, callback) {
     return exclude; // pid=0: "sistema inteiro, exceto este app" (ver renderer.js)
   }
 
-  function syncLinks() {
-    if (session.stopped) return;
+  let syncing = false;
+  async function syncLinks() {
+    if (session.stopped || syncing) return; // não empilha pw-dumps se um demorar mais que o intervalo
+    syncing = true;
+    try {
+      await syncLinksOnce();
+    } finally {
+      syncing = false;
+    }
+  }
+
+  async function syncLinksOnce() {
     let graph;
     try {
-      graph = dumpGraph();
+      graph = await dumpGraphAsync();
     } catch {
       return;
     }
+    if (session.stopped) return;
     const sinkNodeId = findNodeIdByName(graph, `input.${name}`);
     if (sinkNodeId === null) return;
     const sinkInputs = portIds(graph, sinkNodeId, 'in');
@@ -249,13 +331,16 @@ async function startCapture(pid, exclude, callback) {
     }
   }
 
-  syncLinks();
+  await syncLinks();
   session.pollTimer = setInterval(syncLinks, 800);
 
+  // stderr em 'ignore', não 'pipe': ninguém lia esse pipe, e quando o
+  // buffer dele enche (~64KB de avisos acumulados numa sessão longa) o
+  // pw-record trava no write e o áudio para de chegar do nada.
   session.recordProc = spawn(
     'pw-record',
     ['--target', `output.${name}`, '--rate', '48000', '--channels', '2', '--format', 'f32', '-a', '-'],
-    { stdio: ['ignore', 'pipe', 'pipe'] }
+    { stdio: ['ignore', 'pipe', 'ignore'] }
   );
 
   const FRAME_BYTES = 4 * 2; // float32 * 2 canais
@@ -295,4 +380,4 @@ function stopCapture(handle) {
   if (session.loopbackProc) session.loopbackProc.kill('SIGTERM');
 }
 
-module.exports = { supported, listProcesses, startCapture, stopCapture };
+module.exports = { supported, listProcesses, startCapture, stopCapture, cleanupOrphans };

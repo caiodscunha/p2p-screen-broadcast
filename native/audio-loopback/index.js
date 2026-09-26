@@ -44,4 +44,10 @@ function stopCapture(handle) {
   backend.stopCapture(handle);
 }
 
-module.exports = { supported, listProcesses, startCapture, stopCapture };
+// Mata processos auxiliares que sobraram de uma execução anterior que caiu
+// sem limpar (só existe no Linux — ver linux-pipewire.js).
+function cleanupOrphans() {
+  if (backend && backend.cleanupOrphans) backend.cleanupOrphans();
+}
+
+module.exports = { supported, listProcesses, startCapture, stopCapture, cleanupOrphans };
