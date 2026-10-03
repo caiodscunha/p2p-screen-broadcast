@@ -158,13 +158,43 @@ const joinCodeInput = document.getElementById('join-code-input');
 const pasteJoinCodeBtn = document.getElementById('paste-join-code');
 const joinPassphraseInput = document.getElementById('join-passphrase-input');
 const btnJoinRoom = document.getElementById('btn-join-room');
-const homeStatusEl = document.getElementById('home-status');
+const createAlertEl = document.getElementById('create-alert');
+const joinAlertEl = document.getElementById('join-alert');
 
-function setHomeStatus(text, isError) {
-  homeStatusEl.textContent = text;
-  homeStatusEl.hidden = !text;
-  homeStatusEl.style.color = isError ? 'var(--accent-strong)' : '';
+// Erro mostrado dentro do painel (criar/entrar) que causou ele, logo acima
+// do botão; texto vazio esconde.
+function setHomeAlert(alertEl, text) {
+  alertEl.querySelector('.pane-alert-text').textContent = text;
+  alertEl.hidden = !text;
 }
+
+function clearHomeAlerts() {
+  setHomeAlert(createAlertEl, '');
+  setHomeAlert(joinAlertEl, '');
+}
+
+// Enquanto cria/entra, o botão clicado vira "spinner + Criando sala..." e
+// os dois botões ficam travados (sem isso dava pra disparar criar e entrar
+// ao mesmo tempo). busyText null restaura.
+function setHomeBusy(button, busyText) {
+  [btnCreateRoom, btnJoinRoom].forEach((btn) => { btn.disabled = !!busyText; });
+  if (busyText) {
+    button.dataset.label = button.textContent;
+    button.classList.add('is-busy');
+    button.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span>';
+    button.append(busyText);
+  } else if (button.dataset.label) {
+    button.classList.remove('is-busy');
+    button.textContent = button.dataset.label;
+    delete button.dataset.label;
+  }
+}
+
+// Mexer no código/senha depois de um "Código inválido" tira o aviso — ele
+// já não se refere mais ao que está escrito.
+[joinCodeInput, joinPassphraseInput].forEach((input) => {
+  input.addEventListener('input', () => setHomeAlert(joinAlertEl, ''));
+});
 
 pasteJoinCodeBtn.addEventListener('click', async () => {
   joinCodeInput.value = await window.api.readClipboard();
@@ -173,36 +203,36 @@ pasteJoinCodeBtn.addEventListener('click', async () => {
 btnCreateRoom.addEventListener('click', async () => {
   const name = createNameInput.value.trim() || 'Anônimo';
   const passphrase = createPassphraseInput.value.trim();
-  btnCreateRoom.disabled = true;
-  setHomeStatus('Criando sala...', false);
+  clearHomeAlerts();
+  setHomeBusy(btnCreateRoom, 'Criando sala...');
   try {
     await enterRoom({ name, passphrase });
   } finally {
-    btnCreateRoom.disabled = false;
+    setHomeBusy(btnCreateRoom, null);
   }
 });
 
 btnJoinRoom.addEventListener('click', async () => {
   const name = joinNameInput.value.trim() || 'Anônimo';
   const passphrase = joinPassphraseInput.value.trim();
+  clearHomeAlerts();
   let decoded;
   try {
     decoded = await decode(joinCodeInput.value, passphrase);
   } catch (err) {
-    setHomeStatus('Código inválido: ' + err.message, true);
+    setHomeAlert(joinAlertEl, 'Código inválido: ' + err.message);
     return;
   }
   if (!decoded || typeof decoded.sid !== 'string' || !Array.isArray(decoded.cands)) {
-    setHomeStatus('Código inválido: não parece ser um código de sala.', true);
+    setHomeAlert(joinAlertEl, 'Código inválido: não parece ser um código de sala.');
     return;
   }
 
-  btnJoinRoom.disabled = true;
-  setHomeStatus('Entrando na sala...', false);
+  setHomeBusy(btnJoinRoom, 'Entrando na sala...');
   try {
     await enterRoom({ name, passphrase, hostSid: decoded.sid, hostCands: decoded.cands });
   } finally {
-    btnJoinRoom.disabled = false;
+    setHomeBusy(btnJoinRoom, null);
   }
 });
 
@@ -286,7 +316,7 @@ async function enterRoom({ name, passphrase, hostSid, hostCands }) {
 
   myListener = await window.api.startSignalListener();
   if (!myListener) {
-    setHomeStatus('Conexão automática indisponível nessa rede — não é possível criar ou entrar em salas.', true);
+    setHomeAlert(hostSid ? joinAlertEl : createAlertEl, 'Conexão automática indisponível nessa rede — não é possível criar ou entrar em salas.');
     return;
   }
 
@@ -367,11 +397,16 @@ btnToggleFullscreen.addEventListener('click', () => {
 
 // Dock some sozinha (estilo player de vídeo/PiP): mouse parado por 2s
 // dentro da sala esconde a dock e o botão de participantes; mexer o mouse
-// (ou o mouse sair da janela) mostra/esconde na hora.
+// (ou o mouse sair da janela) mostra/esconde na hora. Com o popover de
+// compartilhar aberto a dock fica sempre visível — ele sai dela, e dá pra
+// ficar um tempo lendo/escolhendo sem mexer o mouse. Isso vale também pro
+// mouseleave: a lista aberta de um <select> é uma janela nativa fora da
+// página, então passar o mouse por ela conta como sair da sala.
 let dockIdleTimer = null;
 function showDockControls() {
   viewRoom.classList.remove('controls-hidden');
   clearTimeout(dockIdleTimer);
+  if (!sharePopover.hidden) return;
   dockIdleTimer = setTimeout(() => viewRoom.classList.add('controls-hidden'), 2000);
 }
 function stopDockAutoHide() {
@@ -385,6 +420,7 @@ viewRoom.addEventListener('mousemove', showDockControls);
 viewRoom.addEventListener('mouseenter', showDockControls);
 viewRoom.addEventListener('mouseleave', () => {
   clearTimeout(dockIdleTimer);
+  if (!sharePopover.hidden) return;
   viewRoom.classList.add('controls-hidden');
 });
 
@@ -432,11 +468,9 @@ function leaveRoom() {
     btnToggleFullscreen.innerHTML = ENTER_FULLSCREEN_ICON_SVG;
     btnToggleFullscreen.title = 'Tela cheia';
   }
-  // Sem isso, uma mensagem tipo "Criando sala..."/"Entrando na sala..." que
-  // ficou parada em #home-status (nunca sobrescrita porque a sala anterior
-  // abriu com sucesso e nunca mais voltou pra tela inicial) reaparecia do
-  // nada ao sair da sala, como se algo ainda estivesse em andamento.
-  setHomeStatus('', false);
+  // Sem isso, um aviso de erro de uma tentativa anterior à sala (que abriu
+  // com sucesso depois) reaparecia do nada ao sair dela.
+  clearHomeAlerts();
   showHomeScreen();
 }
 
@@ -1005,6 +1039,7 @@ async function refreshMonitors() {
     monitorSelect.value = previousValue;
   }
   updateMonitorThumbnail();
+  if (updateResolutionAvailability()) applyQualityInRoom();
 }
 
 function updateMonitorThumbnail() {
@@ -1019,21 +1054,137 @@ function updateMonitorThumbnail() {
 
 btnRefreshMonitors.addEventListener('click', refreshMonitors);
 
+// ---------- qualidade da transmissão (resolução + taxa de quadros) ----------
+
+const resolutionSelect = document.getElementById('resolution-select');
+const frameRateSelect = document.getElementById('framerate-select');
+const RESOLUTION_1440_OPTION = resolutionSelect.querySelector('option[value="1440"]');
+
+// Teto de bitrate por conexão pra cada resolução — não é um valor fixo, o
+// WebRTC ainda estima a banda real e usa menos se precisar; só evita mandar
+// mais do que isso pra cada participante. 1440p tem ~1,8x os pixels de
+// 1080p, então com o mesmo teto ficaria visivelmente pior que 1080p em tela
+// com muito movimento.
+const MAX_BITRATE_BY_RESOLUTION = { 720: 5_000_000, 1080: 8_000_000, 1440: 12_000_000 };
+
+function selectedResolution() {
+  return Number(resolutionSelect.value);
+}
+
+function selectedFrameRate() {
+  return Number(frameRateSelect.value);
+}
+
+function selectedScreen() {
+  return screensCache.find((s) => s.id === monitorSelect.value);
+}
+
+// "1440p" só faz sentido se o monitor tiver pelo menos 1440 linhas (a
+// captura nunca aumenta a imagem, então num monitor 1080p ela sairia em
+// 1080p do mesmo jeito). Usa o lado MENOR do monitor pra um monitor em
+// retrato (1440x2560) também contar. Resolução desconhecida (null, ver
+// physicalDisplaySize() no main.js) deixa a opção liberada — no pior caso
+// sai na resolução nativa. No modo em que o seletor de monitor é ignorado
+// (o seletor nativo do SO escolhe a tela), basta algum monitor ter 1440p.
+function screenSupports1440(screen) {
+  if (!screen || !screen.width || !screen.height) return true;
+  return Math.min(screen.width, screen.height) >= 1440;
+}
+
+// Retorna true se precisou rebaixar a escolha de 1440p pra 1080p.
+function updateResolutionAvailability() {
+  const supported = monitorSelectIgnoredByAudioMode()
+    ? screensCache.length === 0 || screensCache.some(screenSupports1440)
+    : screenSupports1440(selectedScreen());
+  RESOLUTION_1440_OPTION.disabled = !supported;
+  RESOLUTION_1440_OPTION.textContent = supported ? '1440p' : '1440p (monitor menor)';
+  if (!supported && resolutionSelect.value === '1440') {
+    resolutionSelect.value = '1080';
+    return true;
+  }
+  return false;
+}
+
+// Limites de tamanho da captura pra resolução escolhida. "720p/1080p/1440p"
+// é o número de LINHAS: a largura segue a proporção do monitor (no mínimo
+// 16:9) — sem isso, num ultrawide 3440x1440 a caixa 2560x1440 faria a
+// imagem caber pela largura e sair com só ~1070 linhas. A captura reduz
+// mantendo a proporção até caber nessa caixa, e nunca aumenta.
+function captureBounds(screen) {
+  const lines = selectedResolution();
+  const hasSize = screen && screen.width && screen.height;
+  const aspect = hasSize ? Math.max(screen.width, screen.height) / Math.min(screen.width, screen.height) : 16 / 9;
+  const longSide = Math.round(lines * Math.max(aspect, 16 / 9));
+  const portrait = hasSize && screen.height > screen.width;
+  return portrait ? { width: lines, height: longSide } : { width: longSide, height: lines };
+}
+
 async function acquireVideoTrackForScreen(sourceId) {
+  const bounds = captureBounds(screensCache.find((s) => s.id === sourceId));
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: false,
     video: {
       mandatory: {
         chromeMediaSource: 'desktop',
         chromeMediaSourceId: sourceId,
-        maxWidth: 1920,
-        maxHeight: 1080,
-        maxFrameRate: 60,
+        maxWidth: bounds.width,
+        maxHeight: bounds.height,
+        maxFrameRate: selectedFrameRate(),
       },
     },
   });
   return stream.getVideoTracks()[0];
 }
+
+// Vídeo vindo do getDisplayMedia (seletor nativo do SO, ver
+// confirmStartSharing()) não tem como ser recapturado em silêncio — pedir de
+// novo abriria o seletor do SO outra vez — então troca de qualidade nele vai
+// por applyConstraints na própria track.
+let localVideoFromDisplayMedia = false;
+
+function displayMediaVideoConstraints() {
+  const bounds = captureBounds(null);
+  const fps = selectedFrameRate();
+  return {
+    width: { ideal: bounds.width, max: bounds.width },
+    height: { ideal: bounds.height, max: bounds.height },
+    frameRate: { ideal: fps, max: fps },
+  };
+}
+
+function applyVideoEncodingToSender(sender) {
+  const params = sender.getParameters();
+  const limits = { maxBitrate: MAX_BITRATE_BY_RESOLUTION[selectedResolution()], maxFramerate: selectedFrameRate() };
+  if (params.encodings && params.encodings.length) {
+    params.encodings.forEach((encoding) => Object.assign(encoding, limits));
+  } else {
+    params.encodings = [limits];
+  }
+  sender.setParameters(params).catch(() => {});
+}
+
+async function applyQualityInRoom() {
+  if (!localStream || !mySharing) return; // nada compartilhando ainda; "Começar" já usa o que estiver escolhido
+
+  if (localVideoFromDisplayMedia) {
+    const track = localStream.getVideoTracks()[0];
+    try {
+      await track.applyConstraints(displayMediaVideoConstraints());
+    } catch (err) {
+      alert('Não foi possível trocar a qualidade: ' + err.message);
+      return;
+    }
+    roomPeers.forEach((peer) => {
+      if (peer.videoSender) applyVideoEncodingToSender(peer.videoSender);
+    });
+    return;
+  }
+
+  await replaceScreenVideoInRoom('Não foi possível trocar a qualidade: ');
+}
+
+resolutionSelect.addEventListener('change', () => applyQualityInRoom());
+frameRateSelect.addEventListener('change', () => applyQualityInRoom());
 
 const audioSourceSelect = document.getElementById('audio-source-select');
 const btnRefreshAudioSources = document.getElementById('btn-refresh-audio-sources');
@@ -1070,7 +1221,7 @@ async function refreshAudioSources() {
   if (supportsProcessAudio) {
     const processOption = document.createElement('option');
     processOption.value = PROCESS_VALUE;
-    processOption.textContent = 'Processo específico (incluir ou excluir um app)';
+    processOption.textContent = 'App específico (incluir ou excluir)';
     audioSourceSelect.appendChild(processOption);
   }
 
@@ -1108,6 +1259,8 @@ btnRefreshAudioSources.addEventListener('click', refreshAudioSources);
 
 const processAudioBlock = document.getElementById('process-audio-block');
 const processAudioSelect = document.getElementById('process-audio-select');
+// Grupo de rádios "Só este app" / "Tudo, menos este app" — o evento
+// 'change' dos rádios borbulha até ele.
 const processAudioMode = document.getElementById('process-audio-mode');
 const btnRefreshAudioProcesses = document.getElementById('btn-refresh-audio-processes');
 
@@ -1140,6 +1293,7 @@ async function updateAudioSourceUiState() {
   const monitorIgnored = monitorSelectIgnoredByAudioMode();
   monitorSelect.disabled = monitorIgnored;
   document.getElementById('loopback-hint').hidden = !monitorIgnored;
+  if (updateResolutionAvailability()) applyQualityInRoom();
 }
 
 // Ao entrar em "Processo específico" pela primeira vez, já deixa pronto pro
@@ -1150,7 +1304,7 @@ async function updateAudioSourceUiState() {
 // app da lista (melhor um alvo qualquer em modo excluir, que a pessoa troca
 // se quiser, do que deixar sem nada selecionado).
 function autoPickDiscordExclude() {
-  processAudioMode.value = 'exclude';
+  processAudioMode.querySelector('input[value="exclude"]').checked = true;
   const options = Array.from(processAudioSelect.options);
   const discordOption = options.find((o) => /discord$/i.test(o.textContent.trim()));
   const pick = discordOption || options[0];
@@ -1214,8 +1368,8 @@ async function acquireAudioTrack() {
 
   if (selected === PROCESS_VALUE) {
     const pid = Number(processAudioSelect.value);
-    if (!pid) throw new Error('Escolha um app na lista de "Processo específico".');
-    const exclude = processAudioMode.value === 'exclude';
+    if (!pid) throw new Error('Escolha um app na lista de "App específico".');
+    const exclude = processAudioMode.querySelector('input:checked').value === 'exclude';
     return startProcessAudioTrack(pid, exclude);
   }
 
@@ -1266,14 +1420,7 @@ async function applyLocalTracksToPeer(peer) {
   const audioTrack = localStream ? localStream.getAudioTracks()[0] || null : null;
 
   await peer.videoSender.replaceTrack(videoTrack).catch(() => {});
-  if (videoTrack) {
-    // Teto de 8 Mbps por conexão — não é um valor fixo, o WebRTC ainda
-    // estima a banda real e usa menos se precisar; só evita mandar mais do
-    // que isso pra cada participante.
-    const params = peer.videoSender.getParameters();
-    params.encodings = [{ maxBitrate: 8_000_000, maxFramerate: 60 }];
-    peer.videoSender.setParameters(params).catch(() => {});
-  }
+  if (videoTrack) applyVideoEncodingToSender(peer.videoSender);
 
   await peer.audioSender.replaceTrack(audioTrack || getOrCreateSilentAudioTrack()).catch(() => {});
 }
@@ -1322,12 +1469,15 @@ function monitorSelectIgnoredByAudioMode() {
 
 function showSharePopover() {
   sharePopover.hidden = false;
+  showDockControls(); // cancela o auto-esconder enquanto o popover estiver aberto
   monitorSelect.disabled = monitorSelectIgnoredByAudioMode();
   updateMonitorThumbnail();
 }
 
 function hideSharePopover() {
+  if (sharePopover.hidden) return;
   sharePopover.hidden = true;
+  showDockControls(); // volta a contar os 2s parado a partir de agora
 }
 
 // Antes de começar a compartilhar, o botão principal abre o popover de
@@ -1362,7 +1512,10 @@ document.addEventListener('click', (event) => {
 
 monitorSelect.addEventListener('change', () => {
   updateMonitorThumbnail();
-  if (mySharing) switchMonitorInRoom();
+  // Se o monitor novo não tem 1440p, a resolução cai pra 1080p aqui mesmo,
+  // antes de recapturar — a troca abaixo já sai com a resolução certa.
+  updateResolutionAvailability();
+  if (mySharing) replaceScreenVideoInRoom('Não foi possível trocar de monitor: ');
 });
 
 btnConfirmShare.addEventListener('click', () => confirmStartSharing());
@@ -1381,7 +1534,7 @@ async function confirmStartSharing() {
   try {
     if (useNativeDisplayMediaLoopback) {
       const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { width: { ideal: 1920, max: 1920 }, height: { ideal: 1080, max: 1080 }, frameRate: { ideal: 60, max: 60 } },
+        video: displayMediaVideoConstraints(),
         audio: true,
       });
       videoTrack = stream.getVideoTracks()[0];
@@ -1402,6 +1555,7 @@ async function confirmStartSharing() {
   }
 
   videoTrack.contentHint = 'detail';
+  localVideoFromDisplayMedia = useNativeDisplayMediaLoopback;
   localStream = new MediaStream([videoTrack, audioTrack]);
   videoTrack.addEventListener('ended', stopSharing);
 
@@ -1417,16 +1571,29 @@ async function confirmStartSharing() {
   renderFocusIfShowing();
 }
 
-async function switchMonitorInRoom() {
+// Recaptura o monitor escolhido no popover com a qualidade escolhida e troca
+// a track em todas as conexões sem renegociar — usado tanto pra trocar de
+// monitor quanto de resolução/taxa de quadros em pleno andamento.
+let screenVideoReplaceSeq = 0;
+
+async function replaceScreenVideoInRoom(errorPrefix) {
   if (!localStream || !mySharing) return;
   const sourceId = monitorSelect.value;
   if (!sourceId) return;
 
+  const seq = ++screenVideoReplaceSeq;
   let newTrack;
   try {
     newTrack = await acquireVideoTrackForScreen(sourceId);
   } catch (err) {
-    alert('Não foi possível trocar de monitor: ' + err.message);
+    alert(errorPrefix + err.message);
+    return;
+  }
+  // Pode ter parado de compartilhar enquanto a captura nova abria, ou outra
+  // troca (ex: duas mudanças seguidas no popover) já ter começado depois
+  // desta — a mais recente é a que vale.
+  if (!localStream || !mySharing || seq !== screenVideoReplaceSeq) {
+    newTrack.stop();
     return;
   }
   newTrack.contentHint = 'detail';
@@ -1437,13 +1604,12 @@ async function switchMonitorInRoom() {
     oldTrack.stop();
   }
   localStream.addTrack(newTrack);
+  localVideoFromDisplayMedia = false;
 
   roomPeers.forEach((peer) => {
     if (!peer.videoSender) return;
     peer.videoSender.replaceTrack(newTrack).catch(() => {});
-    const params = peer.videoSender.getParameters();
-    params.encodings = [{ maxBitrate: 8_000_000, maxFramerate: 60 }];
-    peer.videoSender.setParameters(params).catch(() => {});
+    applyVideoEncodingToSender(peer.videoSender);
   });
 
   localStream.getVideoTracks()[0].addEventListener('ended', stopSharing);
@@ -1494,6 +1660,7 @@ function stopSharing() {
     localStream.getTracks().forEach((t) => t.stop());
     localStream = null;
   }
+  localVideoFromDisplayMedia = false;
   if (processAudioState) {
     processAudioState.cleanup();
     processAudioState = null;

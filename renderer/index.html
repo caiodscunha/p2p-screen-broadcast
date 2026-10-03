@@ -46,6 +46,14 @@
             <li><span>2</span>Manda por onde quiser (voz, chat, o que for)</li>
             <li><span>3</span>Cada pessoa cola o código e entra direto</li>
           </ol>
+          <div id="create-alert" class="pane-alert" role="alert" hidden>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+            <span class="pane-alert-text"></span>
+          </div>
           <button id="btn-create-room" class="btn btn-primary btn-block">Criar sala</button>
         </div>
 
@@ -61,21 +69,33 @@
             <input type="text" id="join-name-input" placeholder="Ex: Maria" maxlength="60" />
           </div>
           <div class="field-block">
-            <label for="join-code-input">Código da sala</label>
-            <textarea id="join-code-input" placeholder="Cole aqui o código da sala..."></textarea>
-            <div class="btn-row">
-              <button id="paste-join-code" class="btn btn-ghost">Colar do clipboard</button>
+            <div class="label-row">
+              <label for="join-code-input">Código da sala</label>
+              <button id="paste-join-code" type="button" class="btn-mini">
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="8" y="2" width="8" height="4" rx="1"></rect>
+                  <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+                </svg>
+                Colar do clipboard
+              </button>
             </div>
+            <textarea id="join-code-input" placeholder="Cole aqui o código da sala..."></textarea>
           </div>
           <div class="field-block">
             <label for="join-passphrase-input">Senha combinada (se houver)</label>
             <input type="text" id="join-passphrase-input" placeholder="Deixe em branco se não houver senha" />
           </div>
+          <div id="join-alert" class="pane-alert" role="alert" hidden>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+            <span class="pane-alert-text"></span>
+          </div>
           <button id="btn-join-room" class="btn btn-primary btn-block">Entrar</button>
         </div>
       </div>
-
-      <p id="home-status" class="hint home-status" hidden></p>
     </div>
   </section>
 
@@ -175,46 +195,88 @@
       </div>
     </footer>
 
-    <!-- popover: escolher tela/áudio antes de começar a compartilhar -->
-    <div id="share-setup-popover" class="popover" hidden>
+    <!-- popover: escolher tela/áudio antes de começar a compartilhar (e
+         trocar monitor/qualidade/áudio em pleno andamento, pela setinha) -->
+    <div id="share-setup-popover" class="popover share-popover" hidden>
       <h3>Compartilhar tela</h3>
-      <div class="field-block">
-        <label for="monitor-select">Monitor a compartilhar</label>
-        <div class="btn-row">
-          <select id="monitor-select"></select>
-          <button id="btn-refresh-monitors" type="button" class="btn btn-ghost">Atualizar</button>
-        </div>
-        <img id="monitor-thumbnail" alt="" hidden />
-        <p id="loopback-hint" class="hint" hidden>Com "Áudio do sistema", o Windows/macOS pergunta
-          qual tela compartilhar na hora — o monitor escolhido acima é ignorado nesse modo.</p>
-      </div>
-      <p id="audio-hint" class="hint" hidden>Este sistema operacional não tem suporte à captura
-        automática do áudio do sistema; apenas o vídeo será compartilhado, a menos que você
-        selecione uma fonte de áudio abaixo.</p>
-      <div class="field-block">
-        <label for="audio-source-select">Fonte de áudio</label>
-        <div class="btn-row">
-          <select id="audio-source-select">
-            <option value="">Nenhum áudio</option>
-          </select>
-          <button id="btn-refresh-audio-sources" type="button" class="btn btn-ghost">Atualizar</button>
-        </div>
-        <div class="field-block" id="process-audio-block" hidden>
-          <label for="process-audio-mode">O que fazer com o app escolhido</label>
-          <select id="process-audio-mode">
-            <option value="include">Compartilhar só o áudio desse app</option>
-            <option value="exclude">Compartilhar tudo, exceto o áudio desse app</option>
-          </select>
-          <div class="field-block">
-            <label for="process-audio-select">App</label>
-            <div class="btn-row">
-              <select id="process-audio-select"></select>
-              <button id="btn-refresh-audio-processes" type="button" class="btn btn-ghost">Atualizar</button>
+
+      <div class="share-section">
+        <div class="share-video">
+          <div class="share-preview">
+            <img id="monitor-thumbnail" alt="" hidden />
+          </div>
+          <div class="share-video-fields">
+            <div class="share-field">
+              <label for="monitor-select">Monitor</label>
+              <div class="select-with-btn">
+                <select id="monitor-select"></select>
+                <button id="btn-refresh-monitors" type="button" class="icon-btn" title="Atualizar lista de monitores">
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
+                    <polyline points="21 3 21 9 15 9"></polyline>
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <div class="quality-row">
+              <div class="share-field">
+                <label for="resolution-select">Resolução</label>
+                <select id="resolution-select">
+                  <option value="720">720p</option>
+                  <option value="1080" selected>1080p</option>
+                  <option value="1440">1440p</option>
+                </select>
+              </div>
+              <div class="share-field">
+                <label for="framerate-select">Taxa de quadros</label>
+                <select id="framerate-select">
+                  <option value="24">24 fps</option>
+                  <option value="30">30 fps</option>
+                  <option value="60" selected>60 fps</option>
+                </select>
+              </div>
             </div>
           </div>
         </div>
+        <p id="loopback-hint" class="share-note" hidden>Com "Áudio do sistema", o Windows/macOS pergunta
+          qual tela compartilhar na hora — o monitor escolhido acima é ignorado.</p>
       </div>
-      <button id="btn-confirm-share" class="btn btn-primary">Começar a compartilhar</button>
+
+      <div class="share-section">
+        <div class="share-field">
+          <label for="audio-source-select">Áudio</label>
+          <div class="select-with-btn">
+            <select id="audio-source-select">
+              <option value="">Nenhum áudio</option>
+            </select>
+            <button id="btn-refresh-audio-sources" type="button" class="icon-btn" title="Atualizar fontes de áudio">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
+                <polyline points="21 3 21 9 15 9"></polyline>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <p id="audio-hint" class="share-note" hidden>Este sistema não captura o áudio do sistema
+          sozinho — só vai áudio se você escolher uma fonte acima.</p>
+        <div id="process-audio-block" class="process-audio-panel" hidden>
+          <div id="process-audio-mode" class="segmented" role="radiogroup" aria-label="O que fazer com o app escolhido">
+            <label><input type="radio" name="process-audio-mode" value="include" checked /><span>Só este app</span></label>
+            <label><input type="radio" name="process-audio-mode" value="exclude" /><span>Tudo, menos este app</span></label>
+          </div>
+          <div class="select-with-btn">
+            <select id="process-audio-select" aria-label="App"></select>
+            <button id="btn-refresh-audio-processes" type="button" class="icon-btn" title="Atualizar lista de apps">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
+                <polyline points="21 3 21 9 15 9"></polyline>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <button id="btn-confirm-share" class="btn btn-primary btn-block">Começar a compartilhar</button>
     </div>
   </section>
 

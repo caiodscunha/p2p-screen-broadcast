@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, ipcMain, clipboard, desktopCapturer, dialog } = require('electron');
+const { app, BrowserWindow, session, ipcMain, clipboard, desktopCapturer, dialog, screen } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -372,12 +372,35 @@ ipcMain.handle('capture:listScreens', async () => {
     types: ['screen'],
     thumbnailSize: process.platform === 'linux' ? { width: 0, height: 0 } : { width: 320, height: 180 },
   });
-  return sources.map((s) => ({
-    id: s.id,
-    name: s.name,
-    thumbnail: s.thumbnail.isEmpty() ? null : s.thumbnail.toDataURL(),
-  }));
+  const displays = screen.getAllDisplays();
+  return sources.map((s) => {
+    const size = physicalDisplaySize(s, displays);
+    return {
+      id: s.id,
+      name: s.name,
+      thumbnail: s.thumbnail.isEmpty() ? null : s.thumbnail.toDataURL(),
+      width: size ? size.width : null,
+      height: size ? size.height : null,
+    };
+  });
 });
+
+// Resolução real (em pixels físicos, não em DIP — um monitor 1440p com
+// escala de 150% aparece como 1707x960 em display.size) do monitor por trás
+// de uma fonte do desktopCapturer — usada pra só oferecer "1440p" na
+// configuração de qualidade quando o monitor tem pelo menos isso. No Linux
+// (Wayland/portal) o display_id às vezes vem vazio; com um monitor só ainda
+// dá pra saber qual é, com mais de um fica desconhecido (null).
+function physicalDisplaySize(source, displays) {
+  const display =
+    displays.find((d) => String(d.id) === source.display_id) ||
+    (displays.length === 1 ? displays[0] : null);
+  if (!display) return null;
+  return {
+    width: Math.round(display.size.width * display.scaleFactor),
+    height: Math.round(display.size.height * display.scaleFactor),
+  };
+}
 
 function createWindow() {
   const win = new BrowserWindow({
