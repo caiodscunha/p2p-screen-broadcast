@@ -743,7 +743,9 @@ async function setupPeerConnection(peer) {
   // "oficial" do evento "track" (em vez de um montado na mão via
   // getReceivers) que passou a carregar de verdade.
   const outgoingStream = new MediaStream();
-  peer.videoSender = pc.addTransceiver('video', { direction: 'sendrecv', streams: [outgoingStream] }).sender;
+  const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv', streams: [outgoingStream] });
+  preferHardwareVideoCodec(videoTransceiver);
+  peer.videoSender = videoTransceiver.sender;
   peer.audioSender = pc.addTransceiver('audio', { direction: 'sendrecv', streams: [outgoingStream] }).sender;
   peer.audioSender.replaceTrack(getOrCreateSilentAudioTrack()).catch(() => {});
 
@@ -843,6 +845,46 @@ async function setupPeerConnection(peer) {
   }
 
   if (mySharing) sendToPeerReliable(peer, { t: 'sharing', sender: myPeerInfo(), on: true }).catch(() => {});
+}
+
+// Ordem de preferência do codec de vídeo: H.264 High primeiro, VP8 logo
+// depois, o resto na ordem padrão do navegador. Sem isso o Chromium
+// negocia VP8, que no Windows é SEMPRE codificado e decodificado na CPU
+// (libvpx) — e na malha da sala cada pessoa assistindo tem o SEU próprio
+// encoder, codificando a mesma tela de novo. Medido num i5-12600K + RTX
+// 5070, tela em movimento a 1080p30, 3 pessoas assistindo: com VP8 a CPU do
+// PC inteiro chegou a 100% e o vídeo caiu pra ~10 fps (é o que travava o
+// PC e as abas do Chrome); com H.264 na placa de vídeo (NVENC) ficou em ~3%
+// de CPU, 30 fps cravados. A 1440p o VP8 não passava de 2 fps nem com uma
+// pessoa só. Quem recebe também ganha: H.264 decodifica na placa de vídeo,
+// VP8 não.
+//
+// Por que "High" (profile-level-id=64...) e não qualquer H.264: no Windows o
+// Chromium só manda pra placa de vídeo os perfis Baseline/Main/High; o
+// Constrained Baseline (42e01f, o H.264 "padrão" do WebRTC) vai pro
+// OpenH264 por software, que foi ainda pior que o VP8 (2 fps a 1080p). E o
+// High só aparece nas capacidades de ENVIO quando existe encoder de
+// hardware (o OpenH264 não faz High): cada lado escolhe sozinho o primeiro
+// codec da lista que ele consegue codificar, então quem não tem hardware
+// manda VP8 (o 2º da lista, nunca o OpenH264), mas continua recebendo
+// H.264 de quem tem — testado com uma instância rodando com
+// --disable-accelerated-video-encode.
+function preferHardwareVideoCodec(transceiver) {
+  const capabilities = RTCRtpSender.getCapabilities && RTCRtpSender.getCapabilities('video');
+  if (!capabilities || typeof transceiver.setCodecPreferences !== 'function') return;
+  const fmtp = (codec) => codec.sdpFmtpLine || '';
+  const isH264High = (codec) =>
+    codec.mimeType.toLowerCase() === 'video/h264' &&
+    /profile-level-id=64/i.test(fmtp(codec)) &&
+    /packetization-mode=1/.test(fmtp(codec));
+  const isVp8 = (codec) => codec.mimeType.toLowerCase() === 'video/vp8';
+  const ordered = [...capabilities.codecs.filter(isH264High), ...capabilities.codecs.filter(isVp8)];
+  ordered.push(...capabilities.codecs.filter((codec) => !ordered.includes(codec)));
+  try {
+    transceiver.setCodecPreferences(ordered);
+  } catch (err) {
+    console.warn('[room] não deu pra definir a preferência de codec de vídeo — fica o padrão do navegador', err);
+  }
 }
 
 // Lê diretamente o que a RTCPeerConnection já está recebendo agora
@@ -1341,11 +1383,18 @@ btnRefreshAudioProcesses.addEventListener('click', refreshAudioProcesses);
 let processAudioState = null;
 let loopbackAudioTrack = null;
 let silentAudioTrack = null;
+// Um AudioContext só pra todas as tracks silenciosas, reaproveitado. Antes
+// cada track nova (toda vez que alguém parava de compartilhar) criava um
+// AudioContext novo e nunca fechava o anterior — e um AudioContext rodando
+// não é coletado: cada um ficava pra sempre com sua thread de áudio em
+// tempo real e seu stream aberto na placa de som, acumulando a cada
+// compartilhar/parar.
+let silentAudioContext = null;
 
 function getOrCreateSilentAudioTrack() {
   if (silentAudioTrack && silentAudioTrack.readyState === 'live') return silentAudioTrack;
-  const ctx = new AudioContext();
-  const destination = ctx.createMediaStreamDestination();
+  if (!silentAudioContext || silentAudioContext.state === 'closed') silentAudioContext = new AudioContext();
+  const destination = silentAudioContext.createMediaStreamDestination();
   silentAudioTrack = destination.stream.getAudioTracks()[0];
   return silentAudioTrack;
 }
@@ -1383,20 +1432,34 @@ async function acquireAudioTrack() {
 
 async function startProcessAudioTrack(pid, exclude) {
   const audioCtx = new AudioContext({ sampleRate: 48000 });
-  await audioCtx.audioWorklet.addModule('pcm-injector-worklet.js');
+  let unsubscribeChunk = () => {};
+  let unsubscribeError = () => {};
+  let handle;
+  let destination;
+  try {
+    await audioCtx.audioWorklet.addModule('pcm-injector-worklet.js');
 
-  const workletNode = new AudioWorkletNode(audioCtx, 'pcm-injector', { outputChannelCount: [2] });
-  const destination = audioCtx.createMediaStreamDestination();
-  workletNode.connect(destination);
+    const workletNode = new AudioWorkletNode(audioCtx, 'pcm-injector', { outputChannelCount: [2] });
+    destination = audioCtx.createMediaStreamDestination();
+    workletNode.connect(destination);
 
-  const unsubscribeChunk = window.api.onProcessAudioChunk((samples, sampleRate, channels) => {
-    workletNode.port.postMessage({ interleaved: samples, channels }, [samples.buffer]);
-  });
-  const unsubscribeError = window.api.onProcessAudioError((message) => {
-    alert('Captura de áudio por processo falhou: ' + message);
-  });
+    unsubscribeChunk = window.api.onProcessAudioChunk((samples, sampleRate, channels) => {
+      workletNode.port.postMessage({ interleaved: samples, channels }, [samples.buffer]);
+    });
+    unsubscribeError = window.api.onProcessAudioError((message) => {
+      alert('Captura de áudio por processo falhou: ' + message);
+    });
 
-  const handle = await window.api.startProcessAudioCapture(pid, exclude);
+    handle = await window.api.startProcessAudioCapture(pid, exclude);
+  } catch (err) {
+    // Sem isso, uma falha aqui (ex: o addon recusando o processo) deixava
+    // este AudioContext rodando pra sempre — ninguém guardava referência
+    // pra fechar depois.
+    unsubscribeChunk();
+    unsubscribeError();
+    audioCtx.close().catch(() => {});
+    throw err;
+  }
 
   processAudioState = {
     handle,

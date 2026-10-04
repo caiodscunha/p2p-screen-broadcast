@@ -290,7 +290,12 @@ the app, on any machine that built or downloaded the Linux release.
   same time means each of them is uploading directly to every other
   participant; there's a per-connection bitrate cap, but nothing that
   budgets total bandwidth across a room with many simultaneous
-  broadcasters.
+  broadcasters. The same goes for encoding: every viewer gets their own
+  encode of your screen. To keep that cheap, the app prefers H.264 on the
+  GPU's hardware encoder (NVENC, Quick Sync, AMF, VideoToolbox), which also
+  lets viewers decode it on their GPU. A PC without a usable hardware
+  encoder falls back to VP8 in software, which gets CPU-heavy at 1080p and
+  above with several viewers.
 - **No native `getDisplayMedia` system-audio loopback on Linux**: that
   specific API is only supported by Chromium/Electron on Windows and macOS.
   Linux instead gets its own audio path: on a PipeWire session, per-app
