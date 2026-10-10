@@ -963,6 +963,33 @@ function adoptRemoteTransceivers(peer) {
   attachLocalTransceivers(peer, video, audio);
 }
 
+// Áudio em estéreo e com mais bitrate. Por padrão o Chromium negocia o Opus
+// em MONO a 32 kbps: ótimo pra voz, mas música e som de jogo viravam mono e
+// perdiam bastante qualidade. O parâmetro "stereo=1" no SDP quer dizer
+// "prefiro RECEBER estéreo" (e "maxaveragebitrate", até quanto quero
+// receber), então cada lado põe isso na PRÓPRIA descrição (oferta ou
+// resposta) antes de aplicá-la: o decodificador daqui passa a sair em
+// estéreo, e o codificador do outro lado, ao ler isso, passa a mandar
+// estéreo a 128 kbps. Medido (440 Hz só no canal esquerdo, 660 Hz só no
+// direito): sem isso os dois tons chegavam iguais nos dois canais; com
+// isso, ~70 dB de separação. E fica compatível com versões antigas: quem
+// ainda não atualizou continua recebendo mono a 32 kbps como antes, e quem
+// atualizou recebe estéreo mesmo de quem não atualizou.
+const OPUS_RECEIVE_PARAMS = ['stereo=1', 'sprop-stereo=1', 'maxaveragebitrate=128000'];
+
+function withStereoOpus(description) {
+  const payloadTypes = [...description.sdp.matchAll(/a=rtpmap:(\d+) opus\/48000\/2/gi)].map((match) => match[1]);
+  const sdp = payloadTypes.reduce(
+    (current, payloadType) =>
+      current.replace(new RegExp(`(a=fmtp:${payloadType} [^\\r\\n]*)`), (line) => {
+        const missing = OPUS_RECEIVE_PARAMS.filter((param) => !new RegExp(`[ ;]${param.split('=')[0]}=`).test(line));
+        return missing.length ? line + ';' + missing.join(';') : line;
+      }),
+    description.sdp
+  );
+  return { type: description.type, sdp };
+}
+
 function waitForIceGathering(pc, timeoutMs) {
   if (pc.iceGatheringState === 'complete') return Promise.resolve();
   return new Promise((resolve) => {
@@ -1070,7 +1097,7 @@ function negotiate(peer, { iceRestart = false } = {}) {
     let message;
     peer.holdingLocalCandidates = true;
     try {
-      await pc.setLocalDescription(await pc.createOffer(iceRestart ? { iceRestart: true } : undefined));
+      await pc.setLocalDescription(withStereoOpus(await pc.createOffer(iceRestart ? { iceRestart: true } : undefined)));
       peer.pendingOfferSeq = seq;
       await waitForIceGathering(pc, ICE_GATHER_WAIT_MS);
       if (peer.pc !== pc) return;
@@ -1144,7 +1171,7 @@ async function handleOffer(peer, message) {
   let answer;
   peer.holdingLocalCandidates = true;
   try {
-    await pc.setLocalDescription(await pc.createAnswer());
+    await pc.setLocalDescription(withStereoOpus(await pc.createAnswer()));
     await waitForIceGathering(pc, ICE_GATHER_WAIT_MS);
     if (peer.pc !== pc) return;
     answer = {

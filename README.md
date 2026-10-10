@@ -103,7 +103,9 @@ generated instantly, no ICE gathering wait.
    code to generate or exchange, and no code re-entry needed for people
    already in the room. When a connection's bandwidth drops, the stream
    temporarily lowers its resolution to keep the frame rate (and latency)
-   steady, and goes back up once the network recovers.
+   steady, and goes back up once the network recovers. Audio goes out as
+   stereo Opus at up to 128 kbps (WebRTC's default would be mono at
+   32 kbps, fine for voice but noticeably worse for music and games).
 6. If a connection drops, the app reconnects on its own: first it looks for
    a new network path on the same connection, then rebuilds the connection
    from scratch. Meanwhile that person's tile shows "Reconectando...", their
