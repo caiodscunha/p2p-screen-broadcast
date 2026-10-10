@@ -14,7 +14,7 @@
     "dist": "electron-builder --win --mac --linux"
   },
   "devDependencies": {
-    "electron": "^32.0.0",
+    "electron": "^44.7.0",
     "electron-builder": "^26.15.3",
     "node-addon-api": "^8.9.2",
     "node-gyp": "^12.4.0"
@@ -53,7 +53,11 @@
       "target": [
         "zip"
       ],
-      "artifactName": "Sinal-P2P-${version}-mac.${ext}"
+      "artifactName": "Sinal-P2P-${version}-mac.${ext}",
+      "extendInfo": {
+        "NSAudioCaptureUsageDescription": "O Sinal P2P captura o áudio do sistema para transmitir junto com a sua tela.",
+        "NSMicrophoneUsageDescription": "O Sinal P2P usa o microfone quando você escolhe um dispositivo de entrada como fonte de áudio."
+      }
     },
     "linux": {
       "icon": "assets/icon.png",
@@ -65,6 +69,7 @@
     }
   },
   "dependencies": {
-    "@achingbrain/nat-port-mapper": "^4.0.5"
+    "@achingbrain/nat-port-mapper": "^4.0.5",
+    "mqtt": "^5.16.0"
   }
 }

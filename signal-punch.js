@@ -22,6 +22,12 @@
 //    nunca passa por aqui. Só é tentado se o código couber no limite de
 //    tamanho de mensagem do serviço (com chunking pra mensagens grandes).
 //
+// 3) Broker MQTT público (EMQX) como reserva do reserva: só usado pra MANDAR
+//    quando o ntfy.sh recusa por limite (cota diária de 250 mensagens por IP
+//    ou limite de pedidos por minuto — ver ntfyLimitedUntil). A conexão de
+//    escuta fica sempre aberta, porque é ela que deixa alguém cujo ntfy
+//    estourou alcançar você.
+//
 // Usado tanto pro pareamento 1:1 original quanto pro protocolo de salas (ver
 // renderer.js): toda mensagem trocada é um objeto JSON pequeno e genérico
 // ({t: 'join'|'welcome'|'offer'|'answer'|'sharing'|... , ...}), este arquivo
@@ -70,6 +76,35 @@ const NTFY_FALLBACK_DELAY_MS = 1200;
 // ntfy nunca mais seriam lidas.
 const NTFY_STALL_MS = 70000;
 
+// Reserva pro ntfy.sh quando ele recusa por limite. Escolhido em 2026-10-10
+// testando de verdade cada candidato: o broker público da EMQX (da EMQ
+// Technologies, a empresa por trás do EMQX, broker MQTT de código aberto;
+// cluster distribuído em várias regiões) respondeu com TLS válido
+// (certificado da DigiCert, verificado) e ida e volta de ~0,4s. O público da
+// HiveMQ recusou conexão em todas as portas no mesmo dia, o sandbox da
+// Eclipse não respondeu, e o test.mosquitto.org o próprio site descreve
+// como "best-effort" (com histórico de quedas e bloqueio anti-DDoS) — todos
+// de fora. Como o ntfy, é um serviço gratuito sem garantia de
+// disponibilidade, por isso é reserva e não a via principal. O broker só vê
+// o envelope de roteamento (ids de sessão) e o conteúdo já cifrado com a
+// chave da sala (ver sealSignal em renderer.js).
+const MQTT_BROKERS = ['mqtts://broker.emqx.io:8883'];
+const MQTT_TOPIC_PREFIX = 'sinal-p2p/v2/';
+const MQTT_CHUNK_SIZE = 12000; // sem cota por mensagem: pedaços maiores, normalmente 1 só
+const MQTT_PUBLISH_TIMEOUT_MS = 5000;
+// Depois de um 429, por quanto tempo nem tentar o ntfy: a cota diária
+// (código 42908, "daily message quota reached") não volta tão cedo, então
+// só testa de novo a cada hora; o limite de pedidos por minuto (42901)
+// volta rápido.
+const NTFY_DAILY_QUOTA_BACKOFF_MS = 60 * 60 * 1000;
+const NTFY_RATE_LIMIT_BACKOFF_MS = 60 * 1000;
+// Vale pro app inteiro (a cota é por IP, não por sala/sessão).
+let ntfyLimitedUntil = 0;
+
+function ntfyLimited() {
+  return Date.now() < ntfyLimitedUntil;
+}
+
 function splitIntoChunks(text, size) {
   if (text.length === 0) return [''];
   const chunks = [];
@@ -85,6 +120,10 @@ function splitIntoChunks(text, size) {
 // não for reconhecido. Deduplica: uma vez entregue, o mesmo "mid" nunca é
 // entregue de novo (importa porque a mesma mensagem pode chegar mais de
 // uma vez — reenvios da via UDP, ou UDP e ntfy chegando os dois).
+// Devolvido pelo montador quando chega um pedaço de uma mensagem que JÁ foi
+// entregue (ver handleIncoming).
+const ALREADY_DELIVERED = Symbol('already-delivered');
+
 function createMessageAssembler() {
   const partial = new Map(); // mid -> pedaços (array com buracos)
   const delivered = new Set(); // mid's já entregues — não deixa crescer sem limite
@@ -97,21 +136,32 @@ function createMessageAssembler() {
   // fragmentadas passam por aqui). Mesma técnica de `delivered` abaixo:
   // `Map` preserva ordem de inserção, então descarta a mais antiga.
   const MAX_PARTIAL = 200;
+  // Tetos pro que chega da rede: sem eles, um único pacote com "n" enorme
+  // (ex: 1e9) fazia `new Array(n).fill(null)` alocar gigabytes e derrubava o
+  // processo principal por falta de memória — bastava saber o id da sessão,
+  // que viaja aberto nos próprios pacotes UDP. Mensagem legítima nenhuma
+  // chega perto disso (uma oferta SDP inteira são poucos pedaços).
+  const MAX_CHUNKS = 64;
+  const MAX_CHUNK_LENGTH = 16384; // cabe o pedaço do MQTT (MQTT_CHUNK_SIZE) já escapado
+  const MAX_MID_LENGTH = 64;
 
   return (envelope) => {
     if (
       !envelope ||
       typeof envelope.mid !== 'string' ||
+      envelope.mid.length > MAX_MID_LENGTH ||
       !Number.isInteger(envelope.i) ||
       !Number.isInteger(envelope.n) ||
       envelope.n < 1 ||
+      envelope.n > MAX_CHUNKS ||
       envelope.i < 0 ||
       envelope.i >= envelope.n ||
-      typeof envelope.c !== 'string'
+      typeof envelope.c !== 'string' ||
+      envelope.c.length > MAX_CHUNK_LENGTH
     ) {
       return null;
     }
-    if (delivered.has(envelope.mid)) return null;
+    if (delivered.has(envelope.mid)) return ALREADY_DELIVERED;
 
     // UDP e ntfy picam a MESMA mensagem em tamanhos diferentes (ver
     // UDP_CHUNK_SIZE/NTFY_CHUNK_SIZE), então os pedaços de cada via são
@@ -154,8 +204,31 @@ async function postNtfyMessage(topic, obj) {
   try {
     const res = await fetch(`${NTFY_BASE}/${encodeURIComponent(topic)}`, {
       method: 'POST',
+      // Sem isso o ntfy.sh guarda cada mensagem por 12h, e qualquer um que
+      // saiba o id do tópico lê o histórico inteiro com um GET (testado);
+      // e "Firebase: no" não deixa ele repassar pro Firebase do Google (que
+      // ele usa pros apps de celular). O app só lê mensagens ao vivo, pela
+      // conexão de streaming — nunca precisou do histórico.
+      headers: { Cache: 'no', Firebase: 'no' },
       body: JSON.stringify(obj),
     });
+    if (res.status === 429) {
+      let code = null;
+      try {
+        code = (await res.json()).code;
+      } catch {
+        // corpo fora do formato esperado — trata como limite de pedidos
+      }
+      const daily = code === 42908;
+      const wasLimited = ntfyLimited();
+      ntfyLimitedUntil = Date.now() + (daily ? NTFY_DAILY_QUOTA_BACKOFF_MS : NTFY_RATE_LIMIT_BACKOFF_MS);
+      if (!wasLimited) {
+        console.warn(
+          '[signal-punch] ntfy: limite atingido (' + (daily ? 'cota diária' : 'pedidos por minuto') + ') — usando o broker MQTT reserva'
+        );
+      }
+      return { ok: false, networkError: false, status: 429, limit: daily ? 'daily' : 'rate' };
+    }
     if (!res.ok) console.error('[signal-punch] ntfy: publicar falhou, status', res.status);
     return { ok: res.ok, networkError: false, status: res.status };
   } catch (err) {
@@ -244,7 +317,76 @@ async function readNtfyStream(res, onMessage, onActivity) {
   }
 }
 
-const STUN_SERVER = { host: 'stun.l.google.com', port: 19302 };
+// Dois servidores do mesmo serviço público do Google (hosts diferentes):
+// a pergunta vai pros dois e vale a primeira resposta — se um não
+// responder, o endereço público ainda é descoberto.
+const STUN_SERVERS = [
+  { host: 'stun.l.google.com', port: 19302 },
+  { host: 'stun1.l.google.com', port: 19302 },
+];
+// Conexões com os brokers MQTT de reserva (ver MQTT_BROKERS) pra UMA sessão:
+// assina o tópico dela (pra receber de quem estiver usando a reserva) e
+// publica quando o ntfy está no limite. A biblioteca (MQTT.js) cuida de
+// reconectar e de reassinar sozinha se a conexão cair.
+function openMqttRelay(sessionId, onEnvelope) {
+  let mqtt;
+  try {
+    mqtt = require('mqtt');
+  } catch {
+    return null; // biblioteca ausente — segue sem a reserva
+  }
+  const clients = MQTT_BROKERS.map((url) => {
+    const client = mqtt.connect(url, {
+      clientId: 'sinal-' + crypto.randomBytes(8).toString('hex'),
+      clean: true,
+      keepalive: 60,
+      connectTimeout: 10_000,
+      reconnectPeriod: 10_000,
+      protocolVersion: 4,
+    });
+    client.subscribe(MQTT_TOPIC_PREFIX + sessionId, { qos: 1 });
+    client.on('message', (_topic, payload) => {
+      let envelope;
+      try {
+        envelope = JSON.parse(payload.toString('utf8'));
+      } catch {
+        return;
+      }
+      onEnvelope(envelope);
+    });
+    let lastError = null;
+    client.on('error', (err) => {
+      if (err.message === lastError) return; // não repete o mesmo erro a cada tentativa de reconexão
+      lastError = err.message;
+      console.error('[signal-punch] mqtt (' + url + '):', err.message);
+    });
+    client.on('connect', () => {
+      lastError = null;
+    });
+    return client;
+  });
+
+  // true quando o broker confirma que recebeu (QoS 1).
+  const publishOne = (client, targetSessionId, obj) =>
+    new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), MQTT_PUBLISH_TIMEOUT_MS);
+      client.publish(MQTT_TOPIC_PREFIX + targetSessionId, JSON.stringify(obj), { qos: 1 }, (err) => {
+        clearTimeout(timer);
+        resolve(!err);
+      });
+    });
+
+  return {
+    publish: async (targetSessionId, obj) =>
+      (await Promise.all(clients.map((client) => publishOne(client, targetSessionId, obj)))).some(Boolean),
+    reconnectIfDown: () =>
+      clients.forEach((client) => {
+        if (!client.connected && !client.reconnecting) client.reconnect();
+      }),
+    close: () => clients.forEach((client) => client.end(true)),
+  };
+}
+
 const STUN_MAGIC_COOKIE = 0x2112a442;
 const XOR_MAPPED_ADDRESS = 0x0020;
 const XOR_MAPPED_ADDRESS_LEGACY = 0x8020; // usado por alguns servidores antigos
@@ -346,12 +488,14 @@ async function mapPublicPort(localPort, timeoutMs = 3000) {
     const candidates = [];
     for await (const mapping of gateway.mapAll(localPort, {
       protocol: 'udp',
-      // Sem autoRefresh: se o cleanup no stop() falhar por algum motivo (app
-      // fechado à força no meio do processo, por exemplo), o próprio
-      // roteador derruba o mapeamento sozinho logo em seguida, em vez de
-      // ficar exposto por mais tempo.
-      ttl: 30_000,
-      autoRefresh: false,
+      // A biblioteca nunca pede menos de 1 hora ao roteador (arredonda pra
+      // cima qualquer ttl menor — o 30s que estava aqui virava 1h), então
+      // sem renovação o mapeamento simplesmente sumia depois de 1 hora de
+      // sala, e quem entrasse depois perdia esse caminho. Renovando, dura
+      // enquanto a sala durar; o stop() remove na saída. Se o app for
+      // fechado à força, o roteador derruba sozinho em no máximo 1 hora.
+      ttl: 3_600_000,
+      autoRefresh: true,
       signal: AbortSignal.timeout(timeoutMs),
     })) {
       candidates.push({ ip: mapping.externalHost, port: mapping.externalPort });
@@ -394,7 +538,13 @@ function discoverPublicAddress(socket, timeoutMs = 3000) {
     let attempts = 0;
     const send = () => {
       attempts += 1;
-      socket.send(request, STUN_SERVER.port, STUN_SERVER.host, () => {});
+      STUN_SERVERS.forEach((server) => {
+        try {
+          socket.send(request, server.port, server.host, () => {});
+        } catch {
+          // socket fechado no meio — o giveUpTimer encerra
+        }
+      });
     };
     send();
     const retryTimer = setInterval(() => {
@@ -415,13 +565,24 @@ function discoverPublicAddress(socket, timeoutMs = 3000) {
 // renderer.js: 'join', 'welcome', 'offer', 'answer', 'sharing' etc.).
 async function startListener({ onMessage }) {
   const socket = dgram.createSocket('udp4');
-  await new Promise((resolve, reject) => {
-    socket.once('error', reject);
-    socket.bind(0, () => {
-      socket.removeListener('error', reject);
-      resolve();
-    });
-  }).catch(() => null);
+  const bound = await new Promise((resolve) => {
+    socket.once('error', () => resolve(false));
+    socket.bind(0, () => resolve(true));
+  });
+  if (!bound) {
+    // Sem porta UDP nenhuma (antes isso estourava logo abaixo, em
+    // socket.address(), e a sala simplesmente não abria sem explicação):
+    // devolve null, que a UI já trata como "conexão automática indisponível".
+    try {
+      socket.close();
+    } catch {
+      // já fechado
+    }
+    return null;
+  }
+  // Depois de vinculado, um erro do socket (ex: ICMP "porta inalcançável"
+  // em algumas plataformas) não pode derrubar o processo principal.
+  socket.on('error', (err) => console.error('[signal-punch] erro no socket UDP:', err.message));
 
   const localPort = socket.address().port;
   // "source" não afeta a lógica (a busca tenta todos igual) — é só pra dar
@@ -480,28 +641,65 @@ async function startListener({ onMessage }) {
   // resolve, o resto é ignorado porque o mid já sai do mapa).
   const pendingAcks = new Map();
 
+  // Publica algo pequeno (uma confirmação) por um retransmissor: o ntfy, ou
+  // o broker MQTT reserva se o ntfy estiver no limite.
+  async function relayPublish(targetSessionId, obj) {
+    if (!ntfyLimited()) {
+      const result = await postNtfyMessage(targetSessionId, obj);
+      if (result.ok || result.status !== 429) return;
+    }
+    if (mqttRelay) await mqttRelay.publish(targetSessionId, obj);
+  }
+
   // Ponto único por onde toda mensagem recebida passa, venha de UDP
-  // (rinfo preenchido) ou do stream ntfy (rinfo null) — responde no MESMO
-  // canal em que a mensagem chegou.
-  function handleIncoming(envelope, rinfo) {
+  // (rinfo preenchido), do stream ntfy ou do broker MQTT (`via`) — responde
+  // no MESMO canal em que a mensagem chegou.
+  function handleIncoming(envelope, rinfo, via) {
     if (!envelope || envelope.v !== 1 || envelope.sid !== sessionId) return;
 
     if (envelope.t === 'ack') {
       const onAck = pendingAcks.get(envelope.mid);
-      if (onAck) onAck(rinfo ? { source: 'udp', address: `${rinfo.address}:${rinfo.port}` } : { source: 'http-relay' });
+      if (onAck) {
+        onAck(
+          rinfo
+            ? { source: 'udp', address: `${rinfo.address}:${rinfo.port}` }
+            : { source: via === 'mqtt' ? 'mqtt' : 'http-relay' }
+        );
+      }
       return;
     }
 
     const from = typeof envelope.from === 'string' ? envelope.from : null;
     const complete = assembler(envelope);
+    if (complete === ALREADY_DELIVERED) {
+      // Quem mandou continua reenviando por UDP porque a confirmação dele
+      // ainda não chegou — ela se perdeu, ou foi pelo ntfy e o ntfy recusou
+      // (limite diário). Antes a repetição era descartada calada e a
+      // confirmação NUNCA chegava: quem mandou achava que a mensagem tinha
+      // se perdido (com o "join", a pessoa era tirada da sala do nada ~10s
+      // depois de entrar, mesmo funcionando). Confirma de novo pelo próprio
+      // UDP — de graça, sem gastar cota do ntfy. Uma vez por rodada de
+      // reenvio (pedaço 0), não uma por pedaço.
+      if (rinfo && envelope.i === 0 && typeof envelope.from === 'string') {
+        const ack = { v: 1, sid: envelope.from, t: 'ack', mid: envelope.mid };
+        try {
+          socket.send(Buffer.from(JSON.stringify(ack)), rinfo.port, rinfo.address, () => {});
+        } catch {
+          // socket fechado — nada a fazer
+        }
+      }
+      return;
+    }
     if (!complete) return; // ainda faltam pedaços, ou envelope não reconhecido
 
     if (from) {
       const ack = { v: 1, sid: from, t: 'ack', mid: envelope.mid };
       if (rinfo) {
         socket.send(Buffer.from(JSON.stringify(ack)), rinfo.port, rinfo.address, () => {});
+      } else if (via === 'mqtt') {
+        if (mqttRelay) mqttRelay.publish(from, ack).catch(() => {});
       } else {
-        postNtfyMessage(from, ack).catch(() => {});
+        relayPublish(from, ack).catch(() => {});
       }
     }
 
@@ -515,8 +713,10 @@ async function startListener({ onMessage }) {
     } catch {
       return; // não é JSON válido (ex: ruído/scan) — ignora
     }
-    handleIncoming(envelope, rinfo);
+    handleIncoming(envelope, rinfo, 'udp');
   });
+
+  const mqttRelay = openMqttRelay(sessionId, (envelope) => handleIncoming(envelope, null, 'mqtt'));
 
   // A primeira conexão ntfy já foi aberta e confirmada acima
   // (initialNtfyStream), em paralelo com STUN/UPnP. Lê essa conexão, e só
@@ -530,7 +730,7 @@ async function startListener({ onMessage }) {
       if (stream) {
         lastNtfyActivity = Date.now();
         ntfyStreamOpen = true;
-        await readNtfyStream(stream, (data) => handleIncoming(data, null), () => {
+        await readNtfyStream(stream, (data) => handleIncoming(data, null, 'ntfy'), () => {
           lastNtfyActivity = Date.now();
         });
         ntfyStreamOpen = false;
@@ -554,7 +754,7 @@ async function startListener({ onMessage }) {
   // Última via que confirmou entrega pra cada destino — decide se o ntfy
   // espera o UDP tentar primeiro (ver NTFY_FALLBACK_DELAY_MS) ou já vai
   // direto, porque com esse destino o UDP não chega.
-  const lastAckVia = new Map(); // targetSessionId -> 'udp' | 'http-relay'
+  const lastAckVia = new Map(); // targetSessionId -> 'udp' | 'http-relay' | 'mqtt'
 
   // Manda `message` pro participante identificado por (targetSessionId,
   // targetCandidates) — divide em pedaços (ver UDP_CHUNK_SIZE/
@@ -567,7 +767,10 @@ async function startListener({ onMessage }) {
   function send(targetCandidates, targetSessionId, message, opts = {}) {
     const timeoutMs = opts.timeoutMs ?? 6000;
     const udpRetryIntervalMs = opts.udpRetryIntervalMs ?? 600;
-    const ntfyDelayMs = lastAckVia.get(targetSessionId) === 'http-relay' ? 0 : NTFY_FALLBACK_DELAY_MS;
+    // `urgent`: não dá pra esperar o UDP tentar primeiro (ex: aviso de saída,
+    // mandado logo antes do canal fechar).
+    const lastVia = lastAckVia.get(targetSessionId);
+    const ntfyDelayMs = opts.urgent || (lastVia && lastVia !== 'udp') ? 0 : NTFY_FALLBACK_DELAY_MS;
 
     const mid = crypto.randomBytes(6).toString('base64url');
     const json = JSON.stringify(message);
@@ -583,6 +786,7 @@ async function startListener({ onMessage }) {
       }));
     const udpEnvelopes = toEnvelopes(splitIntoChunks(json, UDP_CHUNK_SIZE));
     const ntfyEnvelopes = toEnvelopes(splitIntoChunks(json, NTFY_CHUNK_SIZE));
+    const mqttEnvelopes = toEnvelopes(splitIntoChunks(json, MQTT_CHUNK_SIZE));
 
     return new Promise((resolve) => {
       let done = false;
@@ -610,11 +814,23 @@ async function startListener({ onMessage }) {
       // taxa" vs "código não existe mais") em vez de um erro genérico só,
       // se o ack nunca chegar por nenhuma via.
       const ntfyResults = [];
-      ntfyTimer = setTimeout(() => {
+      // 'unused' | 'ok' | 'failed' | 'unavailable' — usado só no diagnóstico
+      let mqttOutcome = 'unused';
+      ntfyTimer = setTimeout(async () => {
         ntfyTimer = null;
-        Promise.all(
-          ntfyEnvelopes.map((env) => postNtfyMessage(targetSessionId, env).then((r) => ntfyResults.push(r)))
-        ).catch(() => {});
+        if (!ntfyLimited()) {
+          await Promise.all(
+            ntfyEnvelopes.map((env) => postNtfyMessage(targetSessionId, env).then((r) => ntfyResults.push(r)))
+          ).catch(() => {});
+          if (done || !ntfyLimited()) return; // o ntfy aceitou (ou falhou por outro motivo que não limite)
+        }
+        // O ntfy está no limite: manda pela reserva.
+        if (!mqttRelay) {
+          mqttOutcome = 'unavailable';
+          return;
+        }
+        const oks = await Promise.all(mqttEnvelopes.map((env) => mqttRelay.publish(targetSessionId, env)));
+        mqttOutcome = oks.every(Boolean) ? 'ok' : 'failed';
       }, ntfyDelayMs);
 
       // socket.send() LANÇA de verdade (não é uma Promise rejeitada) se o
@@ -642,7 +858,13 @@ async function startListener({ onMessage }) {
       sendUdpOnce();
       const udpRetryTimer = setInterval(sendUdpOnce, udpRetryIntervalMs);
       const giveUpTimer = setTimeout(
-        () => finish({ ok: false, via: null, ntfy: summarizeNtfyOutcome(ntfyResults) }),
+        () =>
+          finish({
+            ok: false,
+            via: null,
+            ntfy: ntfyResults.length === 0 && ntfyLimited() ? 'rate-limited' : summarizeNtfyOutcome(ntfyResults),
+            mqtt: mqttOutcome,
+          }),
         timeoutMs
       );
     });
@@ -657,6 +879,7 @@ async function startListener({ onMessage }) {
     // saber — reabre agora em vez de esperar o watchdog perceber.
     kick: () => {
       if (ntfyStreamOpen) streamAbort.abort();
+      if (mqttRelay) mqttRelay.reconnectIfDown();
     },
     stop: () => {
       stopped = true;
@@ -664,6 +887,7 @@ async function startListener({ onMessage }) {
       ntfyAbort.abort();
       socket.close();
       if (upnpResult) upnpResult.cleanup();
+      if (mqttRelay) mqttRelay.close();
       // Nenhum send() ainda em andamento vai conseguir confirmar depois
       // disso (o socket morreu) — encerra todos como falha na hora, em vez
       // de deixar cada um esperando pelo próprio timeout individual.

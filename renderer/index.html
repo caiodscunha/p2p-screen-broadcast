@@ -2,6 +2,12 @@
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8" />
+  <!-- Só roda o que vem do próprio app: nenhum script/estilo inline ou de
+       fora, nenhuma conexão de rede pela página (a sinalização passa pelo
+       processo principal via IPC; o WebRTC não é afetado por connect-src).
+       Miniaturas dos monitores chegam como data: URL. -->
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'none'; font-src 'self'; base-uri 'none'; form-action 'none'" />
   <title>Sinal P2P</title>
   <link rel="stylesheet" href="style.css" />
 </head>

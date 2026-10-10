@@ -41,4 +41,11 @@ contextBridge.exposeInMainWorld('api', {
   // própria tela, pra ele poder desabilitar o botão de minimizar da janela
   // enquanto isso — ver comentário em main.js sobre o bug de travamento.
   setSharingActive: (active) => ipcRenderer.send('sharing:active', active),
+
+  // Janela minimizada/escondida ou de volta (ver main.js).
+  onWindowVisible: (callback) => {
+    const listener = (event, visible) => callback(visible);
+    ipcRenderer.on('window:visible', listener);
+    return () => ipcRenderer.removeListener('window:visible', listener);
+  },
 });

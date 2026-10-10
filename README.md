@@ -106,7 +106,13 @@ generated instantly, no ICE gathering wait.
    steady, and goes back up once the network recovers. Audio goes out as
    stereo Opus at up to 128 kbps (WebRTC's default would be mono at
    32 kbps, fine for voice but noticeably worse for music and games).
-6. If a connection drops, the app reconnects on its own: first it looks for
+6. Once two participants are connected, everything else between them
+   (who is sharing, how each one is viewing the other's screen,
+   renegotiations, introducing newcomers, leaving) goes over a data channel
+   inside their own WebRTC connection, encrypted by it like the media. The
+   external signaling path (UDP, then the relays below) is only needed to
+   enter a room and to reconnect after a drop.
+7. If a connection drops, the app reconnects on its own: first it looks for
    a new network path on the same connection, then rebuilds the connection
    from scratch. Meanwhile that person's tile shows "Reconectando...", their
    status in the participants list says so, and a notice pops up in the
@@ -116,7 +122,7 @@ generated instantly, no ICE gathering wait.
    a banner says so and the app keeps trying to rejoin the room by itself
    for a few minutes, no new code needed.
 
-Two free, public, neutral third-party services are involved in setting up
+Free, public, neutral third-party services are involved in setting up
 connections, never in the actual video/audio, which always flows directly
 between peers over WebRTC:
 
@@ -125,22 +131,48 @@ between peers over WebRTC:
 - **[ntfy.sh](https://ntfy.sh)**, a free and open-source pub/sub-over-HTTP
   service (self-hostable, same code you could run yourself), used only as
   a best-effort relay for the small signaling messages described above
-  (room join, and the per-pair WebRTC offer/answer/ICE candidates). If
-  you'd rather this app never talk to it at all, it's only ever used
-  alongside direct UDP; either one failing just means the room can't form
-  that particular connection, everything else keeps working.
+  (room join, and the per-pair WebRTC offer/answer/ICE candidates). Those
+  messages are end-to-end encrypted (see below), so the relay only ever
+  sees ciphertext, and they're published with caching off, so ntfy.sh
+  doesn't keep them. It's only used when direct UDP doesn't confirm
+  delivery; either one failing just means the room can't form that
+  particular connection, everything else keeps working.
+- **EMQX's public MQTT broker** (`broker.emqx.io`, run by EMQ Technologies,
+  the company behind the open-source EMQX broker), as a backup for ntfy.sh:
+  messages are only sent through it when ntfy.sh refuses them because of
+  its limits (the daily quota or the per-minute request limit). The app
+  keeps a listening connection to it open (over TLS) so that someone whose
+  ntfy.sh quota ran out can still reach you. Like ntfy.sh, it only sees
+  routing ids and already-encrypted messages. It was picked after testing
+  the well-known public brokers: HiveMQ's refused connections and
+  Eclipse's sandbox didn't answer at the time, and test.mosquitto.org
+  describes itself as best-effort. It's a free service with no uptime
+  guarantee, which is why it's a backup and not the main path.
 
-### Code encryption (optional)
+### Encryption
 
-The room code is base64, not encryption by default: anyone who gets a copy
-of it can attempt to join, since it embeds your rendezvous IP/port in plain
-text. Both "Criar sala" and "Entrar em sala" have an optional passphrase
-field: if set, the code is encrypted with AES-GCM (key derived via PBKDF2,
-Web Crypto API, no dependencies) before being base64-encoded, and the same
-passphrase is required to decode it on the other end. This only adds real
-protection if the passphrase is agreed through a different channel than the
-one used to send the code (e.g. code over chat, passphrase said out loud on
-a call). Leaving the passphrase blank keeps the previous plain behavior.
+Video and audio are always encrypted by WebRTC itself (DTLS-SRTP). That
+protection relies on the signaling messages (which carry each side's DTLS
+fingerprint) not being tampered with, so the signaling is encrypted too:
+
+- **Signaling (always on)**: every room has a random 256-bit room key,
+  carried inside the room code. Every message between participants (offers
+  and answers with everyone's IP addresses and DTLS fingerprints, the
+  roster, names) is compressed and then encrypted and authenticated with it
+  (AES-GCM, Web Crypto API, no dependencies), bound to the sender's session.
+  Without the code, someone watching the network or the relay can't read
+  these messages, forge one, or replay a captured one: anything that doesn't
+  decrypt is dropped before it's processed. Codes from older versions
+  (without a room key) are refused with a message asking for a new code, so
+  everyone in a room needs the current version.
+- **The room code itself (optional passphrase)**: the code is plain base64
+  by default, so anyone who gets a copy can join (it's the invitation).
+  Both "Criar sala" and "Entrar em sala" have an optional passphrase field:
+  if set, the code is encrypted with AES-GCM (key derived via PBKDF2) before
+  being base64-encoded, and the same passphrase is required to decode it.
+  This only adds real protection if the passphrase is agreed through a
+  different channel than the one used to send the code (e.g. code over
+  chat, passphrase said out loud on a call).
 
 ### Per-app audio capture (Windows and Linux)
 
@@ -307,9 +339,13 @@ the app, on any machine that built or downloaded the Linux release.
   broadcasters. The same goes for encoding: every viewer gets their own
   encode of your screen. To keep that cheap, the app prefers H.264 on the
   GPU's hardware encoder (NVENC, Quick Sync, AMF, VideoToolbox), which also
-  lets viewers decode it on their GPU. A PC without a usable hardware
-  encoder falls back to VP8 in software, which gets CPU-heavy at 1080p and
-  above with several viewers.
+  lets viewers decode it on their GPU, and only sends each viewer what they
+  actually see: a viewer who has your stream as a small thumbnail (focused
+  on someone else) gets it at 180p and 15 fps, and a viewer who can't see
+  it at all (thumbnails hidden, or the app minimized) gets no video from
+  you until that changes, which stops your encoder for them (audio keeps
+  going). A PC without a usable hardware encoder falls back to VP8 in
+  software, which gets CPU-heavy at 1080p and above with several viewers.
 - **No native `getDisplayMedia` system-audio loopback on Linux**: that
   specific API is only supported by Chromium/Electron on Windows and macOS.
   Linux instead gets its own audio path: on a PipeWire session, per-app
@@ -333,10 +369,12 @@ yet:
   `https://ntfy.sh/v1/account`), plus a short-term request rate limit. Every
   piece of a signaling message counts, and the quota is shared by everyone
   behind the same public IP (CGNAT). To make it last, the app only uses the
-  relay when direct UDP doesn't confirm delivery, and keeps reconnection
-  attempts frugal. When the quota runs out, the relay answers HTTP 429 and
-  automatic signaling degrades to just the direct UDP path (still often
-  enough on its own); a failed join says when that's the reason.
+  relay when direct UDP doesn't confirm delivery, sends everything after
+  the first connection over the WebRTC data channel instead, and keeps
+  reconnection attempts frugal. When the quota runs out anyway, ntfy.sh
+  answers HTTP 429 and the app switches to the EMQX backup broker (see
+  [How it works](#how-it-works)) until ntfy.sh accepts messages again; a
+  failed join says which of them was the problem.
 - **Screen/audio capture is still rough on Linux**: unlike Windows/macOS,
   there's no single API Electron can rely on across distros: behavior
   varies by desktop environment and audio server. Per-app capture (see
@@ -345,7 +383,10 @@ yet:
   running plain PulseAudio (no PipeWire), it falls back to the older manual
   monitor-source selection, same as before this existed. Screen picking is
   also more likely to need manual fiddling or simply not work on some
-  setups.
+  setups. Since the move to Electron 44, the app runs as a native Wayland
+  app on Wayland sessions (Electron's default since version 38) instead of
+  through XWayland, which changes how screen capture works there; this
+  hasn't been tested on Linux yet.
 - **Minimizing while sharing could freeze the whole computer (fixed, but not
   a driver fix: the trigger is avoided instead)**: on some machines, mainly
   laptops with hybrid graphics (an Intel integrated GPU alongside a

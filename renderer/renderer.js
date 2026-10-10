@@ -1,4 +1,6 @@
-const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+// Dois hosts do mesmo serviço público de STUN (Google): se um não responder,
+// o endereço público ainda é descoberto pelo outro.
+const ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
 
 const SHARE_ICON_SVG =
   '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
@@ -121,6 +123,115 @@ function randomPeerId() {
   return bufToBase64(bytes.buffer).replace(/[+/=]/g, '');
 }
 
+// ---------- criptografia da sinalização ----------
+//
+// Toda mensagem trocada entre participantes — oferta/resposta (com os IPs
+// de cada um e a impressão digital DTLS que protege o vídeo/áudio), lista
+// da sala, nomes — vai cifrada e autenticada com a CHAVE DA SALA (AES-GCM,
+// 256 bits), que viaja dentro do código da sala. Antes isso ia em texto
+// puro pelo UDP e pelo ntfy.sh: dava pra ler (o ntfy guardava 12h, e o id
+// do tópico aparece aberto nos pacotes UDP) e, pior, pra INJETAR uma
+// resposta com outra impressão digital DTLS e ficar no meio do vídeo. Agora
+// quem não tem o código não lê nem forja nada; a senha opcional continua
+// protegendo o código em si (ver encode/decode).
+//
+// - A mensagem é compactada antes de cifrar (SDP compacta ~3x): menos
+//   pedaços, menos cota do ntfy gasta.
+// - O id de sessão de quem manda entra como dado autenticado (AAD): uma
+//   mensagem cifrada não vale se reaproveitada como vinda de outra pessoa.
+// - IVs já vistos são recusados: reenviar uma mensagem capturada (replay)
+//   não tem efeito.
+const SIGNAL_AAD_PREFIX = 'sinal-p2p/v2|';
+const MAX_SIGNAL_PLAINTEXT_BYTES = 256 * 1024;
+const MAX_SEEN_SIGNAL_IVS = 10000;
+let roomKey = null; // CryptoKey da sala atual
+let roomKeyB64 = null; // a mesma chave, pra embutir nos códigos de convite
+const seenSignalIvs = new Set();
+
+function newRoomKeyB64() {
+  return bufToBase64(crypto.getRandomValues(new Uint8Array(32)).buffer);
+}
+
+async function setRoomKey(b64) {
+  const bytes = base64ToBytes(b64);
+  if (bytes.length !== 32) throw new Error('chave da sala inválida');
+  roomKey = await crypto.subtle.importKey('raw', bytes, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  roomKeyB64 = b64;
+}
+
+function clearRoomKey() {
+  roomKey = null;
+  roomKeyB64 = null;
+  seenSignalIvs.clear();
+}
+
+async function deflateBytes(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// Com teto de tamanho: um "zip bomb" (poucos bytes que descompactam pra
+// gigabytes) de um participante mal-intencionado não esgota a memória.
+async function inflateBytes(bytes) {
+  const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw')).getReader();
+  const parts = [];
+  let total = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > MAX_SIGNAL_PLAINTEXT_BYTES) {
+      reader.cancel().catch(() => {});
+      throw new Error('mensagem grande demais');
+    }
+    parts.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+async function sealSignal(message, mySessionId) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const compressed = await deflateBytes(new TextEncoder().encode(JSON.stringify(message)));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(SIGNAL_AAD_PREFIX + mySessionId) },
+    roomKey,
+    compressed
+  );
+  const out = new Uint8Array(iv.length + ciphertext.byteLength);
+  out.set(iv, 0);
+  out.set(new Uint8Array(ciphertext), iv.length);
+  return { e: bufToBase64(out.buffer) };
+}
+
+// Devolve a mensagem original, ou null se não deu pra abrir (sem a chave da
+// sala, adulterada, de outra versão do app, repetida...).
+async function openSignal(sealed, fromSessionId) {
+  if (!roomKey || !sealed || typeof sealed.e !== 'string' || typeof fromSessionId !== 'string') return null;
+  const ivKey = sealed.e.slice(0, 16); // 16 caracteres de base64 = exatamente os 12 bytes do IV
+  if (seenSignalIvs.has(ivKey)) return null;
+  try {
+    const bytes = base64ToBytes(sealed.e);
+    if (bytes.length < 12 + 16) return null;
+    const plain = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: bytes.slice(0, 12), additionalData: new TextEncoder().encode(SIGNAL_AAD_PREFIX + fromSessionId) },
+      roomKey,
+      bytes.slice(12)
+    );
+    const message = JSON.parse(new TextDecoder().decode(await inflateBytes(new Uint8Array(plain))));
+    seenSignalIvs.add(ivKey);
+    if (seenSignalIvs.size > MAX_SEEN_SIGNAL_IVS) seenSignalIvs.delete(seenSignalIvs.values().next().value);
+    return message;
+  } catch {
+    return null;
+  }
+}
+
 // ---------- telas ----------
 
 const viewHome = document.getElementById('view-home');
@@ -227,10 +338,17 @@ btnJoinRoom.addEventListener('click', async () => {
     setHomeAlert(joinAlertEl, 'Código inválido: não parece ser um código de sala.');
     return;
   }
+  if (typeof decoded.k !== 'string') {
+    setHomeAlert(
+      joinAlertEl,
+      'Esse código é de uma versão antiga do Sinal P2P. Peça um código novo pra quem está na sala — todo mundo precisa estar na versão nova.'
+    );
+    return;
+  }
 
   setHomeBusy(btnJoinRoom, 'Entrando na sala...');
   try {
-    await enterRoom({ name, passphrase, hostSid: decoded.sid, hostCands: decoded.cands });
+    await enterRoom({ name, passphrase, hostSid: decoded.sid, hostCands: decoded.cands, roomKeyCode: decoded.k });
   } finally {
     setHomeBusy(btnJoinRoom, null);
   }
@@ -298,8 +416,14 @@ function setRoomStatus(text) {
 // `summarizeNtfyOutcome` lá) numa mensagem específica — em vez de um erro
 // genérico só, dá pra saber pelo front se o problema foi o relé ntfy.sh
 // (inalcançável ou limitando taxa) ou o código/sessão de destino em si.
-function joinFailureMessage(ntfyOutcome) {
-  switch (ntfyOutcome) {
+function joinFailureMessage(result) {
+  if (result.ntfy === 'rate-limited' && result.mqtt === 'ok') {
+    return 'Não consegui entrar — o ntfy.sh atingiu o limite e a mensagem foi pelo servidor reserva (MQTT), mas ninguém respondeu: código expirado ou a pessoa não está mais na sala.';
+  }
+  if (result.ntfy === 'rate-limited' && (result.mqtt === 'failed' || result.mqtt === 'unavailable')) {
+    return 'Não consegui entrar — o ntfy.sh atingiu o limite e o servidor reserva (MQTT) também não respondeu. Tente de novo mais tarde.';
+  }
+  switch (result.ntfy) {
     case 'unreachable':
       return 'Não consegui entrar — o servidor de retransmissão (ntfy.sh) está inacessível agora, provavelmente bloqueado temporariamente por excesso de uso. Tente de novo mais tarde.';
     case 'rate-limited':
@@ -313,7 +437,13 @@ function joinFailureMessage(ntfyOutcome) {
   }
 }
 
-async function enterRoom({ name, passphrase, hostSid, hostCands }) {
+async function enterRoom({ name, passphrase, hostSid, hostCands, roomKeyCode }) {
+  try {
+    await setRoomKey(hostSid ? roomKeyCode : newRoomKeyB64());
+  } catch {
+    setHomeAlert(joinAlertEl, 'Código inválido: a chave da sala está corrompida.');
+    return;
+  }
   myPeerId = randomPeerId();
   myName = name;
   myPassphrase = passphrase;
@@ -338,10 +468,12 @@ async function enterRoom({ name, passphrase, hostSid, hostCands }) {
     return;
   }
 
-  unsubscribeSignal = window.api.onSignalMessage(({ message, from }) => handleSignalMessage(message, from));
+  unsubscribeSignal = window.api.onSignalMessage(({ message, from }) => receiveSignal(message, from));
+
+  myFarewellSealed = await sealSignal({ t: 'peer-left', peerId: myPeerId }, myListener.sessionId);
 
   roomNameLabel.textContent = hostSid ? 'Sala' : `Sala de ${myName}`;
-  myInviteCodePromise = encode({ v: 1, sid: myListener.sessionId, cands: myListener.candidates }, myPassphrase);
+  myInviteCodePromise = encode({ v: 2, sid: myListener.sessionId, cands: myListener.candidates, k: roomKeyB64 }, myPassphrase);
 
   showRoomScreen();
   clearToasts();
@@ -364,19 +496,36 @@ async function enterRoom({ name, passphrase, hostSid, hostCands }) {
   if (hostSid) {
     setRoomStatus('Entrando na sala...');
     const joinMessage = { t: 'join', peerId: myPeerId, name: myName, sid: myListener.sessionId, cands: myListener.candidates };
-    const result = await window.api.sendSignalMessage({
-      mySessionId: myListener.sessionId,
-      candidates: hostCands,
-      targetSessionId: hostSid,
-      message: joinMessage,
-    });
+    const listener = myListener;
+    // Quem decide se deu certo é o "welcome" (ou alguém da sala conectar),
+    // não a confirmação de entrega do "join". Antes, se a confirmação se
+    // perdesse — mesmo com o "join" tendo chegado e a sala funcionando —,
+    // o app agendava a volta pra tela inicial; o "welcome" apagava a
+    // mensagem de erro mas não cancelava isso, e a pessoa era tirada da sala
+    // sem aviso nenhum ~10s depois de entrar.
+    let result = { ok: false, via: null };
+    for (let attempt = 0; attempt < JOIN_ATTEMPTS && !roomReady && myListener === listener; attempt++) {
+      result = await sendToPeer({ sid: hostSid, cands: hostCands }, joinMessage);
+      if (result.ok) break;
+    }
+    // Sem confirmação, o "join" ainda pode ter chegado: espera o "welcome"
+    // mais um pouco antes de desistir.
+    const deadline = Date.now() + JOIN_WELCOME_GRACE_MS;
+    while (!roomReady && myListener === listener && Date.now() < deadline && !result.ok) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (myListener !== listener) return; // saiu no meio
+    if (roomReady) {
+      setRoomStatus(''); // já entrou (welcome ou alguém conectou)
+      return;
+    }
     if (!result.ok) {
-      setRoomStatus(joinFailureMessage(result.ntfy) + ' Voltando ao início...');
+      setRoomStatus(joinFailureMessage(result) + ' Voltando ao início...');
       // Sem isso a pessoa ficava presa numa "sala" sozinha, sem ninguém
       // conectado, até clicar em "Sair da sala" por conta própria — agora
       // volta pra tela inicial sozinha depois de um tempo pra dar chance de
-      // ler a mensagem, a menos que ela já tenha saído manualmente antes
-      // (leaveRoom() cancela este timer).
+      // ler a mensagem. Cancelado se o "welcome" ainda chegar (markJoinedRoom)
+      // ou se a pessoa sair antes (leaveRoom).
       joinFailureAutoLeaveTimer = setTimeout(() => {
         joinFailureAutoLeaveTimer = null;
         leaveRoom();
@@ -385,6 +534,20 @@ async function enterRoom({ name, passphrase, hostSid, hostCands }) {
       setRoomStatus('');
     }
   }
+}
+
+const JOIN_ATTEMPTS = 2;
+const JOIN_WELCOME_GRACE_MS = 8000;
+
+// Prova de que estou na sala: chegou o "welcome" ou alguém conectou. Cancela
+// uma volta automática pra tela inicial agendada por uma confirmação perdida.
+function markJoinedRoom() {
+  if (joinFailureAutoLeaveTimer) {
+    clearTimeout(joinFailureAutoLeaveTimer);
+    joinFailureAutoLeaveTimer = null;
+    setRoomStatus('');
+  }
+  roomReady = true;
 }
 
 btnCopyRoomCode.addEventListener('click', async () => {
@@ -450,12 +613,33 @@ btnLeaveRoom.addEventListener('click', () => leaveRoom());
 // outros. Sem isso, pra eles parecia uma queda: "reconectando" por um
 // minuto até desistir. Melhor esforço: a primeira leva de UDP sai na hora,
 // antes do app terminar de fechar.
-window.addEventListener('beforeunload', () => {
-  if (!myListener) return;
+window.addEventListener('beforeunload', () => sendFarewell());
+
+// O aviso de saída ("peer-left") já fica cifrado desde a entrada na sala
+// (ver enterRoom): cifrar é assíncrono, e na hora de sair/fechar o app não
+// dá pra esperar — o canal de sinalização fecha logo em seguida. A mesma
+// mensagem cifrada serve pra todo mundo (cada um só a vê uma vez). `urgent`
+// manda pelo ntfy na hora, sem esperar o UDP tentar primeiro.
+let myFarewellSealed = null;
+
+function sendFarewell() {
+  if (!myListener || !myFarewellSealed) return;
+  const mySessionId = myListener.sessionId;
   roomPeers.forEach((peer) => {
-    sendToPeer(peer, { t: 'peer-left', peerId: myPeerId }).catch(() => {});
+    // Direto primeiro (chega na hora); o externo vai junto porque a conexão
+    // fecha logo em seguida e pode não dar tempo de o canal entregar.
+    sendDirect(peer, { t: 'peer-left', peerId: myPeerId });
+    window.api
+      .sendSignalMessage({
+        mySessionId,
+        candidates: peer.cands,
+        targetSessionId: peer.sid,
+        message: myFarewellSealed,
+        opts: { urgent: true },
+      })
+      .catch(() => {});
   });
-});
+}
 
 function leaveRoom() {
   if (joinFailureAutoLeaveTimer) {
@@ -463,9 +647,8 @@ function leaveRoom() {
     joinFailureAutoLeaveTimer = null;
   }
 
-  roomPeers.forEach((peer) => {
-    sendToPeer(peer, { t: 'peer-left', peerId: myPeerId }).catch(() => {});
-  });
+  sendFarewell();
+  myFarewellSealed = null;
   roomPeers.forEach((peer) => {
     clearTimeout(peer.recoveryTimer);
     clearTimeout(peer.localCandidateFlushTimer);
@@ -480,9 +663,14 @@ function leaveRoom() {
   roomReady = false;
 
   stopSharing();
+  clearRoomKey();
 
   if (myListener) {
-    window.api.stopSignalListener(myListener.sessionId);
+    // Fecha o canal só daqui a pouco: dá tempo do aviso de saída ser
+    // reenviado por UDP e confirmado (a página já voltou pro início; nada
+    // mais é processado daqui, ver unsubscribeSignal logo abaixo).
+    const sessionId = myListener.sessionId;
+    setTimeout(() => window.api.stopSignalListener(sessionId), 2000);
     myListener = null;
   }
   if (unsubscribeSignal) {
@@ -530,8 +718,34 @@ function leaveRoom() {
 // exatamente esse bug que fazia par específicos nunca conectarem (o
 // transporte confirma "entregue" assim que a mensagem é remontada, mesmo
 // que a aplicação não soubesse o que fazer com ela).
+// Mensagens que não abrem (sem a chave da sala, adulteradas, de uma versão
+// antiga do app) são descartadas antes de qualquer processamento. Avisa no
+// console uma vez por remetente, pra não inundar o log.
+const unreadableSignalSenders = new Set();
+
+async function receiveSignal(sealed, from) {
+  const message = await openSignal(sealed, from);
+  if (!message) {
+    if (!unreadableSignalSenders.has(from)) {
+      unreadableSignalSenders.add(from);
+      console.warn('[room] mensagem que não abre com a chave da sala descartada (versão antiga do app, código de outra sala ou adulterada), de', from);
+    }
+    return;
+  }
+  handleSignalMessage(message, from);
+}
+
 function handleSignalMessage(message, from) {
   if (!message || typeof message.t !== 'string') return;
+  // Quem manda não pode se passar por outro participante: o remetente
+  // declarado tem que bater com a sessão de onde a mensagem veio de fato
+  // (que, com a chave da sala, também é autenticada — ver openSignal).
+  if (message.sender && message.sender.sid !== from) return;
+  if (message.t === 'join' && message.sid !== from) return;
+  if (message.t === 'peer-left') {
+    const leaving = roomPeers.get(message.peerId);
+    if (leaving && leaving.sid !== from) return;
+  }
   // Quem saiu de propósito ("peer-left") não volta à vida por causa de uma
   // mensagem dele que ainda estava a caminho (as retentativas de UDP/ntfy
   // chegam atrasadas) — sem isso, reaparecia na lista "conectando" pra sempre.
@@ -564,6 +778,11 @@ function handleSignalMessage(message, from) {
       runSignalingTask(peer, () => handlePeerSignal(peer, message));
       break;
     }
+    case 'view': {
+      const peer = (senderId && roomPeers.get(senderId)) || findPeerBySid(from);
+      if (peer) applyRemoteView(peer, message);
+      break;
+    }
     case 'sharing': {
       if (message.sender) connectToPeer(message.sender);
       const peer = (senderId && roomPeers.get(senderId)) || findPeerBySid(from);
@@ -589,6 +808,10 @@ function applyRemoteSharing(peer, on, version) {
   }
   if (peer.sharing === on) return;
   peer.sharing = on;
+  // Quem começa a compartilhar parte de "todo mundo me vê em tela cheia"
+  // (ver confirmStartSharing); se não é o meu caso, renderGrid/renderFocus
+  // abaixo mandam o pedido certo (updateViewRequests).
+  if (on) peer.sentView = 'full';
   console.log('[room] status de compartilhamento de', peer.name, '->', on);
   renderGrid();
   renderParticipants();
@@ -685,7 +908,7 @@ function handleWelcome(message) {
   console.log('[room] recebi "welcome" com', message.roster.length, 'participante(s) já na sala');
   const wasRejoining = rejoinTimer !== null;
   message.roster.forEach((peerInfo) => connectToPeer(peerInfo));
-  roomReady = true;
+  markJoinedRoom();
   setRoomStatus('');
   if (wasRejoining) {
     stopRejoin();
@@ -702,19 +925,49 @@ function handlePeerLeft(peerId) {
   notify(`${peer.name} saiu da sala.`, 'info');
 }
 
-function sendToPeer(peer, message, opts) {
+// Conta por onde a sinalização está indo — só diagnóstico (console:
+// `signalStats`): direto pela conexão WebRTC ou pelo caminho externo
+// (UDP/ntfy/MQTT).
+const signalStats = { sentDirect: 0, sentExternal: 0, receivedDirect: 0 };
+
+// Depois que dois participantes conectam, tudo entre eles (quem está
+// compartilhando, como cada um vê a tela do outro, renegociações,
+// apresentações de quem chega, aviso de saída) vai pelo canal de dados da
+// própria conexão: direto, mais rápido e sem gastar a cota do ntfy.sh — o
+// caminho externo fica só pra entrar na sala e pra reconectar depois de uma
+// queda. Só usa o canal com a conexão de pé de verdade: durante uma queda
+// ele ainda pode dizer "aberto" sem entregar nada (é justamente quando as
+// mensagens de reconexão precisam do caminho externo).
+function sendDirect(peer, message) {
+  const channel = peer.signalChannel;
+  if (!channel || channel.readyState !== 'open') return false;
+  if (!peer.pc || peer.pc.connectionState !== 'connected' || peer.downSince !== null) return false;
+  try {
+    channel.send(JSON.stringify(message));
+  } catch {
+    return false;
+  }
+  signalStats.sentDirect++;
+  return true;
+}
+
+async function sendToPeer(peer, message, opts) {
+  if (sendDirect(peer, message)) return { ok: true, via: { source: 'datachannel' } };
   // `myListener` pode virar null no meio de um envio ainda em andamento (ex:
   // saiu da sala/fechou o app enquanto uma retentativa de sendToPeerReliable
   // ainda estava pendente) — sem essa checagem, isso derrubava a função com
   // "Cannot read properties of null (reading 'sessionId')" em vez de só
-  // desistir silenciosamente, algo que só o try/catch de quem chama não
-  // cobria porque a exceção vinha antes de qualquer Promise existir.
-  if (!myListener) return Promise.resolve({ ok: false, via: null });
+  // desistir silenciosamente.
+  if (!myListener || !roomKey) return { ok: false, via: null };
+  const mySessionId = myListener.sessionId;
+  const sealed = await sealSignal(message, mySessionId);
+  if (!myListener) return { ok: false, via: null }; // saiu enquanto cifrava
+  signalStats.sentExternal++;
   return window.api.sendSignalMessage({
-    mySessionId: myListener.sessionId,
+    mySessionId,
     candidates: peer.cands,
     targetSessionId: peer.sid,
-    message,
+    message: sealed,
     opts,
   });
 }
@@ -735,7 +988,7 @@ async function sendToPeerReliable(peer, message, { attempts = 3, opts } = {}) {
     if (result.ok) return result;
     console.warn(
       `[room] envio de "${message.t}" pra`, peer.name,
-      `falhou (tentativa ${i + 1}/${attempts}) — ntfy:`, result.ntfy || 'n/d'
+      `falhou (tentativa ${i + 1}/${attempts}) — ntfy:`, result.ntfy || 'n/d', '| mqtt:', result.mqtt || 'n/d'
     );
   }
   return result;
@@ -812,6 +1065,10 @@ function connectToPeer(peerInfo) {
     lastRestartAt: 0,
     lastScratchAt: 0,
     signalingQueue: Promise.resolve(),
+    encodingQueue: Promise.resolve(),
+    remoteView: 'full', // como ESSA pessoa está vendo a minha tela (ver applyRemoteView)
+    remoteViewVersion: 0,
+    sentView: 'full', // como eu disse pra ela que estou vendo a tela DELA
     pcEpoch: 0, // cresce a cada conexão nova minha com esse par (ver createPeerConnection)
     remotePcEpoch: 0, // a mais nova do outro lado que já vi — ofertas de conexões mais velhas são atrasadas
     sharing: false,
@@ -869,6 +1126,25 @@ function createPeerConnection(peer) {
     const audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv', streams: [peer.outgoingStream] });
     attachLocalTransceivers(peer, videoTransceiver, audioTransceiver);
   }
+
+  // Canal de dados pra sinalização DIRETA com esse par, depois de conectado
+  // (ver sendDirect). "negotiated" + id fixo: os dois lados criam o mesmo
+  // canal sozinhos, sem precisar combinar quem cria. Vai cifrado e
+  // autenticado pelo próprio DTLS da conexão (o mesmo que protege o
+  // vídeo), então não passa por sealSignal.
+  const signalChannel = pc.createDataChannel('sinal', { negotiated: true, id: 0 });
+  peer.signalChannel = signalChannel;
+  signalChannel.addEventListener('message', (event) => {
+    if (peer.pc !== pc || typeof event.data !== 'string') return;
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    signalStats.receivedDirect++;
+    handleSignalMessage(message, peer.sid);
+  });
 
   // Prefere o MediaStream que o próprio evento "track" já entrega
   // (`event.streams[0]`) — é o caminho "oficial"/testado do navegador, ao
@@ -1415,6 +1691,13 @@ function markPeerConnected(peer) {
   peer.recoveryAttempts = 0;
   peer.timeoutReason = null;
 
+  if (peer.sharing) {
+    peer.sentView = null; // força reenviar, mesmo que seja 'full'
+    updateViewRequests();
+  }
+
+  markJoinedRoom();
+
   if (!peer.everConnected) {
     peer.everConnected = true;
     if (peer.announceJoin) notify(`${peer.name} entrou na sala.`, 'info');
@@ -1710,6 +1993,25 @@ let localVideoFromDisplayMedia = false;
 // do mesmo jeito; ela só cai temporariamente quando a rede não aguenta.
 const SCREEN_CONTENT_HINT = 'motion';
 
+// A pré-visualização da própria tela (o seu card no grid) usa uma CÓPIA da
+// track de vídeo limitada a 24 quadros por segundo. Mostrar a captura
+// de 60 fps direto na própria janela custava ~20% de um núcleo no processo
+// de GPU (medido: 27,5% -> 7,8% ao pausar a pré-visualização) — só pra você
+// ver o que está compartilhando. Quem assiste continua recebendo a track
+// original, com todos os quadros.
+const SELF_PREVIEW_MAX_FPS = 24;
+let localPreviewStream = null;
+
+function refreshLocalPreview() {
+  if (localPreviewStream) localPreviewStream.getTracks().forEach((track) => track.stop());
+  localPreviewStream = null;
+  const videoTrack = localStream && localStream.getVideoTracks()[0];
+  if (!videoTrack) return;
+  const previewTrack = videoTrack.clone();
+  previewTrack.applyConstraints({ frameRate: { max: SELF_PREVIEW_MAX_FPS } }).catch(() => {});
+  localPreviewStream = new MediaStream([previewTrack]);
+}
+
 function displayMediaVideoConstraints() {
   const bounds = captureBounds(null);
   const fps = selectedFrameRate();
@@ -1720,16 +2022,102 @@ function displayMediaVideoConstraints() {
   };
 }
 
-function applyVideoEncodingToSender(sender) {
-  const params = sender.getParameters();
-  const limits = { maxBitrate: MAX_BITRATE_BY_RESOLUTION[selectedResolution()], maxFramerate: selectedFrameRate() };
-  if (params.encodings && params.encodings.length) {
-    params.encodings.forEach((encoding) => Object.assign(encoding, limits));
-  } else {
-    params.encodings = [limits];
-  }
-  sender.setParameters(params).catch(() => {});
+// ---------- economia por espectador ----------
+//
+// Na malha, cada pessoa assistindo tem o SEU encoder da minha tela —
+// medido: ~26% de um núcleo por espectador a 1080p60 (Electron 32). Quem
+// não está vendo minha tela de verdade não precisa disso: cada um avisa
+// como está me vendo e eu ajusto SÓ a conexão daquela pessoa:
+// - 'full': grid ou foco — qualidade escolhida no popover;
+// - 'thumb': miniatura na tira do foco (160x96 na tela) — 180p a 15 fps;
+// - 'off': não aparece (tira recolhida ou janela minimizada) —
+//   o encoder daquela conexão para. O ÁUDIO não muda em nenhum caso.
+const THUMB_VIEW_HEIGHT = 180;
+const THUMB_VIEW_MAX_FPS = 15;
+const THUMB_VIEW_MAX_BITRATE = 300_000;
+const VIEW_KINDS = ['full', 'thumb', 'off'];
+let myViewVersion = 0;
+
+function applyVideoEncodingToPeer(peer) {
+  const sender = peer.videoSender;
+  if (!sender) return;
+  // getParameters/setParameters em sequência: duas chamadas sobrepostas
+  // (ex: trocar a qualidade no popover enquanto chega um pedido de view)
+  // fazem a segunda falhar por usar parâmetros já vencidos.
+  peer.encodingQueue = peer.encodingQueue
+    .then(async () => {
+      if (peer.videoSender !== sender) return; // conexão recriada no meio
+      const params = sender.getParameters();
+      if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+      const encoding = params.encodings[0];
+      const view = peer.remoteView;
+      encoding.active = view !== 'off';
+      if (view === 'thumb') {
+        const videoTrack = localStream && localStream.getVideoTracks()[0];
+        const height = (videoTrack && videoTrack.getSettings().height) || selectedResolution();
+        encoding.scaleResolutionDownBy = Math.max(1, height / THUMB_VIEW_HEIGHT);
+        encoding.maxFramerate = Math.min(THUMB_VIEW_MAX_FPS, selectedFrameRate());
+        encoding.maxBitrate = THUMB_VIEW_MAX_BITRATE;
+      } else {
+        encoding.scaleResolutionDownBy = 1;
+        encoding.maxFramerate = selectedFrameRate();
+        encoding.maxBitrate = MAX_BITRATE_BY_RESOLUTION[selectedResolution()];
+      }
+      await sender.setParameters(params);
+    })
+    .catch((err) => console.warn('[room] não deu pra ajustar o vídeo enviado pra', peer.name, err));
 }
+
+// Lado de quem compartilha: a pessoa avisou como está me vendo. `forShare`
+// é a versão do MEU compartilhamento que ela conhecia: um pedido de um
+// compartilhamento anterior (ex: um 'off' de quando ela estava minimizada,
+// chegando atrasado depois de eu parar e começar de novo) não vale mais —
+// sem isso ela podia ficar sem vídeo com a janela aberta.
+function applyRemoteView(peer, message) {
+  if (!mySharing || !VIEW_KINDS.includes(message.view) || message.forShare !== mySharingVersion) return;
+  const version = Number(message.v) || 0;
+  if (version <= peer.remoteViewVersion) return; // mais velho que o último aplicado
+  peer.remoteViewVersion = version;
+  if (peer.remoteView === message.view) return;
+  peer.remoteView = message.view;
+  console.log('[room]', peer.name, 'está vendo minha tela como', message.view);
+  applyVideoEncodingToPeer(peer);
+}
+
+// Lado de quem assiste: como estou vendo a tela de `peer` agora.
+function desiredViewOf(peer) {
+  if (!windowVisible) return 'off';
+  if (focusedPeerId === null || focusedPeerId === peer.peerId) return 'full';
+  return focusStripCollapsed ? 'off' : 'thumb';
+}
+
+// Avisa quem está compartilhando sempre que muda como eu vejo a tela
+// deles. Barata de chamar à toa: só manda quando muda (sentView).
+function updateViewRequests() {
+  roomPeers.forEach((peer) => {
+    if (!peer.sharing) return;
+    const view = desiredViewOf(peer);
+    if (peer.sentView === view) return;
+    peer.sentView = view;
+    sendToPeerReliable(peer, {
+      t: 'view',
+      sender: myPeerInfo(),
+      view,
+      v: ++myViewVersion,
+      forShare: peer.sharingVersion,
+    }).catch(() => {});
+  });
+}
+
+// Janela minimizada: ninguém precisa me mandar vídeo enquanto isso (o
+// áudio continua). Vem do processo principal porque, com
+// backgroundThrottling desligado, a Page Visibility API diz "visible"
+// mesmo minimizada (testado).
+let windowVisible = true;
+window.api.onWindowVisible((visible) => {
+  windowVisible = visible;
+  updateViewRequests();
+});
 
 async function applyQualityInRoom() {
   if (!localStream || !mySharing) return; // nada compartilhando ainda; "Começar" já usa o que estiver escolhido
@@ -1742,9 +2130,7 @@ async function applyQualityInRoom() {
       alert('Não foi possível trocar a qualidade: ' + err.message);
       return;
     }
-    roomPeers.forEach((peer) => {
-      if (peer.videoSender) applyVideoEncodingToSender(peer.videoSender);
-    });
+    roomPeers.forEach((peer) => applyVideoEncodingToPeer(peer));
     return;
   }
 
@@ -2009,7 +2395,7 @@ async function applyLocalTracksToPeer(peer) {
   const audioTrack = localStream ? localStream.getAudioTracks()[0] || null : null;
 
   await peer.videoSender.replaceTrack(videoTrack).catch(() => {});
-  if (videoTrack) applyVideoEncodingToSender(peer.videoSender);
+  if (videoTrack) applyVideoEncodingToPeer(peer);
 
   await peer.audioSender.replaceTrack(audioTrack || getOrCreateSilentAudioTrack()).catch(() => {});
 }
@@ -2147,9 +2533,14 @@ async function confirmStartSharing() {
   localVideoFromDisplayMedia = useNativeDisplayMediaLoopback;
   localStream = new MediaStream([videoTrack, audioTrack]);
   videoTrack.addEventListener('ended', stopSharing);
+  refreshLocalPreview();
 
   mySharing = true;
   mySharingVersion++;
+  roomPeers.forEach((peer) => {
+    peer.remoteView = 'full';
+    peer.remoteViewVersion = 0;
+  });
   window.api.setSharingActive(true);
   // Só troca as tracks — sem renegociar. Com os transceivers negociados
   // direito (ver isOfferer), isso basta pros dois sentidos; a renegociação
@@ -2203,10 +2594,11 @@ async function replaceScreenVideoInRoom(errorPrefix) {
   roomPeers.forEach((peer) => {
     if (!peer.videoSender) return;
     peer.videoSender.replaceTrack(newTrack).catch(() => {});
-    applyVideoEncodingToSender(peer.videoSender);
+    applyVideoEncodingToPeer(peer);
   });
 
   localStream.getVideoTracks()[0].addEventListener('ended', stopSharing);
+  refreshLocalPreview();
   renderGrid();
   renderFocusIfShowing();
 }
@@ -2255,6 +2647,7 @@ function stopSharing() {
     localStream.getTracks().forEach((t) => t.stop());
     localStream = null;
   }
+  refreshLocalPreview();
   localVideoFromDisplayMedia = false;
   if (processAudioState) {
     processAudioState.cleanup();
@@ -2440,7 +2833,7 @@ function setPeerVolume(peer, v) {
 // 'unpin' pro card grande do foco (clicar volta pro grid).
 function updateMediaTile(container, item, pinMode) {
   const { video, name, volumeSlider, volumeBtn, pinIcon, reconnectingOverlay } = ensureMediaTile(container, item.kind === 'self');
-  const desiredStream = item.kind === 'self' ? localStream : item.peer.remoteStream || null;
+  const desiredStream = item.kind === 'self' ? localPreviewStream : item.peer.remoteStream || null;
   video.muted = item.kind === 'self';
   if (video.srcObject !== desiredStream) video.srcObject = desiredStream;
   name.textContent = item.name;
@@ -2520,6 +2913,7 @@ function renderGrid() {
     el.onclick = () => enterFocus(item.id);
     updateMediaTile(el, item, 'pin');
   });
+  updateViewRequests();
 }
 
 // Deixar de renderizar um lado (grid ou foco) só esconde o container por
@@ -2529,26 +2923,34 @@ function renderGrid() {
 // pra ouvir a mesma pessoa duas vezes (uma pelo card antigo, mudo pro
 // controle de volume; outra pelo novo) até sair e voltar do foco de novo.
 // O lado que vai ficar visível se corrige sozinho (`updateMediaTile` já
-// desmuta quando não é o próprio preview), então só precisa mutar quem
-// está saindo de cena.
-function muteAllVideosIn(elements) {
+// desmuta quando não é o próprio preview e dá play), então só precisa
+// cuidar de quem está saindo de cena.
+//
+// Além de mutar, PAUSA: um <video> escondido continua recebendo e
+// desenhando cada frame (medido: ~3,5% de um núcleo por vídeo 1080p60 só
+// pros cards do grid escondidos atrás do foco). Os pausados aqui são
+// sempre cópias mudas de quem já está tocando no lado visível — o áudio
+// da pessoa continua saindo por lá.
+function pauseAllVideosIn(elements) {
   for (const el of elements) {
     const video = el.querySelector('video');
-    if (video) video.muted = true;
+    if (!video) continue;
+    video.muted = true;
+    video.pause();
   }
 }
 
 function enterFocus(id) {
   focusedPeerId = id;
-  muteAllVideosIn(gridTileEls.values());
+  pauseAllVideosIn(gridTileEls.values());
   renderFocus();
 }
 
 function exitFocus() {
   focusedPeerId = null;
   focusViewEl.hidden = true;
-  muteAllVideosIn(focusStripTileEls.values());
-  muteAllVideosIn([focusMainEl]);
+  pauseAllVideosIn(focusStripTileEls.values());
+  pauseAllVideosIn([focusMainEl]);
   renderGrid();
 }
 
@@ -2573,6 +2975,7 @@ btnToggleFocusStrip.addEventListener('click', (event) => {
   // (ver .room-view.stage-zoomed.focus-strip-collapsed no CSS). Com a tira
   // visível ele já sobra bem acima da dock, sem precisar disso.
   viewRoom.classList.toggle('focus-strip-collapsed', focusStripCollapsed);
+  updateViewRequests();
 });
 
 function renderFocusIfShowing() {
@@ -2620,6 +3023,7 @@ function renderFocus() {
     el.onclick = () => enterFocus(item.id);
     updateMediaTile(el, item, 'pin');
   });
+  updateViewRequests();
 }
 
 const connectionStateLabels = {
