@@ -103,7 +103,11 @@ generated instantly, no ICE gathering wait.
    code to generate or exchange, and no code re-entry needed for people
    already in the room. When a connection's bandwidth drops, the stream
    temporarily lowers its resolution to keep the frame rate (and latency)
-   steady, and goes back up once the network recovers. Audio goes out as
+   steady, and goes back up once the network recovers. Each connection
+   starts out assuming 3 Mbps for video instead of WebRTC's default
+   300 kbps, so the first share after connecting already goes out at full
+   resolution instead of spending its first seconds blurry and downscaled
+   while the bandwidth estimate catches up. Audio goes out as
    stereo Opus at up to 128 kbps (WebRTC's default would be mono at
    32 kbps, fine for voice but noticeably worse for music and games).
 6. Once two participants are connected, everything else between them
