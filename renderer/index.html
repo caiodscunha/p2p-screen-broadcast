@@ -110,7 +110,12 @@
 
     <div class="room-body">
       <div class="room-stage">
+        <div id="connection-banner" class="connection-banner" role="status" hidden>
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="connection-banner-text"></span>
+        </div>
         <p id="room-status" class="hint room-status" hidden></p>
+        <div id="room-toasts" class="room-toasts" aria-live="polite"></div>
         <p id="grid-empty" class="grid-empty">Ninguém está compartilhando a tela ainda.</p>
         <div id="stream-grid" class="stream-grid"></div>
 

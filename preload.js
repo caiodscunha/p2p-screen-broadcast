@@ -28,6 +28,8 @@ contextBridge.exposeInMainWorld('api', {
   // conexões WebRTC entre todo mundo (ver protocolo em renderer.js).
   startSignalListener: () => ipcRenderer.invoke('signal:startListener'),
   stopSignalListener: (sessionId) => ipcRenderer.invoke('signal:stopListener', sessionId),
+  // A rede voltou: reabre a conexão do retransmissor (ver kick() em signal-punch.js).
+  kickSignalListener: (sessionId) => ipcRenderer.invoke('signal:kick', sessionId),
   sendSignalMessage: (info) => ipcRenderer.invoke('signal:send', info),
   onSignalMessage: (callback) => {
     const listener = (event, data) => callback(data);

@@ -9,7 +9,9 @@
 //    já resolvida, e mesmo assim UDP direto não chega entre dois PCs de
 //    verdade — provavelmente o próprio modem/operadora barrando).
 //
-// 2) Retransmissor HTTPS (ntfy.sh) como reforço, tentado em paralelo: os dois
+// 2) Retransmissor HTTPS (ntfy.sh) como reforço, tentado se o UDP não
+//    confirmar a entrega em pouco mais de 1s (ou direto, com quem o UDP já
+//    se mostrou não chegar — ver NTFY_FALLBACK_DELAY_MS): os dois
 //    lados só fazem requisições HTTPS de SAÍDA (publicar/consultar mensagens
 //    num "tópico" público e efêmero identificado pelo id de sessão) — nenhum
 //    dos dois precisa aceitar conexão nenhuma, então funciona atrás de
@@ -44,7 +46,29 @@ const NTFY_BASE = 'https://ntfy.sh';
 // desistir se não couber, TODA mensagem (grande ou pequena) é dividida em
 // pedaços pequenos e remontada do outro lado — funciona não importa o
 // tamanho real da mensagem nem o limite exato do transporte.
-const MESSAGE_CHUNK_SIZE = 2000;
+//
+// Cada via tem o seu tamanho de pedaço:
+// - UDP: abaixo de um pacote IP (~1472 bytes úteis). Os 2000 de antes viravam
+//   datagramas fragmentados em 2 pacotes IP, e muito NAT/CGNAT descarta
+//   fragmento — justamente entre redes diferentes, onde o UDP direto mais
+//   falhava.
+// - ntfy: o maior que cabe numa mensagem (limite de 4096 bytes, mesmo depois
+//   do JSON escapar aspas/barras), porque CADA pedaço publicado conta na
+//   cota diária do ntfy.sh — 250 mensagens por dia por IP no plano anônimo
+//   (conferido em https://ntfy.sh/v1/account), dividida por todo mundo atrás
+//   do mesmo IP (CGNAT).
+const UDP_CHUNK_SIZE = 1000;
+const NTFY_CHUNK_SIZE = 3000;
+// O ntfy só entra se o UDP não confirmar a entrega nesse tempo (ver send()).
+// Entre quem se alcança por UDP isso zera o uso da cota; pra quem depende do
+// ntfy, a espera some depois da primeira mensagem (lastAckVia).
+const NTFY_FALLBACK_DELAY_MS = 1200;
+// O ntfy manda uma linha de "keepalive" a cada 45s em toda conexão de
+// streaming aberta. Passar disso sem receber NADA quer dizer que a conexão
+// morreu sem avisar (ex: a internet caiu e voltou — o TCP antigo fica
+// pendurado pra sempre, sem erro nenhum), e as mensagens que chegarem pelo
+// ntfy nunca mais seriam lidas.
+const NTFY_STALL_MS = 70000;
 
 function splitIntoChunks(text, size) {
   if (text.length === 0) return [''];
@@ -89,10 +113,15 @@ function createMessageAssembler() {
     }
     if (delivered.has(envelope.mid)) return null;
 
-    let parts = partial.get(envelope.mid);
+    // UDP e ntfy picam a MESMA mensagem em tamanhos diferentes (ver
+    // UDP_CHUNK_SIZE/NTFY_CHUNK_SIZE), então os pedaços de cada via são
+    // montados separados (`n` diferente) — misturar daria lixo. A entrega
+    // continua sendo uma só por "mid": a via que completar primeiro ganha.
+    const key = `${envelope.mid}/${envelope.n}`;
+    let parts = partial.get(key);
     if (!parts) {
       parts = new Array(envelope.n).fill(null);
-      partial.set(envelope.mid, parts);
+      partial.set(key, parts);
       if (partial.size > MAX_PARTIAL) {
         partial.delete(partial.keys().next().value);
       }
@@ -100,7 +129,7 @@ function createMessageAssembler() {
     parts[envelope.i] = envelope.c;
     if (!parts.every((p) => p !== null)) return null;
 
-    partial.delete(envelope.mid);
+    partial.delete(key);
     delivered.add(envelope.mid);
     if (delivered.size > MAX_DELIVERED) {
       delivered.delete(delivered.values().next().value);
@@ -184,8 +213,10 @@ async function openNtfyStream(topic, signal) {
 
 // Lê o corpo de uma conexão já aberta (ver openNtfyStream), chamando
 // onMessage pra cada mensagem publicada nesse tópico enquanto a conexão
-// durar. Retorna quando a conexão fechar (sozinha ou abortada).
-async function readNtfyStream(res, onMessage) {
+// durar. Retorna quando a conexão fechar (sozinha ou abortada). `onActivity`
+// é chamado a cada pedaço de dado recebido, keepalive inclusive — é o sinal
+// de vida que o watchdog do startListener usa (ver NTFY_STALL_MS).
+async function readNtfyStream(res, onMessage, onActivity) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -193,6 +224,7 @@ async function readNtfyStream(res, onMessage) {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
+      onActivity();
       buffer += decoder.decode(value, { stream: true });
       let idx;
       while ((idx = buffer.indexOf('\n')) >= 0) {
@@ -404,6 +436,11 @@ async function startListener({ onMessage }) {
   // se perde).
   const sessionId = crypto.randomBytes(8).toString('base64url');
   const ntfyAbort = new AbortController();
+  // Um AbortController por conexão de streaming, além do geral (ntfyAbort,
+  // que encerra tudo no stop()): deixa derrubar SÓ a conexão atual pra
+  // reabrir uma nova — ver o watchdog e kick() abaixo.
+  let streamAbort = new AbortController();
+  const streamSignal = () => AbortSignal.any([ntfyAbort.signal, streamAbort.signal]);
 
   // STUN só descobre um endereço (sem garantir que o roteador deixa passar
   // um pacote não solicitado); UPnP configura o roteador ativamente pra
@@ -412,7 +449,7 @@ async function startListener({ onMessage }) {
   const [publicAddr, upnpResult, initialNtfyStream] = await Promise.all([
     discoverPublicAddress(socket),
     mapPublicPort(localPort),
-    openNtfyStream(sessionId, ntfyAbort.signal),
+    openNtfyStream(sessionId, streamSignal()),
   ]);
 
   if (publicAddr && !candidates.some((c) => c.ip === publicAddr.ip && c.port === publicAddr.port)) {
@@ -483,60 +520,89 @@ async function startListener({ onMessage }) {
 
   // A primeira conexão ntfy já foi aberta e confirmada acima
   // (initialNtfyStream), em paralelo com STUN/UPnP. Lê essa conexão, e só
-  // reconecta (nova chamada a openNtfyStream) se ela cair sozinha antes da
-  // sessão terminar.
+  // reconecta (nova chamada a openNtfyStream) se ela cair — sozinha, pelo
+  // watchdog (sem sinal de vida há NTFY_STALL_MS) ou por kick().
+  let lastNtfyActivity = Date.now();
+  let ntfyStreamOpen = false;
   (async () => {
     let stream = initialNtfyStream;
     while (!stopped) {
       if (stream) {
-        await readNtfyStream(stream, (data) => handleIncoming(data, null));
+        lastNtfyActivity = Date.now();
+        ntfyStreamOpen = true;
+        await readNtfyStream(stream, (data) => handleIncoming(data, null), () => {
+          lastNtfyActivity = Date.now();
+        });
+        ntfyStreamOpen = false;
         stream = null;
         if (stopped) break;
       }
       await new Promise((r) => setTimeout(r, 1000)); // pequena pausa antes de reconectar
       if (stopped) break;
-      stream = await openNtfyStream(sessionId, ntfyAbort.signal);
+      streamAbort = new AbortController();
+      stream = await openNtfyStream(sessionId, streamSignal());
     }
   })().catch(() => {});
 
+  const ntfyWatchdog = setInterval(() => {
+    if (ntfyStreamOpen && Date.now() - lastNtfyActivity > NTFY_STALL_MS) {
+      console.warn('[signal-punch] ntfy: stream sem sinal de vida há', Math.round((Date.now() - lastNtfyActivity) / 1000), 's — reabrindo');
+      streamAbort.abort();
+    }
+  }, 10000);
+
+  // Última via que confirmou entrega pra cada destino — decide se o ntfy
+  // espera o UDP tentar primeiro (ver NTFY_FALLBACK_DELAY_MS) ou já vai
+  // direto, porque com esse destino o UDP não chega.
+  const lastAckVia = new Map(); // targetSessionId -> 'udp' | 'http-relay'
+
   // Manda `message` pro participante identificado por (targetSessionId,
-  // targetCandidates) — divide em pedaços (ver MESSAGE_CHUNK_SIZE) e corre
-  // as duas vias: publica cada pedaço no ntfy UMA vez só (HTTP já garante
-  // entrega se o POST voltar sucesso — repetir isso à toa foi o que
-  // estourou o limite de taxa do ntfy.sh numa versão anterior deste
-  // arquivo), e reenvia por UDP periodicamente (que não tem confirmação
-  // embutida) até o destinatário confirmar com um ack — por qualquer via —
-  // ou estourar o tempo limite.
+  // targetCandidates) — divide em pedaços (ver UDP_CHUNK_SIZE/
+  // NTFY_CHUNK_SIZE) e corre as duas vias: reenvia por UDP periodicamente
+  // (que não tem confirmação embutida) até o destinatário confirmar com um
+  // ack — por qualquer via — ou estourar o tempo limite; e, se o UDP não
+  // confirmar logo, publica cada pedaço no ntfy UMA vez só (HTTP já garante
+  // entrega se o POST voltar sucesso — repetir isso à toa foi o que estourou
+  // o limite de taxa do ntfy.sh numa versão anterior deste arquivo).
   function send(targetCandidates, targetSessionId, message, opts = {}) {
     const timeoutMs = opts.timeoutMs ?? 6000;
     const udpRetryIntervalMs = opts.udpRetryIntervalMs ?? 600;
+    const ntfyDelayMs = lastAckVia.get(targetSessionId) === 'http-relay' ? 0 : NTFY_FALLBACK_DELAY_MS;
 
     const mid = crypto.randomBytes(6).toString('base64url');
-    const chunkStrings = splitIntoChunks(JSON.stringify(message), MESSAGE_CHUNK_SIZE);
-    const envelopes = chunkStrings.map((c, i) => ({
-      v: 1,
-      sid: targetSessionId,
-      from: sessionId,
-      mid,
-      i,
-      n: chunkStrings.length,
-      c,
-    }));
+    const json = JSON.stringify(message);
+    const toEnvelopes = (chunkStrings) =>
+      chunkStrings.map((c, i) => ({
+        v: 1,
+        sid: targetSessionId,
+        from: sessionId,
+        mid,
+        i,
+        n: chunkStrings.length,
+        c,
+      }));
+    const udpEnvelopes = toEnvelopes(splitIntoChunks(json, UDP_CHUNK_SIZE));
+    const ntfyEnvelopes = toEnvelopes(splitIntoChunks(json, NTFY_CHUNK_SIZE));
 
     return new Promise((resolve) => {
       let done = false;
+      let ntfyTimer = null;
       const finish = (result) => {
         if (done) return;
         done = true;
         clearInterval(udpRetryTimer);
         clearTimeout(giveUpTimer);
+        clearTimeout(ntfyTimer);
         pendingAcks.delete(mid);
         pendingSends.delete(finish);
         resolve(result);
       };
       pendingSends.add(finish);
 
-      pendingAcks.set(mid, (via) => finish({ ok: true, via }));
+      pendingAcks.set(mid, (via) => {
+        lastAckVia.set(targetSessionId, via.source);
+        finish({ ok: true, via });
+      });
 
       // Agrega o resultado de cada pedaço publicado no ntfy num diagnóstico
       // só (ver `summarizeNtfyOutcome`) — é o que deixa a UI (renderer.js)
@@ -544,9 +610,12 @@ async function startListener({ onMessage }) {
       // taxa" vs "código não existe mais") em vez de um erro genérico só,
       // se o ack nunca chegar por nenhuma via.
       const ntfyResults = [];
-      Promise.all(
-        envelopes.map((env) => postNtfyMessage(targetSessionId, env).then((r) => ntfyResults.push(r)))
-      ).catch(() => {});
+      ntfyTimer = setTimeout(() => {
+        ntfyTimer = null;
+        Promise.all(
+          ntfyEnvelopes.map((env) => postNtfyMessage(targetSessionId, env).then((r) => ntfyResults.push(r)))
+        ).catch(() => {});
+      }, ntfyDelayMs);
 
       // socket.send() LANÇA de verdade (não é uma Promise rejeitada) se o
       // socket já tiver sido fechado — pode acontecer se o app fechar ou a
@@ -557,7 +626,7 @@ async function startListener({ onMessage }) {
       // nenhuma pra capturá-la, então virava um "Uncaught Exception" fatal
       // no processo principal.
       const sendUdpOnce = () => {
-        envelopes.forEach((env) => {
+        udpEnvelopes.forEach((env) => {
           const payload = Buffer.from(JSON.stringify(env));
           (targetCandidates || []).forEach((c) => {
             try {
@@ -583,8 +652,15 @@ async function startListener({ onMessage }) {
     sessionId,
     candidates,
     send,
+    // A rede acabou de voltar (ver 'online' no renderer): a conexão de
+    // streaming do ntfy aberta antes da queda quase certamente está morta sem
+    // saber — reabre agora em vez de esperar o watchdog perceber.
+    kick: () => {
+      if (ntfyStreamOpen) streamAbort.abort();
+    },
     stop: () => {
       stopped = true;
+      clearInterval(ntfyWatchdog);
       ntfyAbort.abort();
       socket.close();
       if (upnpResult) upnpResult.cleanup();

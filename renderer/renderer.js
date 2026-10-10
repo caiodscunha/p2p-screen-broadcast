@@ -245,11 +245,25 @@ let myName = '';
 let myPassphrase = '';
 let myListener = null; // { sessionId, candidates }
 let unsubscribeSignal = null;
-let roomPeers = new Map(); // peerId -> { peerId, name, sid, cands, pc, videoSender, audioSender, remoteStream, sharing, connectionState }
+let roomPeers = new Map(); // peerId -> estado de cada participante (ver connectToPeer)
 let myInviteCodePromise = null;
+// true depois que já estou de fato na sala (criei, ou recebi o "welcome") —
+// quem aparecer a partir daí "entrou na sala" (ver announceJoin).
+let roomReady = false;
+// Quem saiu de propósito ("peer-left"): mensagens atrasadas deles não podem
+// trazê-los de volta (ver handleSignalMessage).
+const departedPeerIds = new Set();
+// Quem caiu por falta de conexão (não saiu): peerId -> {peerId, name, sid,
+// cands}. Se eu ficar sozinho, é pra eles que mando "join" pra tentar voltar
+// (ver maybeStartRejoin).
+const lostPeers = new Map();
 let focusedPeerId = null; // null | 'self' | peerId
 let focusStripCollapsed = false; // esconde a tira de miniaturas na view de foco (ver btnToggleFocusStrip)
 let mySharing = false;
+// Cresce a cada vez que começo/paro de compartilhar. Vai junto com o estado
+// (mensagem "sharing" e toda oferta/resposta) pra quem recebe descartar um
+// estado mais velho que chegue atrasado depois de um mais novo.
+let mySharingVersion = 0;
 let localStream = null;
 // Agenda a saída automática dessa "sala fantasma" (só você, ninguém
 // conectado) alguns segundos depois de um "Entrar" que falhou — ver o `if
@@ -306,6 +320,10 @@ async function enterRoom({ name, passphrase, hostSid, hostCands }) {
   mySharing = false;
   focusedPeerId = null;
   roomPeers = new Map();
+  roomReady = !hostSid;
+  departedPeerIds.clear();
+  lostPeers.clear();
+  rejoinGaveUp = false;
   localStream = null;
   // Limpa qualquer mensagem deixada por uma tentativa anterior (ex: "não
   // consegui entrar na sala" de um código antigo que falhou) — sem isso, ela
@@ -326,6 +344,8 @@ async function enterRoom({ name, passphrase, hostSid, hostCands }) {
   myInviteCodePromise = encode({ v: 1, sid: myListener.sessionId, cands: myListener.candidates }, myPassphrase);
 
   showRoomScreen();
+  clearToasts();
+  updateConnectionBanner();
   resetMediaTileRegistries();
   renderParticipants();
   renderGrid();
@@ -426,6 +446,17 @@ viewRoom.addEventListener('mouseleave', () => {
 
 btnLeaveRoom.addEventListener('click', () => leaveRoom());
 
+// Fechar o app (ou a janela) sem clicar em "Sair da sala" também avisa os
+// outros. Sem isso, pra eles parecia uma queda: "reconectando" por um
+// minuto até desistir. Melhor esforço: a primeira leva de UDP sai na hora,
+// antes do app terminar de fechar.
+window.addEventListener('beforeunload', () => {
+  if (!myListener) return;
+  roomPeers.forEach((peer) => {
+    sendToPeer(peer, { t: 'peer-left', peerId: myPeerId }).catch(() => {});
+  });
+});
+
 function leaveRoom() {
   if (joinFailureAutoLeaveTimer) {
     clearTimeout(joinFailureAutoLeaveTimer);
@@ -436,9 +467,17 @@ function leaveRoom() {
     sendToPeer(peer, { t: 'peer-left', peerId: myPeerId }).catch(() => {});
   });
   roomPeers.forEach((peer) => {
+    clearTimeout(peer.recoveryTimer);
+    clearTimeout(peer.localCandidateFlushTimer);
     if (peer.pc) peer.pc.close();
   });
   roomPeers.clear();
+  clearTimeout(rejoinTimer);
+  rejoinTimer = null;
+  rejoinGaveUp = false;
+  lostPeers.clear();
+  departedPeerIds.clear();
+  roomReady = false;
 
   stopSharing();
 
@@ -471,6 +510,8 @@ function leaveRoom() {
   // Sem isso, um aviso de erro de uma tentativa anterior à sala (que abriu
   // com sucesso depois) reaparecia do nada ao sair dela.
   clearHomeAlerts();
+  clearToasts();
+  updateConnectionBanner();
   showHomeScreen();
 }
 
@@ -491,6 +532,11 @@ function leaveRoom() {
 // que a aplicação não soubesse o que fazer com ela).
 function handleSignalMessage(message, from) {
   if (!message || typeof message.t !== 'string') return;
+  // Quem saiu de propósito ("peer-left") não volta à vida por causa de uma
+  // mensagem dele que ainda estava a caminho (as retentativas de UDP/ntfy
+  // chegam atrasadas) — sem isso, reaparecia na lista "conectando" pra sempre.
+  const senderId = message.sender && message.sender.peerId;
+  if (senderId && departedPeerIds.has(senderId)) return;
   switch (message.t) {
     case 'join':
       handleJoin(message);
@@ -502,53 +548,81 @@ function handleSignalMessage(message, from) {
       if (message.peer) connectToPeer(message.peer);
       break;
     case 'peer-left':
-      if (message.peerId) removePeer(message.peerId);
+      if (message.peerId) handlePeerLeft(message.peerId);
       break;
-    case 'offer': {
+    case 'offer':
+    case 'answer':
+    case 'ice-candidate':
+    case 'ice-candidates':
+    case 'restart-request': {
       if (message.sender) connectToPeer(message.sender);
-      const peer = findPeerBySid(from);
-      if (peer) handleOffer(peer, message.sdp);
-      else console.warn('[room] oferta recebida de peer desconhecido (sem sender embutido?)', from);
-      break;
-    }
-    case 'ice-candidate': {
-      if (message.sender) connectToPeer(message.sender);
-      const peer = findPeerBySid(from);
-      if (peer) handleIceCandidate(peer, message.candidate);
-      break;
-    }
-    // Lote de candidatos (ver o 'icecandidate' em setupPeerConnection) — o
-    // caso singular acima fica pra aceitar versões antigas do app.
-    case 'ice-candidates': {
-      if (message.sender) connectToPeer(message.sender);
-      const peer = findPeerBySid(from);
-      if (peer && Array.isArray(message.candidates)) {
-        message.candidates.forEach((candidate) => handleIceCandidate(peer, candidate));
+      const peer = (senderId && roomPeers.get(senderId)) || findPeerBySid(from);
+      if (!peer) {
+        console.warn(`[room] "${message.t}" recebido de peer desconhecido (sem sender embutido?)`, from);
+        break;
       }
-      break;
-    }
-    case 'answer': {
-      if (message.sender) connectToPeer(message.sender);
-      const peer = findPeerBySid(from);
-      if (peer) handleAnswer(peer, message.sdp);
-      else console.warn('[room] resposta recebida de peer desconhecido (sem sender embutido?)', from);
+      runSignalingTask(peer, () => handlePeerSignal(peer, message));
       break;
     }
     case 'sharing': {
       if (message.sender) connectToPeer(message.sender);
-      const peer = findPeerBySid(from);
+      const peer = (senderId && roomPeers.get(senderId)) || findPeerBySid(from);
       if (peer) {
-        peer.sharing = !!message.on;
-        console.log('[room] status de compartilhamento de', peer.name, '->', peer.sharing);
-        renderGrid();
-        renderParticipants();
-        renderFocusIfShowing();
+        applyRemoteSharing(peer, !!message.on, message.v);
       } else {
         console.warn('[room] "sharing" recebido de peer desconhecido (sem sender embutido?)', from);
       }
       break;
     }
   }
+}
+
+function sharingMessage() {
+  return { t: 'sharing', sender: myPeerInfo(), on: mySharing, v: mySharingVersion };
+}
+
+function applyRemoteSharing(peer, on, version) {
+  if (typeof on !== 'boolean') return;
+  if (typeof version === 'number') {
+    if (peer.sharingVersion !== null && version < peer.sharingVersion) return; // mais velho que o que já sei
+    peer.sharingVersion = version;
+  }
+  if (peer.sharing === on) return;
+  peer.sharing = on;
+  console.log('[room] status de compartilhamento de', peer.name, '->', on);
+  renderGrid();
+  renderParticipants();
+  renderFocusIfShowing();
+}
+
+function handlePeerSignal(peer, message) {
+  switch (message.t) {
+    case 'offer':
+      return handleOffer(peer, message);
+    case 'answer':
+      return handleAnswer(peer, message);
+    case 'ice-candidate': // formato antigo (um por mensagem), pra versões anteriores do app
+      return handleRemoteCandidates(peer, message, [message.candidate]);
+    case 'ice-candidates':
+      return handleRemoteCandidates(peer, message, message.candidates);
+    case 'restart-request':
+      return handleRestartRequest(peer, message);
+  }
+}
+
+// Tudo que mexe na negociação de UM par (aplicar oferta/resposta/
+// candidatos, criar oferta) roda numa fila, um de cada vez. Com UDP
+// reenviando e o ntfy correndo junto, a mesma mensagem (ou uma mais antiga)
+// pode chegar duas vezes quase juntas — processadas em paralelo, as duas
+// intercalavam setRemoteDescription/createAnswer e uma estragava a outra.
+// Nada aqui dentro espera o envio pela rede (isso leva segundos); só as
+// operações na RTCPeerConnection, que são rápidas.
+function runSignalingTask(peer, task) {
+  const run = () => (roomPeers.get(peer.peerId) === peer ? task() : undefined);
+  peer.signalingQueue = peer.signalingQueue
+    .then(run)
+    .catch((err) => console.error('[room] erro na negociação com', peer.name, err));
+  return peer.signalingQueue;
 }
 
 function findPeerBySid(sid) {
@@ -579,27 +653,53 @@ function myPeerInfo() {
 function handleJoin(message) {
   const peerInfo = { peerId: message.peerId, name: message.name || 'Participante', sid: message.sid, cands: message.cands };
   if (!peerInfo.peerId || !peerInfo.sid || !Array.isArray(peerInfo.cands)) return;
-  if (peerInfo.peerId === myPeerId || roomPeers.has(peerInfo.peerId)) return;
-  console.log('[room] recebi "join" de', peerInfo.name, '— apresentando pro resto da sala');
+  if (peerInfo.peerId === myPeerId || departedPeerIds.has(peerInfo.peerId) || !myListener) return;
 
-  const roster = [...roomPeers.values()].map(toPeerInfo);
-  roster.push({ peerId: myPeerId, name: myName, sid: myListener.sessionId, cands: myListener.candidates });
+  // Já conhecido: é alguém que perdeu a conexão com a sala inteira e está
+  // tentando voltar sozinho (ver attemptRejoin) — do lado dele, todo mundo
+  // foi removido, então a apresentação vai de novo, e a conexão antiga com
+  // ele (se ainda existir deste lado) não serve mais.
+  const known = roomPeers.get(peerInfo.peerId);
+  console.log('[room] recebi "join" de', peerInfo.name, known ? '(já conhecido — voltando pra sala)' : '— apresentando pro resto da sala');
 
-  connectToPeer(peerInfo);
-  const newPeer = roomPeers.get(peerInfo.peerId);
-  if (newPeer) sendToPeer(newPeer, { t: 'welcome', roster }).catch(() => {});
+  const roster = [...roomPeers.values()].filter((peer) => peer.peerId !== peerInfo.peerId).map(toPeerInfo);
+  roster.push(myPeerInfo());
+
+  if (!known) connectToPeer(peerInfo);
+  const joiningPeer = roomPeers.get(peerInfo.peerId);
+  if (joiningPeer) sendToPeer(joiningPeer, { t: 'welcome', roster }).catch(() => {});
 
   roomPeers.forEach((peer) => {
     if (peer.peerId === peerInfo.peerId) return;
     sendToPeer(peer, { t: 'peer-joined', peer: peerInfo }).catch(() => {});
   });
+
+  if (known) {
+    if (known.connectionState !== 'connected') requestReconnect(known, { full: true });
+    sendToPeerReliable(known, sharingMessage()).catch(() => {});
+  }
 }
 
 function handleWelcome(message) {
   if (!Array.isArray(message.roster)) return;
   console.log('[room] recebi "welcome" com', message.roster.length, 'participante(s) já na sala');
+  const wasRejoining = rejoinTimer !== null;
   message.roster.forEach((peerInfo) => connectToPeer(peerInfo));
+  roomReady = true;
   setRoomStatus('');
+  if (wasRejoining) {
+    stopRejoin();
+    notify('Você voltou pra sala.', 'success');
+  }
+}
+
+function handlePeerLeft(peerId) {
+  departedPeerIds.add(peerId);
+  lostPeers.delete(peerId);
+  const peer = roomPeers.get(peerId);
+  if (!peer) return;
+  removePeer(peerId);
+  notify(`${peer.name} saiu da sala.`, 'info');
 }
 
 function sendToPeer(peer, message, opts) {
@@ -620,18 +720,17 @@ function sendToPeer(peer, message, opts) {
 }
 
 // Uma tentativa de sendToPeer já é bem persistente por si só (reenvia por
-// UDP por ~6s e corre em paralelo com o retransmissor ntfy — ver
-// signal-punch.js), mas se as DUAS vias falharem nessa janela (rede
-// congestionada, o stream ntfy do outro lado reconectando bem nesse
-// instante etc.), a tentativa acaba e NINGUÉM tenta de novo — a oferta ou
-// resposta simplesmente se perde pra sempre e aquele par fica travado
-// (tela preta permanente, só resolvia saindo e entrando de novo). Pra
-// mensagens que realmente precisam chegar pra a conexão funcionar
-// (oferta/resposta), tenta de novo algumas vezes antes de desistir de
-// verdade.
+// UDP por ~6s e cai pro retransmissor ntfy — ver signal-punch.js), mas se as
+// DUAS vias falharem nessa janela (rede congestionada, o stream ntfy do
+// outro lado reconectando bem nesse instante etc.), a tentativa acaba e
+// NINGUÉM tenta de novo — a oferta ou resposta simplesmente se perde pra
+// sempre e aquele par fica travado. Pra mensagens que realmente precisam
+// chegar pra a conexão funcionar (oferta/resposta), tenta de novo algumas
+// vezes antes de desistir de verdade.
 async function sendToPeerReliable(peer, message, { attempts = 3, opts } = {}) {
   let result = { ok: false, via: null };
   for (let i = 0; i < attempts; i++) {
+    if (!roomPeers.has(peer.peerId)) break; // saiu/foi removido no meio
     result = await sendToPeer(peer, message, opts);
     if (result.ok) return result;
     console.warn(
@@ -644,8 +743,49 @@ async function sendToPeerReliable(peer, message, { attempts = 3, opts } = {}) {
 
 // ---------- malha de conexões WebRTC (uma RTCPeerConnection por par) ----------
 
+// Quem oferece em cada par é SEMPRE o mesmo lado: o de peerId
+// lexicograficamente menor. Ele é o único que cria os transceivers e o
+// único que manda ofertas (inclusive as de reconexão); o outro lado só
+// responde, usando os transceivers que a própria oferta criou.
+//
+// Isso não é preferência de estilo — era a causa da tela preta pra quem
+// entrava depois de alguém já estar compartilhando (e de toda a saga de
+// "tela preta" anterior). Antes, os DOIS lados chamavam addTransceiver.
+// Pela especificação (JSEP 5.10), ao aplicar a oferta remota o navegador só
+// reaproveita transceivers criados por addTrack — os de addTransceiver
+// ficam de fora, e ele cria transceivers NOVOS (recvonly) pra oferta.
+// Resultado, medido aqui: quem respondia ficava com 4 transceivers, e os 2
+// dele (onde a tela era colocada via replaceTrack) com mid=null, fora do
+// SDP — nunca transmitiam nada. Quem ofereceu ficava "sendonly", sem evento
+// "track", e o vídeo daquela pessoa ficava preto pra sempre (0 frames,
+// readyState=0). Quando alguém já transmitindo era quem respondia (o
+// recém-chegado tinha o peerId menor), a tela dele nunca chegava pro
+// recém-chegado. A "renegociação ao começar a compartilhar" de antes só
+// mascarava isso nos outros casos, criando m-lines extras pra esses
+// transceivers órfãos.
+function isOfferer(peer) {
+  return myPeerId < peer.peerId;
+}
+
+// Tempos do acompanhamento de cada conexão (ver beginRecovery/recoveryTick).
+// "disconnected" costuma voltar sozinho em 1-2s (perda curta de pacotes);
+// passou disso, reinicia o ICE (procura caminho de rede novo, mesma
+// conexão). Se nem assim voltar, recria a conexão do zero; e depois de um
+// minuto sem nada, desiste e avisa.
+const INITIAL_CONNECT_GRACE_MS = 15000;
+const RECOVERY_FIRST_CHECK_MS = 3000;
+const RECOVERY_RETRY_DELAYS_MS = [10000, 15000, 20000];
+const RECOVERY_FULL_RESTART_FROM_ATTEMPT = 3;
+const RECOVERY_GIVE_UP_MS = 60000;
+// Espera a descoberta de candidatos ICE (ou esse tempo) antes de mandar a
+// oferta/resposta, pra eles irem dentro do próprio SDP: uma mensagem só, em
+// vez do SDP mais 2-3 lotes de candidatos — cada mensagem gasta cota do ntfy
+// (ver signal-punch.js). Candidato que aparecer depois disso vai em lote.
+const ICE_GATHER_WAIT_MS = 1500;
+
 function connectToPeer(peerInfo) {
-  if (!peerInfo || peerInfo.peerId === myPeerId || roomPeers.has(peerInfo.peerId)) return;
+  if (!peerInfo || !peerInfo.peerId || peerInfo.peerId === myPeerId || roomPeers.has(peerInfo.peerId)) return;
+  if (departedPeerIds.has(peerInfo.peerId) || !peerInfo.sid || !Array.isArray(peerInfo.cands)) return;
   console.log('[room] conhecendo novo participante:', peerInfo.name, peerInfo.peerId);
   const peer = {
     peerId: peerInfo.peerId,
@@ -653,110 +793,91 @@ function connectToPeer(peerInfo) {
     sid: peerInfo.sid,
     cands: peerInfo.cands,
     pc: null,
+    pcId: null, // identidade da MINHA RTCPeerConnection atual com esse par
+    remotePcId: null, // identidade da conexão do OUTRO lado com quem a minha está pareada
     videoSender: null,
     audioSender: null,
+    outgoingStream: null,
     remoteStream: null,
     remoteStreamFromEvent: false,
     pendingIceCandidates: [],
     unsentLocalCandidates: [],
     gatheredLocalCandidates: [],
+    holdingLocalCandidates: false,
     localCandidateFlushTimer: null,
     remoteCandidatesReceived: 0,
-    makingOffer: false,
+    offerSeq: 0,
+    pendingOfferSeq: 0,
+    lastRemoteOfferSeq: 0,
+    lastRestartAt: 0,
+    lastScratchAt: 0,
+    signalingQueue: Promise.resolve(),
+    pcEpoch: 0, // cresce a cada conexão nova minha com esse par (ver createPeerConnection)
+    remotePcEpoch: 0, // a mais nova do outro lado que já vi — ofertas de conexões mais velhas são atrasadas
     sharing: false,
+    sharingVersion: null,
     volume: 1,
     volumeBeforeMute: 1,
     connectionState: 'new',
-    connectionTimedOut: false,
-    timeoutReason: null, // 'signaling' | 'ice' — ver o watchdog em setupPeerConnection
-    iceWatchdogTimer: null,
+    everConnected: false,
+    // "Fulano entrou na sala" só pra quem chega DEPOIS de mim — quem já
+    // estava lá quando entrei (o roster do welcome) não "entrou" agora, e
+    // quem está voltando de uma queda não é novidade.
+    announceJoin: roomReady && rejoinTimer === null && !lostPeers.has(peerInfo.peerId),
+    downSince: Date.now(), // desde quando está sem conexão (null = conectado)
+    reconnecting: false,
+    recoveryAttempts: 0,
+    recoveryTimer: null,
+    timeoutReason: null, // 'signaling' | 'ice' — só pra quem nunca chegou a conectar
   };
   roomPeers.set(peer.peerId, peer);
-  setupPeerConnection(peer);
+  lostPeers.delete(peer.peerId);
+  createPeerConnection(peer);
+  scheduleRecoveryTick(peer, INITIAL_CONNECT_GRACE_MS);
+  if (isOfferer(peer)) negotiate(peer);
+  if (mySharing) sendToPeerReliable(peer, sharingMessage()).catch(() => {});
   renderParticipants();
 }
 
-// A malha é formada uma vez, ao conhecer cada participante: toda conexão já
-// nasce com um sender de vídeo e um de áudio (o de áudio sempre com uma
-// track — real ou silenciosa, mesmo truque que já existia pro áudio no
-// fluxo 1:1). Começar/parar de compartilhar depois disso é só trocar o
-// conteúdo dessas tracks via replaceTrack, sem renegociar nada — é o que
-// faz a conexão continuar de pé na sala quando alguém para de transmitir.
-async function setupPeerConnection(peer) {
+function createPeerConnection(peer) {
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
   peer.pc = pc;
+  peer.pcId = randomPeerId();
+  peer.pcEpoch = Math.max(Date.now(), peer.pcEpoch + 1);
+  peer.remotePcId = null;
+  peer.offerSeq = 0;
+  peer.pendingOfferSeq = 0;
+  peer.lastRemoteOfferSeq = 0;
+  peer.videoSender = null;
+  peer.audioSender = null;
+  // Associa os transceivers a UM MediaStream próprio (mesmo sem track
+  // nenhuma ainda) — sem isso, o m-line negociado não carrega um "msid" de
+  // verdade, e o `event.streams` do lado de quem recebe chega vazio.
+  peer.outgoingStream = new MediaStream();
+  peer.remoteStream = null;
+  peer.remoteStreamFromEvent = false;
+  peer.pendingIceCandidates = [];
+  peer.unsentLocalCandidates = [];
+  peer.gatheredLocalCandidates = [];
+  peer.holdingLocalCandidates = false;
+  clearTimeout(peer.localCandidateFlushTimer);
+  peer.localCandidateFlushTimer = null;
+  peer.connectionState = 'new';
 
-  // Alguns pares nunca chegam a 'failed' sozinhos: o agente de ICE do
-  // Chromium pode ficar preso pra sempre sem avisar. Sem isso, a pessoa
-  // ficava "conectando" na lista de participantes indefinidamente, com a
-  // tela preta, sem feedback nenhum. Não fecha a conexão (ainda pode
-  // conectar de verdade, só devagar) — só avisa visualmente;
-  // `connectionstatechange` limpa isso se ela realmente conectar depois.
-  //
-  // O estado em que ficou preso diz ONDE está o problema, e são causas bem
-  // diferentes (a versão anterior culpava NAT nos dois casos, o que
-  // mandou uma investigação real pro lado errado — log de 2026-09-21 com
-  // `connectionState: new`):
-  // - 'new': o ICE nem começou a testar caminhos — oferta/resposta ou os
-  //   candidatos do outro lado nunca chegaram pela sinalização (UDP/ntfy).
-  //   Não tem nada a ver com NAT/TURN. Aqui dá pra tentar recuperar:
-  //   reenviar a oferta (se sou eu quem oferece) e todos os meus candidatos.
-  // - 'connecting' (ICE em 'checking'): os dois lados trocaram tudo e estão
-  //   testando caminhos, mas nenhum passa — aí sim é NAT estrito sem TURN.
-  peer.iceWatchdogTimer = setTimeout(() => {
-    if (pc.connectionState === 'connected') return;
-    const diag = {
-      connectionState: pc.connectionState,
-      iceConnectionState: pc.iceConnectionState,
-      signalingState: pc.signalingState,
-      temDescricaoRemota: !!pc.remoteDescription,
-      candidatosRemotosRecebidos: peer.remoteCandidatesReceived,
-      candidatosLocaisColetados: peer.gatheredLocalCandidates.length,
-    };
-    if (pc.connectionState === 'new') {
-      peer.timeoutReason = 'signaling';
-      console.warn(
-        '[room] conexão com', peer.name, 'não começou em 20s — a sinalização não completou',
-        '(oferta/resposta ou candidatos ICE não chegaram); NÃO é NAT. Tentando reenviar.', diag
-      );
-      if (!pc.remoteDescription && !isPolite(peer)) negotiate(peer);
-      if (peer.gatheredLocalCandidates.length) {
-        sendToPeerReliable(peer, { t: 'ice-candidates', sender: myPeerInfo(), candidates: peer.gatheredLocalCandidates }).catch(() => {});
-      }
-    } else {
-      peer.timeoutReason = 'ice';
-      console.warn(
-        '[room] conexão com', peer.name, 'não fechou em 20s — sinalização ok, mas nenhum caminho de rede',
-        'passou: provável NAT estrito sem TURN nessa combinação de redes', diag
-      );
-    }
-    peer.connectionTimedOut = true;
-    renderParticipants();
-  }, 20000);
-
-  // Associa os dois transceivers a UM MediaStream próprio (mesmo sem track
-  // nenhuma ainda) — sem isso, o m-line negociado não carrega um "msid"
-  // de verdade, e o `event.streams` do lado de quem recebe chega vazio.
-  // Confirmado num teste real: sem essa associação, o <video> ficava com
-  // `srcObject` atribuído certinho (mesmo id, sem erro nenhum) mas
-  // `readyState` nunca saía de 0 — só reproduzindo com o MediaStream
-  // "oficial" do evento "track" (em vez de um montado na mão via
-  // getReceivers) que passou a carregar de verdade.
-  const outgoingStream = new MediaStream();
-  const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv', streams: [outgoingStream] });
-  preferHardwareVideoCodec(videoTransceiver);
-  peer.videoSender = videoTransceiver.sender;
-  peer.audioSender = pc.addTransceiver('audio', { direction: 'sendrecv', streams: [outgoingStream] }).sender;
-  peer.audioSender.replaceTrack(getOrCreateSilentAudioTrack()).catch(() => {});
-
-  if (localStream) applyLocalTracksToPeer(peer);
+  if (isOfferer(peer)) {
+    const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv', streams: [peer.outgoingStream] });
+    const audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv', streams: [peer.outgoingStream] });
+    attachLocalTransceivers(peer, videoTransceiver, audioTransceiver);
+  }
 
   // Prefere o MediaStream que o próprio evento "track" já entrega
   // (`event.streams[0]`) — é o caminho "oficial"/testado do navegador, ao
   // contrário de montar um MediaStream na mão a partir de
   // `pc.getReceivers()` (ver `syncRemoteStreamFromReceivers`, mantida só
-  // como reforço pro caso raro de `event.streams` vir vazio mesmo assim).
+  // como reforço pro caso de `event.streams` vir vazio, ex: versão antiga do
+  // app do outro lado).
   pc.addEventListener('track', (event) => {
+    if (peer.pc !== pc) return;
     console.log(
       '[room] evento "track" (' + event.track.kind + ') de', peer.name,
       '— streams no evento:', event.streams.length
@@ -774,40 +895,30 @@ async function setupPeerConnection(peer) {
   });
 
   pc.addEventListener('connectionstatechange', () => {
+    if (peer.pc !== pc) return; // conexão antiga, já substituída (ver recreatePeerConnection)
     peer.connectionState = pc.connectionState;
     console.log('[room] conexão com', peer.name, '->', pc.connectionState);
     if (pc.connectionState === 'connected') {
-      clearTimeout(peer.iceWatchdogTimer);
-      peer.connectionTimedOut = false;
-      peer.timeoutReason = null;
-    } else if (pc.connectionState === 'connecting' && peer.connectionTimedOut) {
-      peer.timeoutReason = 'ice'; // a sinalização completou depois do aviso — agora é só rede
+      markPeerConnected(peer);
+      syncRemoteStreamFromReceivers(peer);
+    } else if (pc.connectionState === 'failed') {
+      // Antes isto removia a pessoa da sala na hora, em silêncio e pra
+      // sempre — uma queda de alguns segundos tirava alguém da chamada sem
+      // aviso nenhum e sem jeito de voltar. Agora tenta reconectar.
+      beginRecovery(peer, 0);
+    } else if (pc.connectionState === 'disconnected') {
+      beginRecovery(peer, RECOVERY_FIRST_CHECK_MS);
     }
-    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-      removePeer(peer.peerId);
-      return;
-    }
-    syncRemoteStreamFromReceivers(peer); // qualquer transição serve de gatilho; a função decide sozinha se há o que fazer
     renderParticipants();
+    updateConnectionBanner();
   });
 
-  // ICE incremental ("trickle"): os candidatos vão sendo mandados conforme
-  // são descobertos, em vez de esperar a descoberta inteira terminar pra só
-  // então mandar a oferta/resposta completa (como era antes). Ver
-  // `handleIceCandidate`/`flushPendingIceCandidates` do lado de quem recebe.
-  //
-  // A oferta/resposta sai ANTES de qualquer candidato existir, então ela
-  // própria não carrega nenhum — se NENHUMA mensagem de candidato chegar, o
-  // outro lado nunca tem com quem testar e a conexão fica em 'new' pra
-  // sempre. Era exatamente isso que acontecia: cada candidato ia numa
-  // mensagem separada, sem retentativa, numa rajada (um POST no ntfy.sh por
-  // candidato, mais o ack de volta de cada um — o tipo de rajada que já
-  // estourou o limite de taxa do ntfy.sh antes, ver signal-punch.js).
-  // Agora: agrupa os candidatos descobertos em ~300ms numa mensagem só, com
-  // retentativa, e ao fim da descoberta reenvia a lista COMPLETA mais uma
-  // vez — assim um lote perdido no meio do caminho não é fatal.
-  // Candidato repetido do outro lado é inofensivo (o navegador ignora).
+  // Descoberta de candidatos ICE. Os que aparecem enquanto a oferta/resposta
+  // ainda está esperando pra sair (holdingLocalCandidates, ver
+  // ICE_GATHER_WAIT_MS) já vão dentro do próprio SDP; os que aparecem
+  // depois vão em lote (~300ms), com retentativa.
   pc.addEventListener('icegatheringstatechange', () => {
+    if (peer.pc !== pc) return;
     if (pc.iceGatheringState === 'gathering') {
       // nova rodada de descoberta (ex: ICE restart) — candidatos antigos não servem mais
       peer.gatheredLocalCandidates = [];
@@ -815,36 +926,57 @@ async function setupPeerConnection(peer) {
     }
   });
   pc.addEventListener('icecandidate', (event) => {
-    if (event.candidate) {
-      const candidate = event.candidate.toJSON();
-      peer.gatheredLocalCandidates.push(candidate);
-      peer.unsentLocalCandidates.push(candidate);
-      if (!peer.localCandidateFlushTimer) {
-        peer.localCandidateFlushTimer = setTimeout(() => flushLocalCandidates(peer), 300);
-      }
-      return;
-    }
-    // null = descoberta terminou: o lote pendente vira redundante com a lista completa
-    clearTimeout(peer.localCandidateFlushTimer);
-    peer.localCandidateFlushTimer = null;
-    peer.unsentLocalCandidates = [];
-    if (peer.gatheredLocalCandidates.length) {
-      sendToPeerReliable(peer, { t: 'ice-candidates', sender: myPeerInfo(), candidates: peer.gatheredLocalCandidates }).catch(() => {});
+    if (peer.pc !== pc || !event.candidate) return;
+    const candidate = event.candidate.toJSON();
+    peer.gatheredLocalCandidates.push(candidate);
+    if (peer.holdingLocalCandidates) return;
+    peer.unsentLocalCandidates.push(candidate);
+    if (!peer.localCandidateFlushTimer) {
+      peer.localCandidateFlushTimer = setTimeout(() => flushLocalCandidates(peer), 300);
     }
   });
+}
 
-  // Desempate de quem manda a oferta inicial: o peerId lexicograficamente
-  // menor oferece, o outro espera — evita ofertas duplicadas quando os dois
-  // lados descobrem um ao outro ao mesmo tempo. Com ICE incremental não
-  // precisa mais esperar a descoberta de rede terminar antes de mandar — os
-  // candidatos vão chegando depois, um por um. Reaproveita `negotiate()`
-  // (mesma função usada pra renegociar depois, ver mais abaixo) pra manter
-  // o `makingOffer` corretamente marcado desde a primeiríssima oferta.
-  if (myPeerId < peer.peerId) {
-    negotiate(peer);
+// Liga os transceivers (criados pela minha oferta, ou adotados da oferta do
+// outro lado) às minhas tracks locais.
+function attachLocalTransceivers(peer, videoTransceiver, audioTransceiver) {
+  preferHardwareVideoCodec(videoTransceiver);
+  peer.videoSender = videoTransceiver.sender;
+  peer.audioSender = audioTransceiver.sender;
+  applyLocalTracksToPeer(peer);
+}
+
+// Lado que responde: usa os transceivers que a oferta acabou de criar
+// (recvonly por padrão) como os SEUS — passa pra sendrecv, associa o msid e
+// coloca as tracks locais neles. Precisa acontecer entre
+// setRemoteDescription e createAnswer pra resposta já sair com tudo isso.
+function adoptRemoteTransceivers(peer) {
+  if (peer.videoSender) return;
+  const transceivers = peer.pc.getTransceivers();
+  const video = transceivers.find((t) => t.mid !== null && t.receiver.track.kind === 'video');
+  const audio = transceivers.find((t) => t.mid !== null && t.receiver.track.kind === 'audio');
+  if (!video || !audio) throw new Error('oferta sem m-line de vídeo e áudio');
+  for (const transceiver of [video, audio]) {
+    transceiver.direction = 'sendrecv';
+    transceiver.sender.setStreams(peer.outgoingStream);
   }
+  attachLocalTransceivers(peer, video, audio);
+}
 
-  if (mySharing) sendToPeerReliable(peer, { t: 'sharing', sender: myPeerInfo(), on: true }).catch(() => {});
+function waitForIceGathering(pc, timeoutMs) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      pc.removeEventListener('icegatheringstatechange', onChange);
+      resolve();
+    };
+    const onChange = () => {
+      if (pc.iceGatheringState === 'complete') done();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    pc.addEventListener('icegatheringstatechange', onChange);
+  });
 }
 
 // Ordem de preferência do codec de vídeo: H.264 High primeiro, VP8 logo
@@ -862,15 +994,19 @@ async function setupPeerConnection(peer) {
 // Por que "High" (profile-level-id=64...) e não qualquer H.264: no Windows o
 // Chromium só manda pra placa de vídeo os perfis Baseline/Main/High; o
 // Constrained Baseline (42e01f, o H.264 "padrão" do WebRTC) vai pro
-// OpenH264 por software, que foi ainda pior que o VP8 (2 fps a 1080p). E o
-// High só aparece nas capacidades de ENVIO quando existe encoder de
-// hardware (o OpenH264 não faz High): cada lado escolhe sozinho o primeiro
-// codec da lista que ele consegue codificar, então quem não tem hardware
-// manda VP8 (o 2º da lista, nunca o OpenH264), mas continua recebendo
-// H.264 de quem tem — testado com uma instância rodando com
+// OpenH264 por software, que foi ainda pior que o VP8 (2 fps a 1080p).
+//
+// A lista sai das capacidades de RECEBIMENTO, não de envio: o High só
+// aparece nas de envio quando existe encoder de hardware, mas decodificar
+// todo mundo decodifica. Agora que quem responde também aplica a
+// preferência (nos transceivers adotados da oferta), montar pelas de envio
+// tiraria o High da resposta de quem não tem encoder de hardware — e aí
+// nem o outro lado, que tem, poderia mandar H.264 pra ele. Cada lado
+// codifica com o primeiro codec da lista que ele consegue: com hardware,
+// H.264 High; sem, pula pro VP8 (o 2º), nunca o OpenH264 — testado com
 // --disable-accelerated-video-encode.
 function preferHardwareVideoCodec(transceiver) {
-  const capabilities = RTCRtpSender.getCapabilities && RTCRtpSender.getCapabilities('video');
+  const capabilities = RTCRtpReceiver.getCapabilities && RTCRtpReceiver.getCapabilities('video');
   if (!capabilities || typeof transceiver.setCodecPreferences !== 'function') return;
   const fmtp = (codec) => codec.sdpFmtpLine || '';
   const isH264High = (codec) =>
@@ -887,21 +1023,12 @@ function preferHardwareVideoCodec(transceiver) {
   }
 }
 
-// Lê diretamente o que a RTCPeerConnection já está recebendo agora
-// (independente de o evento "track" ter disparado ou não). Só age UMA VEZ
-// por peer, pra sempre — nunca reconstrói depois disso.
-//
-// Isso não é preguiça: foi um bug real e sério. A versão anterior
-// reconstruía o MediaStream a cada 3s enquanto o <video> não desse sinal de
-// vida — mas atribuir um MediaStream NOVO a `srcObject` interrompe
-// qualquer carregamento em andamento ("play() request was interrupted by a
-// new load request", visto se repetindo pra sempre no console de um teste
-// real). Ou seja, o próprio reforço se sabotava: cada nova tentativa
-// cancelava a anterior antes dela ter qualquer chance de terminar de
-// carregar, num loop que nunca podia dar certo. A correção é confiar que
-// uma atribuição única e sem interrupção tem tempo de carregar de verdade
-// (é exatamente o que já funciona no `<video>` do próprio preview e no
-// caminho oficial via `event.streams[0]`) — nunca reatribuir de novo.
+// Reforço pro caso de o evento "track" vir sem `event.streams` (ex: versão
+// antiga do app do outro lado, sem msid): monta o MediaStream a partir do
+// que a RTCPeerConnection já está recebendo. Só age UMA VEZ por conexão —
+// reatribuir um MediaStream novo a `srcObject` interrompe o carregamento
+// do anterior, e uma versão antiga que refazia isso a cada 3s nunca deixava
+// o vídeo carregar.
 function syncRemoteStreamFromReceivers(peer) {
   if (!peer.pc || peer.remoteStreamFromEvent || peer.remoteStream) return;
   const videoReceiver = peer.pc.getReceivers().find((r) => r.track && r.track.kind === 'video');
@@ -916,88 +1043,151 @@ function syncRemoteStreamFromReceivers(peer) {
   renderFocusIfShowing();
 }
 
-// Quem NÃO era o ofertante original (peerId maior no desempate) cede em
-// caso de colisão de ofertas — convenção arbitrária mas precisa ser a MESMA
-// dos dois lados, e reaproveitar o mesmo desempate já usado pra decidir
-// quem oferece na conexão inicial mantém isso consistente.
-function isPolite(peer) {
-  return !(myPeerId < peer.peerId);
-}
-
-// Refaz a oferta numa conexão que já existe — usado quando alguém começa a
-// compartilhar (ver confirmStartSharing/applyLocalTracksToAllPeers). Só
-// trocar a track (replaceTrack) sobre a conexão original tecnicamente
-// deveria bastar, mas um teste real mostrou isso ficando instável de forma
-// não-determinística — a MESMA dupla de pessoas, no mesmo papel, funcionava
-// numa rodada de compartilhar e travava (tela presa em "nada carregado") na
-// próxima, sem nenhuma mudança de código entre uma e outra. Renegociar do
-// zero toda vez que alguém começa a compartilhar tem uma vantagem concreta:
-// quem está COMPARTILHANDO sempre manda a oferta dessa negociação, o que
-// deixa quem está ASSISTINDO sempre no papel de quem responde — o único
-// papel que se mostrou confiável em receber o evento "track" em todos os
-// testes até aqui.
-async function negotiate(peer) {
-  if (!peer.pc) return;
-  try {
-    peer.makingOffer = true;
-    const offer = await peer.pc.createOffer();
-    await peer.pc.setLocalDescription(offer);
-    console.log('[room] renegociando (nova oferta) com', peer.name);
-    const result = await sendToPeerReliable(peer, { t: 'offer', sender: myPeerInfo(), sdp: peer.pc.localDescription.toJSON() });
-    if (!result.ok) console.warn('[room] renegociação com', peer.name, 'não foi confirmada em nenhuma tentativa');
-  } catch (err) {
-    console.error('[room] falha ao renegociar com', peer.name, err);
-  } finally {
-    peer.makingOffer = false;
-  }
-}
-
-async function handleOffer(peer, sdp) {
-  if (!peer.pc) return;
-
-  // Colisão: os dois lados tentaram ofertar ao mesmo tempo (comum agora que
-  // qualquer um pode renegociar a qualquer momento, não só na conexão
-  // inicial). Quem é "educado" (ver isPolite) desfaz a própria oferta e
-  // aceita a do outro lado; quem não é, ignora a oferta alheia e segue com
-  // a própria — assim os dois lados sempre concordam em qual oferta vence.
-  const offerCollision = peer.makingOffer || peer.pc.signalingState !== 'stable';
-  if (offerCollision) {
-    if (!isPolite(peer)) {
-      console.log('[room] ignorando oferta de', peer.name, '— colisão, e não sou o lado que cede aqui');
-      return;
-    }
-    console.log('[room] colisão de ofertas com', peer.name, '— desfazendo minha oferta local pra aceitar a dele');
+// Cada oferta/resposta/lote de candidatos leva:
+// - pcId: a identidade da conexão de quem mandou;
+// - toPcId: a identidade da conexão do destinatário com quem ela está
+//   pareada (null = ainda nenhuma — oferta inicial de uma conexão nova);
+// - seq (oferta/resposta): número da oferta, crescente por conexão;
+// - pcEpoch (oferta): crescente a cada conexão nova de quem oferece — uma
+//   oferta de uma conexão já substituída que chegue atrasada (comum depois
+//   de uma queda: as retentativas ficam represadas e chegam todas juntas
+//   quando a rede volta) é ignorada, em vez de derrubar a conexão nova;
+// - sharing/sharingV: se quem mandou está compartilhando (ver
+//   applyRemoteSharing) — quem recriou a conexão do zero pode ter perdido
+//   isso, e uma reconexão sempre passa por oferta/resposta.
+// Com isso dá pra jogar fora o que chegar atrasado ou repetido (as
+// retentativas de UDP/ntfy entregam a mesma oferta 2x, às vezes depois de
+// uma mais nova — aplicar uma oferta velha depois de uma reconexão
+// derrubava a conexão de novo) e perceber quando um dos lados recriou a
+// conexão do zero e o outro ainda está na antiga (aí os dois recomeçam
+// juntos, em vez de ficarem conversando com conexões que não existem mais).
+function negotiate(peer, { iceRestart = false } = {}) {
+  if (!isOfferer(peer)) return Promise.resolve();
+  return runSignalingTask(peer, async () => {
+    const pc = peer.pc;
+    if (!pc || pc.signalingState === 'closed') return;
+    const seq = ++peer.offerSeq;
+    let message;
+    peer.holdingLocalCandidates = true;
     try {
-      await peer.pc.setLocalDescription({ type: 'rollback' });
-    } catch (err) {
-      console.error('[room] falha ao desfazer oferta local pra', peer.name, err);
+      await pc.setLocalDescription(await pc.createOffer(iceRestart ? { iceRestart: true } : undefined));
+      peer.pendingOfferSeq = seq;
+      await waitForIceGathering(pc, ICE_GATHER_WAIT_MS);
+      if (peer.pc !== pc) return;
+      message = {
+        t: 'offer',
+        sender: myPeerInfo(),
+        sdp: pc.localDescription.toJSON(),
+        pcId: peer.pcId,
+        toPcId: peer.remotePcId,
+        seq,
+        pcEpoch: peer.pcEpoch,
+        sharing: mySharing,
+        sharingV: mySharingVersion,
+      };
+    } finally {
+      if (peer.pc === pc) peer.holdingLocalCandidates = false;
+    }
+    console.log(`[room] mandando oferta${iceRestart ? ' (reinício de ICE)' : ''} pra`, peer.name, `#${seq}`);
+    // Reconectando, o próprio ciclo de recoveryTick já repete — 3
+    // tentativas por oferta aqui só multiplicavam mensagens pro ntfy
+    // enquanto o outro lado nem está alcançável (estourou o limite num teste).
+    sendToPeerReliable(peer, message, { attempts: peer.reconnecting ? 1 : 3 }).then((result) => {
+      if (!result.ok) console.warn('[room] oferta pra', peer.name, 'não foi confirmada em nenhuma tentativa');
+    });
+  });
+}
+
+async function handleOffer(peer, message) {
+  const fromPcId = message.pcId || null; // null = versão antiga do app, sem esses campos
+  const toPcId = message.toPcId || null;
+  const seq = Number(message.seq) || 0;
+  const epoch = Number(message.pcEpoch) || 0;
+
+  if (fromPcId) {
+    if (epoch && epoch < peer.remotePcEpoch) return; // de uma conexão dele já substituída, chegando atrasada
+    if (toPcId && toPcId !== peer.pcId) {
+      // O outro lado está renegociando com uma conexão minha que não existe
+      // mais (eu recriei a minha). Pede pra ele recomeçar do zero também.
+      console.log('[room] oferta de', peer.name, 'era pra uma conexão minha antiga — pedindo pra recomeçar do zero');
+      sendToPeerReliable(peer, { t: 'restart-request', sender: myPeerInfo(), pcId: peer.pcId, toPcId: fromPcId, full: true }, { attempts: 1 }).catch(() => {});
       return;
+    }
+    if (peer.remotePcId && peer.remotePcId !== fromPcId) {
+      if (toPcId) return; // de uma conexão dele mais antiga, que já foi substituída
+      // Oferta inicial de uma conexão NOVA do outro lado (ele recomeçou do
+      // zero): a minha, pareada com a antiga dele, não serve mais.
+      console.log('[room]', peer.name, 'recomeçou a conexão do zero — recriando a minha também');
+      recreatePeerConnection(peer);
+    } else if (peer.remotePcId === fromPcId && seq <= peer.lastRemoteOfferSeq) {
+      return; // oferta repetida ou atrasada — já respondi essa (ou uma mais nova)
     }
   }
 
-  try {
-    await peer.pc.setRemoteDescription(sdp);
-    await flushPendingIceCandidates(peer);
-    const answer = await peer.pc.createAnswer();
-    await peer.pc.setLocalDescription(answer);
-    console.log('[room] enviando resposta pra', peer.name);
-    const result = await sendToPeerReliable(peer, { t: 'answer', sender: myPeerInfo(), sdp: peer.pc.localDescription.toJSON() });
-    if (!result.ok) console.warn('[room] resposta pra', peer.name, 'não foi confirmada em nenhuma tentativa');
-  } catch (err) {
-    console.error('[room] falha ao responder oferta de', peer.name, err);
+  const pc = peer.pc;
+  if (pc.signalingState === 'have-local-offer') {
+    // Só acontece com uma versão antiga do app do outro lado, que ainda
+    // renegocia dos dois lados: quem oferece aqui (eu) ignora a dele.
+    console.log('[room] ignorando oferta de', peer.name, '— colisão com a minha');
+    return;
   }
+
+  await pc.setRemoteDescription(message.sdp);
+  if (fromPcId) {
+    peer.remotePcId = fromPcId;
+    peer.lastRemoteOfferSeq = seq;
+    peer.remotePcEpoch = Math.max(peer.remotePcEpoch, epoch);
+  }
+  applyRemoteSharing(peer, message.sharing, message.sharingV);
+  adoptRemoteTransceivers(peer);
+  await flushPendingIceCandidates(peer);
+  let answer;
+  peer.holdingLocalCandidates = true;
+  try {
+    await pc.setLocalDescription(await pc.createAnswer());
+    await waitForIceGathering(pc, ICE_GATHER_WAIT_MS);
+    if (peer.pc !== pc) return;
+    answer = {
+      t: 'answer',
+      sender: myPeerInfo(),
+      sdp: pc.localDescription.toJSON(),
+      pcId: peer.pcId,
+      toPcId: fromPcId,
+      seq,
+      sharing: mySharing,
+      sharingV: mySharingVersion,
+    };
+  } finally {
+    if (peer.pc === pc) peer.holdingLocalCandidates = false;
+  }
+  console.log('[room] mandando resposta pra', peer.name, `#${seq}`);
+  sendToPeerReliable(peer, answer, { attempts: peer.reconnecting ? 1 : 3 }).then((result) => {
+    if (!result.ok) console.warn('[room] resposta pra', peer.name, 'não foi confirmada em nenhuma tentativa');
+  });
 }
 
-async function handleAnswer(peer, sdp) {
-  if (!peer.pc) return;
-  try {
-    console.log('[room] recebi resposta de', peer.name, '— aplicando');
-    await peer.pc.setRemoteDescription(sdp);
-    await flushPendingIceCandidates(peer);
-    syncRemoteStreamFromReceivers(peer);
-  } catch (err) {
-    console.error('[room] falha ao aplicar resposta de', peer.name, err);
+async function handleAnswer(peer, message) {
+  const pc = peer.pc;
+  const fromPcId = message.pcId || null;
+  const toPcId = message.toPcId || null;
+  const seq = Number(message.seq) || 0;
+
+  if (toPcId && toPcId !== peer.pcId) return; // resposta pra uma conexão minha que já foi substituída
+  if (pc.signalingState !== 'have-local-offer') return; // repetida/atrasada — já aplicada
+  if (seq && seq !== peer.pendingOfferSeq) return; // responde uma oferta minha mais antiga
+  if (fromPcId && peer.remotePcId && fromPcId !== peer.remotePcId) {
+    // O outro lado respondeu com uma conexão NOVA (outra identidade DTLS) —
+    // não dá pra aplicar na minha, pareada com a antiga. Recomeça do zero.
+    console.log('[room] resposta de', peer.name, 'veio de uma conexão nova dele — recomeçando do zero');
+    restartFromScratch(peer);
+    return;
   }
+
+  console.log('[room] recebi resposta de', peer.name, `#${seq} — aplicando`);
+  await pc.setRemoteDescription(message.sdp);
+  if (fromPcId) peer.remotePcId = fromPcId;
+  applyRemoteSharing(peer, message.sharing, message.sharingV);
+  await flushPendingIceCandidates(peer);
 }
 
 // Candidatos ICE do outro lado podem chegar (via nosso canal de
@@ -1005,19 +1195,33 @@ async function handleAnswer(peer, sdp) {
 // oferta/resposta dele — `addIceCandidate` exige que `remoteDescription` já
 // exista, então guarda numa fila e aplica assim que ela for setada (ver
 // `flushPendingIceCandidates`, chamada logo depois de cada
-// `setRemoteDescription` acima).
-async function handleIceCandidate(peer, candidate) {
-  if (!peer.pc || !candidate) return;
-  peer.remoteCandidatesReceived++;
-  if (!peer.pc.remoteDescription) {
-    peer.pendingIceCandidates = peer.pendingIceCandidates || [];
-    peer.pendingIceCandidates.push(candidate);
-    return;
-  }
-  try {
-    await peer.pc.addIceCandidate(candidate);
-  } catch (err) {
-    console.warn('[room] falha ao aplicar candidato ICE de', peer.name, err);
+// `setRemoteDescription`). O mesmo vale pros de um reinício de ICE que
+// chegam antes da oferta de reinício (outra "ufrag", que a descrição atual
+// ainda não conhece).
+async function handleRemoteCandidates(peer, message, candidates) {
+  if (!Array.isArray(candidates)) return;
+  const fromPcId = message.pcId || null;
+  const toPcId = message.toPcId || null;
+  if (toPcId && toPcId !== peer.pcId) return; // pra uma conexão minha que já foi substituída
+  if (fromPcId && peer.remotePcId && fromPcId !== peer.remotePcId) return; // de uma conexão antiga dele
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    peer.remoteCandidatesReceived++;
+    if (!peer.pc.remoteDescription || (fromPcId && !peer.remotePcId)) {
+      peer.pendingIceCandidates.push({ candidate, pcId: fromPcId });
+      continue;
+    }
+    try {
+      await peer.pc.addIceCandidate(candidate);
+    } catch (err) {
+      const ufrag = candidate.usernameFragment;
+      if (ufrag && !peer.pc.remoteDescription.sdp.includes('a=ice-ufrag:' + ufrag)) {
+        peer.pendingIceCandidates.push({ candidate, pcId: fromPcId });
+      } else {
+        console.warn('[room] falha ao aplicar candidato ICE de', peer.name, err);
+      }
+    }
   }
 }
 
@@ -1026,14 +1230,19 @@ function flushLocalCandidates(peer) {
   if (!peer.unsentLocalCandidates.length) return;
   const candidates = peer.unsentLocalCandidates;
   peer.unsentLocalCandidates = [];
-  sendToPeerReliable(peer, { t: 'ice-candidates', sender: myPeerInfo(), candidates }).catch(() => {});
+  sendToPeerReliable(
+    peer,
+    { t: 'ice-candidates', sender: myPeerInfo(), candidates, pcId: peer.pcId, toPcId: peer.remotePcId },
+    { attempts: peer.reconnecting ? 1 : 3 }
+  ).catch(() => {});
 }
 
 async function flushPendingIceCandidates(peer) {
-  if (!peer.pendingIceCandidates || !peer.pendingIceCandidates.length) return;
-  const candidates = peer.pendingIceCandidates;
+  if (!peer.pendingIceCandidates.length) return;
+  const pending = peer.pendingIceCandidates;
   peer.pendingIceCandidates = [];
-  for (const candidate of candidates) {
+  for (const { candidate, pcId } of pending) {
+    if (pcId && peer.remotePcId && pcId !== peer.remotePcId) continue; // de uma conexão antiga dele
     try {
       await peer.pc.addIceCandidate(candidate);
     } catch (err) {
@@ -1042,10 +1251,176 @@ async function flushPendingIceCandidates(peer) {
   }
 }
 
+// ---------- queda e reconexão ----------
+
+// Quem oferece recebe isto de quem responde quando o lado que responde
+// percebeu a queda (ou a falta de conexão) — só quem oferece reinicia.
+function handleRestartRequest(peer, message) {
+  if (!isOfferer(peer)) return;
+  const toPcId = message.toPcId || null;
+  if (toPcId && toPcId !== peer.pcId) return; // fala de uma conexão minha antiga; a atual já é um recomeço
+  if (message.full) {
+    restartFromScratch(peer);
+  } else if (Date.now() - peer.lastRestartAt >= 5000) {
+    peer.lastRestartAt = Date.now();
+    // Sem resposta ainda nessa conexão: a oferta se perdeu — manda de novo.
+    negotiate(peer, { iceRestart: !!peer.pc.remoteDescription });
+  }
+}
+
+// Pede uma reconexão: quem oferece faz direto; quem responde pede pra quem
+// oferece (uma mensagem só, sem retentativa — o próximo ciclo de
+// recoveryTick manda de novo se precisar).
+function requestReconnect(peer, { full }) {
+  if (isOfferer(peer)) {
+    if (full) {
+      restartFromScratch(peer);
+    } else if (Date.now() - peer.lastRestartAt >= 5000) {
+      peer.lastRestartAt = Date.now();
+      negotiate(peer, { iceRestart: !!peer.pc.remoteDescription });
+    }
+    return;
+  }
+  sendToPeerReliable(
+    peer,
+    { t: 'restart-request', sender: myPeerInfo(), pcId: peer.pcId, toPcId: peer.remotePcId, full },
+    { attempts: 1 }
+  ).catch(() => {});
+}
+
+function restartFromScratch(peer) {
+  if (!isOfferer(peer)) {
+    requestReconnect(peer, { full: true });
+    return;
+  }
+  // Acabou de recomeçar: espera essa tentativa em vez de matar a conexão
+  // nova no meio do caminho (o pedido do outro lado e o meu próprio ciclo
+  // de reconexão costumam pedir isso com poucos segundos de diferença).
+  if (Date.now() - peer.lastScratchAt < 8000) return;
+  peer.lastScratchAt = Date.now();
+  peer.lastRestartAt = Date.now();
+  runSignalingTask(peer, () => {
+    console.log('[room] recriando a conexão com', peer.name, 'do zero');
+    recreatePeerConnection(peer);
+  });
+  negotiate(peer);
+}
+
+function recreatePeerConnection(peer) {
+  const oldPc = peer.pc;
+  createPeerConnection(peer);
+  if (oldPc) oldPc.close();
+  // O MediaStream recebido era da conexão antiga; o novo chega pelo evento
+  // "track" da nova. Enquanto isso o card mostra "Reconectando...".
+  renderGrid();
+  renderFocusIfShowing();
+}
+
+function scheduleRecoveryTick(peer, delayMs) {
+  clearTimeout(peer.recoveryTimer);
+  peer.recoveryTimer = setTimeout(() => recoveryTick(peer), delayMs);
+}
+
+// A conexão com `peer` caiu ('disconnected'/'failed'). `firstCheckMs` = 0
+// age na hora; senão espera um pouco pra ver se volta sozinha.
+function beginRecovery(peer, firstCheckMs) {
+  if (peer.downSince === null) {
+    peer.downSince = Date.now();
+    peer.recoveryAttempts = 0;
+    scheduleRecoveryTick(peer, firstCheckMs);
+  } else if (firstCheckMs === 0 && !peer.reconnecting) {
+    scheduleRecoveryTick(peer, 0); // 'disconnected' virou 'failed' antes do primeiro check
+  }
+}
+
+function recoveryTick(peer) {
+  peer.recoveryTimer = null;
+  if (roomPeers.get(peer.peerId) !== peer || peer.downSince === null) return;
+  if (peer.pc.connectionState === 'connected') {
+    markPeerConnected(peer);
+    return;
+  }
+
+  const downFor = Date.now() - peer.downSince;
+  if (downFor >= RECOVERY_GIVE_UP_MS) {
+    giveUpOnPeer(peer);
+    return;
+  }
+
+  if (!peer.everConnected) {
+    // Nunca conectou: diz no painel ONDE está travado. 'signaling' = a
+    // oferta/resposta nem chegou (problema da sinalização UDP/ntfy, não de
+    // NAT); 'ice' = os dois lados trocaram tudo mas nenhum caminho de rede
+    // passa (NAT estrito sem TURN nessa combinação de redes).
+    peer.timeoutReason = peer.pc.remoteDescription ? 'ice' : 'signaling';
+    console.warn('[room] conexão com', peer.name, 'não fechou ainda —', peer.timeoutReason, {
+      connectionState: peer.pc.connectionState,
+      iceConnectionState: peer.pc.iceConnectionState,
+      signalingState: peer.pc.signalingState,
+      candidatosRemotosRecebidos: peer.remoteCandidatesReceived,
+      candidatosLocaisColetados: peer.gatheredLocalCandidates.length,
+    });
+  } else if (!peer.reconnecting) {
+    notify(`Conexão com ${peer.name} caiu — tentando reconectar...`, 'warning');
+  }
+  peer.reconnecting = true;
+
+  peer.recoveryAttempts++;
+  const full = peer.recoveryAttempts >= RECOVERY_FULL_RESTART_FROM_ATTEMPT;
+  console.log('[room] tentando reconectar com', peer.name, `(tentativa ${peer.recoveryAttempts}${full ? ', do zero' : ''})`);
+  requestReconnect(peer, { full });
+
+  const delays = RECOVERY_RETRY_DELAYS_MS;
+  const nextDelay = delays[Math.min(peer.recoveryAttempts - 1, delays.length - 1)];
+  scheduleRecoveryTick(peer, Math.min(nextDelay, RECOVERY_GIVE_UP_MS - downFor));
+  renderParticipants();
+  renderGrid();
+  renderFocusIfShowing();
+  updateConnectionBanner();
+}
+
+function markPeerConnected(peer) {
+  clearTimeout(peer.recoveryTimer);
+  peer.recoveryTimer = null;
+  const wasReconnecting = peer.reconnecting && peer.everConnected;
+  peer.downSince = null;
+  peer.reconnecting = false;
+  peer.recoveryAttempts = 0;
+  peer.timeoutReason = null;
+
+  if (!peer.everConnected) {
+    peer.everConnected = true;
+    if (peer.announceJoin) notify(`${peer.name} entrou na sala.`, 'info');
+  } else if (wasReconnecting) {
+    notify(`Conexão com ${peer.name} restabelecida.`, 'success');
+    // O "sharing" que eu mandei durante a queda pode ter se perdido (ou eu
+    // parei/comecei a compartilhar nesse meio tempo).
+    sendToPeerReliable(peer, sharingMessage()).catch(() => {});
+  }
+  renderParticipants();
+  renderGrid();
+  renderFocusIfShowing();
+  updateConnectionBanner();
+}
+
+function giveUpOnPeer(peer) {
+  console.warn('[room] desistindo da conexão com', peer.name, 'depois de', RECOVERY_GIVE_UP_MS / 1000, 's');
+  removePeer(peer.peerId);
+  if (peer.everConnected) {
+    lostPeers.set(peer.peerId, toPeerInfo(peer));
+    notify(`${peer.name} caiu da sala (sem conexão há 1 minuto).`, 'error');
+  } else if (peer.timeoutReason === 'ice') {
+    notify(`Não consegui conectar com ${peer.name}: a combinação das redes de vocês não deixa conexão direta.`, 'error');
+  } else {
+    notify(`Não consegui conectar com ${peer.name}: as mensagens de conexão não chegaram.`, 'error');
+  }
+  maybeStartRejoin();
+}
+
 function removePeer(peerId) {
   const peer = roomPeers.get(peerId);
   if (!peer) return;
-  clearTimeout(peer.iceWatchdogTimer);
+  clearTimeout(peer.recoveryTimer);
   clearTimeout(peer.localCandidateFlushTimer);
   if (peer.pc) peer.pc.close();
   roomPeers.delete(peerId);
@@ -1053,6 +1428,118 @@ function removePeer(peerId) {
   renderParticipants();
   renderGrid();
   renderFocusIfShowing();
+  updateConnectionBanner();
+}
+
+// Fiquei sozinho na sala porque TODO MUNDO caiu (não porque saíram): quase
+// certamente a queda foi minha. Tenta voltar sozinho mandando "join" de
+// novo pra quem estava na sala — o mesmo caminho de entrar com o código,
+// só que pros pontos de encontro que eu já conheço. Quem ainda estiver lá
+// responde com "welcome" e a malha se refaz.
+const REJOIN_INTERVAL_MS = 15000;
+const REJOIN_MAX_MS = 5 * 60 * 1000;
+let rejoinTimer = null;
+let rejoinStartedAt = 0;
+let rejoinGaveUp = false;
+
+function maybeStartRejoin() {
+  if (rejoinTimer !== null || roomPeers.size > 0 || lostPeers.size === 0 || !myListener) return;
+  rejoinStartedAt = Date.now();
+  rejoinGaveUp = false;
+  attemptRejoin();
+}
+
+function attemptRejoin() {
+  rejoinTimer = null;
+  if (!myListener || roomPeers.size > 0) {
+    stopRejoin();
+    return;
+  }
+  if (Date.now() - rejoinStartedAt > REJOIN_MAX_MS) {
+    stopRejoin();
+    rejoinGaveUp = true;
+    updateConnectionBanner();
+    return;
+  }
+  const joinMessage = { t: 'join', peerId: myPeerId, name: myName, sid: myListener.sessionId, cands: myListener.candidates };
+  lostPeers.forEach((info) => sendToPeer(info, joinMessage).catch(() => {}));
+  rejoinTimer = setTimeout(attemptRejoin, REJOIN_INTERVAL_MS);
+  updateConnectionBanner();
+}
+
+function stopRejoin() {
+  clearTimeout(rejoinTimer);
+  rejoinTimer = null;
+  if (roomPeers.size > 0) lostPeers.clear();
+  updateConnectionBanner();
+}
+
+// A rede do PC voltou: não espera o próximo ciclo de recoveryTick (até 20s)
+// nem o watchdog do ntfy perceber que a conexão dele morreu.
+window.addEventListener('online', () => {
+  if (!myListener) return;
+  console.log('[room] a rede voltou — reconectando agora');
+  window.api.kickSignalListener(myListener.sessionId);
+  roomPeers.forEach((peer) => {
+    if (peer.downSince !== null) scheduleRecoveryTick(peer, 1000);
+  });
+  if (rejoinTimer !== null) {
+    clearTimeout(rejoinTimer);
+    rejoinTimer = setTimeout(attemptRejoin, 1500);
+  }
+  updateConnectionBanner();
+});
+window.addEventListener('offline', () => updateConnectionBanner());
+
+// ---------- avisos na tela ----------
+
+const roomToastsEl = document.getElementById('room-toasts');
+const connectionBannerEl = document.getElementById('connection-banner');
+const connectionBannerTextEl = connectionBannerEl.querySelector('.connection-banner-text');
+const connectionBannerSpinnerEl = connectionBannerEl.querySelector('.btn-spinner');
+const MAX_TOASTS = 4;
+
+// Aviso passageiro no canto da sala (entrou/saiu/caiu/voltou). `kind`:
+// 'info' | 'success' | 'warning' | 'error' — muda só a cor da borda.
+function notify(text, kind = 'info') {
+  if (!viewRoom.classList.contains('active')) return;
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${kind}`;
+  toast.setAttribute('role', kind === 'error' || kind === 'warning' ? 'alert' : 'status');
+  toast.textContent = text;
+  roomToastsEl.appendChild(toast);
+  while (roomToastsEl.childElementCount > MAX_TOASTS) roomToastsEl.firstElementChild.remove();
+  setTimeout(() => {
+    toast.classList.add('toast-leaving');
+    setTimeout(() => toast.remove(), 250);
+  }, kind === 'error' ? 9000 : 5000);
+}
+
+function clearToasts() {
+  roomToastsEl.innerHTML = '';
+}
+
+// Faixa fixa no topo enquanto a MINHA conexão estiver com problema (não a
+// de uma pessoa só — isso vai no aviso passageiro e no card dela).
+function updateConnectionBanner() {
+  let text = '';
+  let busy = true;
+  if (myListener) {
+    const everConnected = [...roomPeers.values()].filter((peer) => peer.everConnected);
+    if (!navigator.onLine) {
+      text = 'Sem internet — reconecto sozinho quando a conexão voltar.';
+    } else if (rejoinTimer !== null) {
+      text = 'Você perdeu a conexão com a sala — tentando voltar...';
+    } else if (rejoinGaveUp && roomPeers.size === 0) {
+      text = 'Não consegui voltar pra sala. Saia e entre de novo com um código.';
+      busy = false;
+    } else if (everConnected.length >= 2 && everConnected.every((peer) => peer.reconnecting)) {
+      text = 'Sua conexão parece ter caído — reconectando com todo mundo...';
+    }
+  }
+  connectionBannerTextEl.textContent = text;
+  connectionBannerSpinnerEl.hidden = !busy;
+  connectionBannerEl.hidden = !text;
 }
 
 // ===================================================================
@@ -1183,6 +1670,18 @@ async function acquireVideoTrackForScreen(sourceId) {
 // novo abriria o seletor do SO outra vez — então troca de qualidade nele vai
 // por applyConstraints na própria track.
 let localVideoFromDisplayMedia = false;
+
+// 'motion' (e não 'detail'): quando a banda aperta, o encoder reduz a
+// RESOLUÇÃO e mantém os quadros por segundo. Com 'detail' o Chromium faz o
+// contrário — segura a resolução a qualquer custo e derruba o fps —, e
+// numa rede instável isso virava travadas e atraso acumulado. Medido com o
+// emulador de rede do próprio WebRTC (link alternando 30 Mbps / 2 Mbps com
+// 2% de perda): com 'detail', 0 a 11 fps na rede ruim, latência de até
+// ~1,9s e, depois que a rede voltava, ~400ms de atraso que levava ~20s pra
+// sumir; com 'motion', ~30 fps o tempo todo, 90-150ms na rede ruim e
+// 70-90ms depois. Com banda sobrando a resolução é a escolhida no popover
+// do mesmo jeito; ela só cai temporariamente quando a rede não aguenta.
+const SCREEN_CONTENT_HINT = 'motion';
 
 function displayMediaVideoConstraints() {
   const bounds = captureBounds(null);
@@ -1492,9 +1991,9 @@ function applyLocalTracksToAllPeers() {
   roomPeers.forEach((peer) => applyLocalTracksToPeer(peer));
 }
 
-function broadcastSharingState(on) {
+function broadcastSharingState() {
   roomPeers.forEach((peer) => {
-    sendToPeerReliable(peer, { t: 'sharing', sender: myPeerInfo(), on }).catch(() => {});
+    sendToPeerReliable(peer, sharingMessage()).catch(() => {});
   });
 }
 
@@ -1617,16 +2116,21 @@ async function confirmStartSharing() {
     return;
   }
 
-  videoTrack.contentHint = 'detail';
+  videoTrack.contentHint = SCREEN_CONTENT_HINT;
   localVideoFromDisplayMedia = useNativeDisplayMediaLoopback;
   localStream = new MediaStream([videoTrack, audioTrack]);
   videoTrack.addEventListener('ended', stopSharing);
 
   mySharing = true;
+  mySharingVersion++;
   window.api.setSharingActive(true);
+  // Só troca as tracks — sem renegociar. Com os transceivers negociados
+  // direito (ver isOfferer), isso basta pros dois sentidos; a renegociação
+  // que existia aqui só mascarava o bug dos transceivers órfãos, e ainda
+  // dependia da sinalização chegar a cada vez que alguém começava a
+  // compartilhar.
   applyLocalTracksToAllPeers();
-  roomPeers.forEach((peer) => negotiate(peer));
-  broadcastSharingState(true);
+  broadcastSharingState();
   hideSharePopover();
   updateShareButtonUI();
   renderGrid();
@@ -1659,7 +2163,7 @@ async function replaceScreenVideoInRoom(errorPrefix) {
     newTrack.stop();
     return;
   }
-  newTrack.contentHint = 'detail';
+  newTrack.contentHint = SCREEN_CONTENT_HINT;
 
   const oldTrack = localStream.getVideoTracks()[0];
   if (oldTrack) {
@@ -1717,6 +2221,7 @@ function stopSharing() {
   if (!mySharing && !localStream) return;
   const wasSharing = mySharing;
   mySharing = false;
+  if (wasSharing) mySharingVersion++;
   window.api.setSharingActive(false);
 
   if (localStream) {
@@ -1742,7 +2247,7 @@ function stopSharing() {
     if (peer.audioSender) peer.audioSender.replaceTrack(getOrCreateSilentAudioTrack()).catch(() => {});
   });
 
-  if (wasSharing) broadcastSharingState(false);
+  if (wasSharing) broadcastSharingState();
   updateShareButtonUI();
   renderGrid();
   renderParticipants();
@@ -1881,7 +2386,18 @@ function ensureMediaTile(container, isSelf) {
   }
   const pinIcon = pinOverlay.querySelector('.pin-icon');
 
-  return { video, name, volumeSlider, volumeBtn, pinIcon };
+  // "Reconectando..." por cima do vídeo de quem caiu — sem isso o card
+  // ficava preto (ou congelado no último frame) sem explicação nenhuma.
+  let reconnectingOverlay = container.querySelector('.tile-reconnecting');
+  if (!isSelf && !reconnectingOverlay) {
+    reconnectingOverlay = document.createElement('div');
+    reconnectingOverlay.className = 'tile-reconnecting';
+    reconnectingOverlay.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span><span>Reconectando...</span>';
+    reconnectingOverlay.hidden = true;
+    container.appendChild(reconnectingOverlay);
+  }
+
+  return { video, name, volumeSlider, volumeBtn, pinIcon, reconnectingOverlay };
 }
 
 // Muda o volume de um peer e, se o valor for maior que zero, também guarda
@@ -1896,12 +2412,13 @@ function setPeerVolume(peer, v) {
 // `pinMode`: 'pin' pro grid/tira de miniaturas (clicar fixa esse em foco) ou
 // 'unpin' pro card grande do foco (clicar volta pro grid).
 function updateMediaTile(container, item, pinMode) {
-  const { video, name, volumeSlider, volumeBtn, pinIcon } = ensureMediaTile(container, item.kind === 'self');
+  const { video, name, volumeSlider, volumeBtn, pinIcon, reconnectingOverlay } = ensureMediaTile(container, item.kind === 'self');
   const desiredStream = item.kind === 'self' ? localStream : item.peer.remoteStream || null;
   video.muted = item.kind === 'self';
   if (video.srcObject !== desiredStream) video.srcObject = desiredStream;
   name.textContent = item.name;
   pinIcon.innerHTML = pinMode === 'unpin' ? UNPIN_ICON_SVG : PIN_ICON_SVG;
+  if (reconnectingOverlay) reconnectingOverlay.hidden = !(item.kind === 'peer' && item.peer.reconnecting);
 
   if (volumeSlider && item.kind !== 'self') {
     const peer = item.peer;
@@ -2109,20 +2626,19 @@ function renderParticipants() {
     let statusText = connectionStateLabels[entry.connectionState] || 'conectando';
     if (entry.isSelf) {
       statusClass = 'status-connected';
-      statusText = 'você';
+      statusText = entry.sharing ? 'compartilhando' : 'você';
     } else if (entry.connectionState === 'connected') {
       statusClass = 'status-connected';
-      statusText = 'conectado';
-    } else if (entry.connectionState === 'failed' || entry.connectionState === 'disconnected') {
-      statusClass = 'status-failed';
-    } else if (entry.connectionTimedOut) {
-      // Ver o setTimeout em setupPeerConnection: o navegador às vezes nunca
-      // marca a conexão como 'failed' sozinho — sem isso a pessoa ficava
-      // "conectando" pra sempre sem nenhum aviso.
+      statusText = entry.sharing ? 'compartilhando' : 'conectado';
+    } else if (entry.everConnected && entry.downSince !== null) {
+      // Caiu e está tentando voltar (ver recoveryTick).
+      statusText = 'reconectando';
+    } else if (entry.timeoutReason) {
+      // Nunca chegou a conectar e já passou do prazo inicial (ver
+      // recoveryTick) — diz onde travou em vez de "conectando" pra sempre.
       statusClass = 'status-failed';
       statusText = entry.timeoutReason === 'signaling' ? 'sem conexão (sinalização)' : 'sem conexão (rede)';
     }
-    if (entry.sharing) statusText = 'compartilhando';
     pill.className = 'status-pill ' + statusClass;
     pill.textContent = statusText;
 
@@ -2141,20 +2657,6 @@ function renderParticipants() {
   });
 }
 
-// Confere periodicamente (não só nos eventos) se cada conexão já tem vídeo
-// chegando que `peer.remoteStream` ainda não reflete — rede de segurança
-// pro caso do evento "track" não disparar (ver syncRemoteStreamFromReceivers).
-// Não trava em `connectionState === 'connected'`: confirmado num teste real
-// que esse aviso também pode nunca disparar pro lado que ofereceu a conexão,
-// mesmo com ela genuinamente funcionando (dado real fluindo) — a própria
-// função já é barata de chamar à toa (sai cedo se não achar receiver com
-// track, ou se já estiver tudo certo).
-setInterval(() => {
-  roomPeers.forEach((peer) => {
-    if (peer.pc) syncRemoteStreamFromReceivers(peer);
-  });
-}, 3000);
-
 // Diagnóstico de bitrate/fps por conexão (visível só no console/DevTools,
 // que fica desligado nos executáveis empacotados) — mesma finalidade do
 // diagnóstico que já existia no fluxo 1:1, generalizada pra cada peer da
@@ -2163,7 +2665,8 @@ setInterval(async () => {
   if (!mySharing) return;
   for (const peer of roomPeers.values()) {
     if (!peer.videoSender || !peer.pc || peer.pc.connectionState !== 'connected') continue;
-    const stats = await peer.pc.getStats();
+    const stats = await peer.pc.getStats().catch(() => null);
+    if (!stats) continue;
     stats.forEach((report) => {
       if (report.type !== 'outbound-rtp' || report.kind !== 'video') return;
       if (peer.lastStatsSample) {
@@ -2193,7 +2696,8 @@ setInterval(async () => {
 setInterval(async () => {
   for (const peer of roomPeers.values()) {
     if (!peer.pc || peer.pc.connectionState !== 'connected') continue;
-    const stats = await peer.pc.getStats();
+    const stats = await peer.pc.getStats().catch(() => null);
+    if (!stats) continue;
     stats.forEach((report) => {
       if (report.type !== 'inbound-rtp' || report.kind !== 'video') return;
 

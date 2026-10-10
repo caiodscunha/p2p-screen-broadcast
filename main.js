@@ -349,6 +349,12 @@ ipcMain.handle('signal:stopListener', (event, sessionId) => {
   }
 });
 
+ipcMain.handle('signal:kick', (event, sessionId) => {
+  const listeners = activeSignalListeners.get(event.sender.id);
+  const handle = listeners && listeners.get(sessionId);
+  if (handle) handle.kick();
+});
+
 ipcMain.handle('signal:send', (event, { mySessionId, candidates, targetSessionId, message, opts }) => {
   const listeners = activeSignalListeners.get(event.sender.id);
   const handle = listeners && listeners.get(mySessionId);

@@ -88,8 +88,9 @@ generated instantly, no ICE gathering wait.
    channel (WhatsApp, chat, email, etc).
 3. Each person who pastes the code and clicks **Entrar** sends a small
    `join` message to that rendezvous, delivered automatically whenever the
-   network allows (direct UDP first, a free public relay,
-   [ntfy.sh](https://ntfy.sh), as a fallback in parallel).
+   network allows (direct UDP first, and a free public relay,
+   [ntfy.sh](https://ntfy.sh), only if UDP doesn't confirm delivery within
+   about a second).
 4. Whoever receives that `join` replies with the room's current roster and
    introduces the newcomer to everyone else already there. From that point
    on, **every pair of participants talks directly to each other**: the
@@ -100,7 +101,18 @@ generated instantly, no ICE gathering wait.
 5. Starting to share your screen (the bottom bar's share button) sends your
    video/audio directly to every other connection in the mesh, with no new
    code to generate or exchange, and no code re-entry needed for people
-   already in the room.
+   already in the room. When a connection's bandwidth drops, the stream
+   temporarily lowers its resolution to keep the frame rate (and latency)
+   steady, and goes back up once the network recovers.
+6. If a connection drops, the app reconnects on its own: first it looks for
+   a new network path on the same connection, then rebuilds the connection
+   from scratch. Meanwhile that person's tile shows "Reconectando...", their
+   status in the participants list says so, and a notice pops up in the
+   corner (same for people joining, leaving, and coming back). After a
+   minute without any connection they're removed from your room with a
+   notice. If you're the one who lost everyone (your own internet dropped),
+   a banner says so and the app keeps trying to rejoin the room by itself
+   for a few minutes, no new code needed.
 
 Two free, public, neutral third-party services are involved in setting up
 connections, never in the actual video/audio, which always flows directly
@@ -314,15 +326,15 @@ architecture), these are real bugs/rough edges that just haven't been fixed
 yet:
 
 - **ntfy.sh rate limiting**: the free public relay used for automatic room
-  signaling (see [How it works](#how-it-works)) rate-limits by IP address,
-  not by app. If a lot of signaling traffic comes from the same public IP
-  in a short window (e.g. repeated join attempts while debugging a
-  connection issue), it can start rejecting requests with HTTP 429 for a
-  while. This is rare in normal one-off usage, but can show up during heavy
-  testing, and can also affect multiple unrelated people sharing the same
-  IP behind CGNAT. When it happens, automatic signaling degrades to just the
-  direct UDP path (still often enough on its own); there's no in-app
-  indicator of this yet.
+  signaling (see [How it works](#how-it-works)) limits by IP address, not
+  by app: anonymous use gets 250 messages per day per IP (as reported by
+  `https://ntfy.sh/v1/account`), plus a short-term request rate limit. Every
+  piece of a signaling message counts, and the quota is shared by everyone
+  behind the same public IP (CGNAT). To make it last, the app only uses the
+  relay when direct UDP doesn't confirm delivery, and keeps reconnection
+  attempts frugal. When the quota runs out, the relay answers HTTP 429 and
+  automatic signaling degrades to just the direct UDP path (still often
+  enough on its own); a failed join says when that's the reason.
 - **Screen/audio capture is still rough on Linux**: unlike Windows/macOS,
   there's no single API Electron can rely on across distros: behavior
   varies by desktop environment and audio server. Per-app capture (see

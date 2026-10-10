@@ -579,6 +579,98 @@ textarea {
   margin: 0;
 }
 
+/* Faixa fixa enquanto a PRÓPRIA conexão está com problema (ver
+   updateConnectionBanner no JS). O aviso de status normal desce pra não
+   ficar embaixo dela. */
+.connection-banner {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 20px);
+  background: rgba(38, 31, 14, 0.95);
+  border: 1px solid rgba(240, 178, 50, 0.5);
+  color: var(--warning);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 999px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+.connection-banner .btn-spinner {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  border-color: rgba(240, 178, 50, 0.3);
+  border-top-color: var(--warning);
+}
+
+.connection-banner:not([hidden]) ~ .room-status { top: 50px; }
+
+/* Avisos passageiros (entrou/saiu/caiu/voltou), empilhados no canto. */
+.room-toasts {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  max-width: min(360px, calc(100% - 20px));
+  pointer-events: none;
+}
+
+.toast {
+  background: rgba(30, 31, 34, 0.95);
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--text-faint);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  animation: toast-in 0.18s ease-out;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+}
+
+.toast-success { border-left-color: var(--success); }
+.toast-warning { border-left-color: var(--warning); }
+.toast-error { border-left-color: var(--accent); }
+.toast.toast-leaving { opacity: 0; transform: translateX(8px); }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* "Reconectando..." por cima do vídeo de quem caiu. Abaixo do nome e do
+   volume (z-index 2/3), que continuam visíveis. */
+.tile-reconnecting {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: rgba(0, 0, 0, 0.6);
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  pointer-events: none;
+}
+
+.focus-thumb .tile-reconnecting { font-size: 11px; gap: 4px; }
+
 .stream-grid {
   flex: 1;
   display: grid;
