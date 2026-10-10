@@ -1266,6 +1266,58 @@ function withStereoOpus(description) {
   return { type: description.type, sdp };
 }
 
+// Banda inicial do vídeo que EU mando. O WebRTC começa toda conexão
+// estimando 300 kbps e só sobe essa estimativa conforme o que é de fato
+// enviado. Antes de alguém compartilhar só passa áudio, então o primeiro
+// compartilhamento largava com 300 kbps. O encoder reduzia a resolução pra
+// caber e, com a tela quase parada (pouco dado indo), a estimativa demorava
+// a subir. Medido aqui, compartilhando 1080p60, no 1º compartilhamento:
+// H.264 com a estimativa indo de 300 só até ~850 kbps em 12s, caindo pra
+// 720p aos 3s; VP8 (o que vai pra/de quem não tem encoder/decoder de
+// hardware, ex: Linux com NVIDIA) preso em 640x360 os 12s inteiros. Do 2º em
+// diante já não acontecia, porque a conexão tinha aprendido a banda no 1º.
+// Com 3000 kbps de partida: H.264 ficou em 1920x1080 do começo ao fim, com a
+// estimativa em ~5700 kbps em menos de 1s, e o VP8 largou em 720p. A
+// estimativa se mantém enquanto ninguém compartilha (ainda em 3000 depois
+// de 20s só com áudio). Se a rede aguentar menos que isso, o controle de
+// congestionamento baixa em menos de 1s.
+//
+// O x-google-start-bitrate vale pra quem ENVIA e é lido da descrição REMOTA,
+// então cada lado põe na descrição que recebe, antes de aplicá-la. Também
+// funciona com quem ainda não atualizou. Renegociar (ex: reinício de ICE)
+// com o mesmo valor não zera a estimativa: o WebRTC só reaplica quando o
+// valor muda.
+const VIDEO_START_BITRATE_KBPS = 3000;
+const VIDEO_CODEC_NAMES = /^(VP8|VP9|H264|H265|AV1)$/i;
+
+function withVideoStartBitrate(description) {
+  const param = `x-google-start-bitrate=${VIDEO_START_BITRATE_KBPS}`;
+  const lines = description.sdp.split('\r\n');
+  const videoPayloadTypes = new Set();
+  let inVideo = false;
+  lines.forEach((line) => {
+    if (line.startsWith('m=')) inVideo = line.startsWith('m=video');
+    const rtpmap = inVideo && line.match(/^a=rtpmap:(\d+) ([^/]+)\//);
+    if (rtpmap && VIDEO_CODEC_NAMES.test(rtpmap[2])) videoPayloadTypes.add(rtpmap[1]);
+  });
+  const withFmtp = new Set(
+    lines.map((line) => (line.match(/^a=fmtp:(\d+) /) || [])[1]).filter((pt) => videoPayloadTypes.has(pt))
+  );
+  const out = [];
+  lines.forEach((line) => {
+    const fmtp = line.match(/^a=fmtp:(\d+) /);
+    if (fmtp && videoPayloadTypes.has(fmtp[1])) {
+      out.push(/x-google-start-bitrate=/.test(line) ? line : `${line};${param}`);
+      return;
+    }
+    out.push(line);
+    // VP8 normalmente vem sem nenhuma linha fmtp — cria uma.
+    const rtpmap = line.match(/^a=rtpmap:(\d+) /);
+    if (rtpmap && videoPayloadTypes.has(rtpmap[1]) && !withFmtp.has(rtpmap[1])) out.push(`a=fmtp:${rtpmap[1]} ${param}`);
+  });
+  return { type: description.type, sdp: out.join('\r\n') };
+}
+
 function waitForIceGathering(pc, timeoutMs) {
   if (pc.iceGatheringState === 'complete') return Promise.resolve();
   return new Promise((resolve) => {
@@ -1435,7 +1487,7 @@ async function handleOffer(peer, message) {
     return;
   }
 
-  await pc.setRemoteDescription(message.sdp);
+  await pc.setRemoteDescription(withVideoStartBitrate(message.sdp));
   if (fromPcId) {
     peer.remotePcId = fromPcId;
     peer.lastRemoteOfferSeq = seq;
@@ -1487,7 +1539,7 @@ async function handleAnswer(peer, message) {
   }
 
   console.log('[room] recebi resposta de', peer.name, `#${seq} — aplicando`);
-  await pc.setRemoteDescription(message.sdp);
+  await pc.setRemoteDescription(withVideoStartBitrate(message.sdp));
   if (fromPcId) peer.remotePcId = fromPcId;
   applyRemoteSharing(peer, message.sharing, message.sharingV);
   await flushPendingIceCandidates(peer);
