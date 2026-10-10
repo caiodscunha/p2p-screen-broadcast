@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, ipcMain, clipboard, desktopCapturer, dialog } = require('electron');
+const { app, BrowserWindow, session, ipcMain, clipboard, desktopCapturer, dialog, screen } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -69,8 +69,13 @@ function firewallRuleExists(ruleName) {
 }
 
 // Roda o netsh elevado (precisa de admin pra mexer em regra de firewall).
-// Escreve um .ps1 temporário em vez de aninhar aspas direto no comando —
-// evita o inferno de escaping de rodar PowerShell dentro de PowerShell.
+// O netsh é chamado direto pelo Start-Process elevado — nada de script
+// intermediário. Antes isso escrevia um .ps1 com nome previsível na pasta
+// temporária e o executava como admin: qualquer programa rodando como o
+// usuário podia trocar o arquivo nesse meio tempo e ganhar admin de carona
+// no UAC que a pessoa aprovou. O comando do PowerShell vai em
+// -EncodedCommand (base64 de UTF-16LE), então não tem aspas pra escapar
+// no caminho até ele.
 //
 // A regra é a mais restrita possível pro que precisa funcionar:
 // - program="<exe>": só esse executável pode receber a conexão, nenhum outro
@@ -80,28 +85,19 @@ function firewallRuleExists(ruleName) {
 // - profile=private,domain: NÃO libera em rede Wi-Fi pública (aeroporto, café
 //   etc.) — só em redes marcadas como "privada" no Windows (casa/trabalho
 //   confiável), que é o único cenário em que isso precisa funcionar mesmo.
+function powershellQuote(text) {
+  return `'${text.replace(/'/g, "''")}'`;
+}
+
+function encodePowershellCommand(command) {
+  return Buffer.from(command, 'utf16le').toString('base64');
+}
+
 function addFirewallRuleElevated(ruleName, exePath) {
   return new Promise((resolve) => {
-    const scriptPath = path.join(app.getPath('temp'), `sinal-p2p-add-firewall-rule-${process.pid}.ps1`);
-    const scriptContent =
-      `netsh advfirewall firewall add rule name="${ruleName}" dir=in action=allow protocol=UDP program="${exePath}" enable=yes profile=private,domain\r\n`;
-
-    try {
-      fs.writeFileSync(scriptPath, scriptContent, 'utf8');
-    } catch {
-      resolve(false);
-      return;
-    }
-
-    const elevate = `Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File "${scriptPath}"' -Verb RunAs -WindowStyle Hidden -Wait`;
-    exec(`powershell -NoProfile -Command "${elevate}"`, (err) => {
-      try {
-        fs.unlinkSync(scriptPath);
-      } catch {
-        // arquivo temporário; se sobrar, não afeta nada
-      }
-      resolve(!err);
-    });
+    const netshArgs = `advfirewall firewall add rule name="${ruleName}" dir=in action=allow protocol=UDP program="${exePath}" enable=yes profile=private,domain`;
+    const elevate = `Start-Process -FilePath netsh -ArgumentList ${powershellQuote(netshArgs)} -Verb RunAs -WindowStyle Hidden -Wait`;
+    exec(`powershell -NoProfile -EncodedCommand ${encodePowershellCommand(elevate)}`, (err) => resolve(!err));
   });
 }
 
@@ -349,6 +345,12 @@ ipcMain.handle('signal:stopListener', (event, sessionId) => {
   }
 });
 
+ipcMain.handle('signal:kick', (event, sessionId) => {
+  const listeners = activeSignalListeners.get(event.sender.id);
+  const handle = listeners && listeners.get(sessionId);
+  if (handle) handle.kick();
+});
+
 ipcMain.handle('signal:send', (event, { mySessionId, candidates, targetSessionId, message, opts }) => {
   const listeners = activeSignalListeners.get(event.sender.id);
   const handle = listeners && listeners.get(mySessionId);
@@ -372,12 +374,35 @@ ipcMain.handle('capture:listScreens', async () => {
     types: ['screen'],
     thumbnailSize: process.platform === 'linux' ? { width: 0, height: 0 } : { width: 320, height: 180 },
   });
-  return sources.map((s) => ({
-    id: s.id,
-    name: s.name,
-    thumbnail: s.thumbnail.isEmpty() ? null : s.thumbnail.toDataURL(),
-  }));
+  const displays = screen.getAllDisplays();
+  return sources.map((s) => {
+    const size = physicalDisplaySize(s, displays);
+    return {
+      id: s.id,
+      name: s.name,
+      thumbnail: s.thumbnail.isEmpty() ? null : s.thumbnail.toDataURL(),
+      width: size ? size.width : null,
+      height: size ? size.height : null,
+    };
+  });
 });
+
+// Resolução real (em pixels físicos, não em DIP — um monitor 1440p com
+// escala de 150% aparece como 1707x960 em display.size) do monitor por trás
+// de uma fonte do desktopCapturer — usada pra só oferecer "1440p" na
+// configuração de qualidade quando o monitor tem pelo menos isso. No Linux
+// (Wayland/portal) o display_id às vezes vem vazio; com um monitor só ainda
+// dá pra saber qual é, com mais de um fica desconhecido (null).
+function physicalDisplaySize(source, displays) {
+  const display =
+    displays.find((d) => String(d.id) === source.display_id) ||
+    (displays.length === 1 ? displays[0] : null);
+  if (!display) return null;
+  return {
+    width: Math.round(display.size.width * display.scaleFactor),
+    height: Math.round(display.size.height * display.scaleFactor),
+  };
+}
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -398,6 +423,7 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
       // Desliga o DevTools (Ctrl+Shift+I/F12 e qualquer chamada a
       // openDevTools()) nos executáveis empacotados, para o usuário final não
       // conseguir abrir o console. Continua disponível rodando via
@@ -426,11 +452,31 @@ function createWindow() {
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   win.once('ready-to-show', () => win.show());
 
+  // O app é uma página local só: nunca navega pra outro endereço nem abre
+  // janela nova. Bloquear isso garante que nada vindo da rede (um nome de
+  // participante, um link arrastado pra janela) consiga levar a janela —
+  // que tem acesso às APIs do preload — pra um conteúdo de fora.
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.webContents.on('will-navigate', (event) => event.preventDefault());
+
   // Toda vez que a página carrega/recarrega, o estado de "compartilhando"
   // do renderer começa do zero — sem isso, um reload em pleno
   // compartilhamento (ex: DevTools) deixaria minimizar desabilitado pra
   // sempre, já que só o renderer avisa quando volta a compartilhar de novo.
   win.webContents.on('did-finish-load', () => win.setMinimizable(true));
+
+  // Avisa o renderer quando a janela some/volta (minimizar, esconder). Com
+  // backgroundThrottling desligado (necessário, ver acima), a página fica
+  // "visible" pra sempre pela Page Visibility API — o renderer não teria
+  // como saber sozinho que ninguém está olhando, e continuaria pedindo
+  // vídeo em qualidade cheia de todo mundo (ver updateViewRequests).
+  const sendWindowVisible = (visible) => {
+    if (!win.webContents.isDestroyed()) win.webContents.send('window:visible', visible);
+  };
+  win.on('minimize', () => sendWindowVisible(false));
+  win.on('hide', () => sendWindowVisible(false));
+  win.on('restore', () => sendWindowVisible(true));
+  win.on('show', () => sendWindowVisible(!win.isMinimized()));
 
   // Evita vazar uma thread de captura nativa rodando pra sempre se a janela
   // fechar/recarregar sem que o usuário clique em "Parar".
@@ -453,6 +499,15 @@ app.whenReady().then(() => {
   // código/senha/nome, não precisam disso, e o serviço de spellcheck do
   // Chromium carrega dicionários inteiros na memória à toa.
   session.defaultSession.setSpellCheckerEnabled(false);
+
+  // Por padrão o Electron concede QUALQUER permissão que a página pedir
+  // (localização, notificações, USB, ...). O app só precisa de captura de
+  // mídia (microfone/tela) — o resto é negado.
+  const ALLOWED_PERMISSIONS = new Set(['media', 'display-capture']);
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    callback(ALLOWED_PERMISSIONS.has(permission));
+  });
+  session.defaultSession.setPermissionCheckHandler((webContents, permission) => ALLOWED_PERMISSIONS.has(permission));
 
   removeStaleInstanceDirs();
   processAudio.cleanupOrphans();
