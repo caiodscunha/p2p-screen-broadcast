@@ -652,6 +652,7 @@ function leaveRoom() {
   roomPeers.forEach((peer) => {
     clearTimeout(peer.recoveryTimer);
     clearTimeout(peer.localCandidateFlushTimer);
+    clearInterval(peer.bandwidthProbeTimer);
     if (peer.pc) peer.pc.close();
   });
   roomPeers.clear();
@@ -1066,6 +1067,8 @@ function connectToPeer(peerInfo) {
     lastScratchAt: 0,
     signalingQueue: Promise.resolve(),
     encodingQueue: Promise.resolve(),
+    bandwidthProbeTimer: null, // ver startBandwidthProbing
+    probeNudge: false,
     remoteView: 'full', // como ESSA pessoa está vendo a minha tela (ver applyRemoteView)
     remoteViewVersion: 0,
     sentView: 'full', // como eu disse pra ela que estou vendo a tela DELA
@@ -1280,7 +1283,9 @@ function withStereoOpus(description) {
 // estimativa em ~5700 kbps em menos de 1s, e o VP8 largou em 720p. A
 // estimativa se mantém enquanto ninguém compartilha (ainda em 3000 depois
 // de 20s só com áudio). Se a rede aguentar menos que isso, o controle de
-// congestionamento baixa em menos de 1s.
+// congestionamento baixa em menos de 1s. Só isso não bastou: numa conexão
+// nova a estimativa ainda costuma despencar logo depois do 1º quadro-chave
+// (ver startBandwidthProbing).
 //
 // O x-google-start-bitrate vale pra quem ENVIA e é lido da descrição REMOTA,
 // então cada lado põe na descrição que recebe, antes de aplicá-la. Também
@@ -1784,6 +1789,7 @@ function removePeer(peerId) {
   if (!peer) return;
   clearTimeout(peer.recoveryTimer);
   clearTimeout(peer.localCandidateFlushTimer);
+  clearInterval(peer.bandwidthProbeTimer);
   if (peer.pc) peer.pc.close();
   roomPeers.delete(peerId);
   if (focusedPeerId === peerId) focusedPeerId = null;
@@ -2113,11 +2119,79 @@ function applyVideoEncodingToPeer(peer) {
       } else {
         encoding.scaleResolutionDownBy = 1;
         encoding.maxFramerate = selectedFrameRate();
-        encoding.maxBitrate = MAX_BITRATE_BY_RESOLUTION[selectedResolution()];
+        // O -1 kbps alternado só serve pra disparar a sondagem de banda (ver
+        // startBandwidthProbing).
+        encoding.maxBitrate = MAX_BITRATE_BY_RESOLUTION[selectedResolution()] - (peer.probeNudge ? 1000 : 0);
       }
       await sender.setParameters(params);
     })
     .catch((err) => console.warn('[room] não deu pra ajustar o vídeo enviado pra', peer.name, err));
+}
+
+// ---------- sondagem de banda quando o vídeo começa ----------
+//
+// Mesmo largando de 3000 kbps (ver withVideoStartBitrate), numa conexão
+// nova a estimativa de banda costuma DESPENCAR logo depois do primeiro
+// quadro-chave: o controle de congestionamento vê a rajada do quadro-chave
+// atrasar um pouco e corta a estimativa pra ~85% do que mediu passando de
+// fato, e até ali só passava áudio. Medido (2 instâncias, tela 1080p quase
+// parada): de 3000 pra ~1100 kbps em 1s na maioria das conexões novas. Com
+// a tela parada quase nada é enviado, e o WebRTC não sobe a estimativa
+// muito acima do que vê passando: ficava em ~1200 kbps por 20s, com o
+// encoder mirando ~1000 kbps (e o VP8 em 720p). Por isso só o PRIMEIRO
+// compartilhamento saía ruim: no segundo a conexão já sabia a banda.
+//
+// O WebRTC tem um jeito próprio de medir a banda sem depender do que está
+// passando: a sondagem (rajadas curtas de enchimento num ritmo maior,
+// medindo quanto chega do outro lado). Uma das coisas que a disparam é o
+// teto de bitrate do vídeo mudar, e cada sondagem testa até 2x a estimativa
+// atual. Então, nos primeiros segundos de vídeo indo pra alguém, enquanto a
+// estimativa estiver bem abaixo do teto, mexe 1 kbps no teto a cada 1,5s.
+// Como a sondagem mede o que a rede de fato entrega, numa rede lenta ela só
+// confirma o valor baixo: não força banda que não existe.
+const BANDWIDTH_PROBE_INTERVAL_MS = 1500;
+const BANDWIDTH_PROBE_WINDOW_MS = 10000; // contado a partir de quando a conexão está de pé
+const BANDWIDTH_PROBE_GIVE_UP_MS = 60000; // se nem chegar a conectar
+
+function startBandwidthProbing(peer) {
+  clearInterval(peer.bandwidthProbeTimer);
+  const startedAt = Date.now();
+  let connectedAt = null;
+  const timer = setInterval(async () => {
+    const stop = () => {
+      clearInterval(timer);
+      if (peer.bandwidthProbeTimer === timer) peer.bandwidthProbeTimer = null;
+    };
+    if (!mySharing || roomPeers.get(peer.peerId) !== peer) return stop();
+    const pc = peer.pc;
+    if (!pc || pc.connectionState !== 'connected') {
+      if (Date.now() - startedAt > BANDWIDTH_PROBE_GIVE_UP_MS) stop();
+      return;
+    }
+    if (connectedAt === null) connectedAt = Date.now();
+    if (Date.now() - connectedAt > BANDWIDTH_PROBE_WINDOW_MS) return stop();
+    if (peer.remoteView !== 'full') return; // miniatura/desligado: o teto é outro (ou nem tem encoder)
+
+    const estimate = await outgoingBandwidthEstimate(pc);
+    if (!estimate || peer.bandwidthProbeTimer !== timer) return;
+    if (estimate >= MAX_BITRATE_BY_RESOLUTION[selectedResolution()] * 0.9) return stop();
+    peer.probeNudge = !peer.probeNudge;
+    applyVideoEncodingToPeer(peer);
+  }, BANDWIDTH_PROBE_INTERVAL_MS);
+  peer.bandwidthProbeTimer = timer;
+}
+
+// Estimativa atual de banda de saída da conexão (bps), ou null.
+async function outgoingBandwidthEstimate(pc) {
+  const stats = await pc.getStats().catch(() => null);
+  if (!stats) return null;
+  let estimate = null;
+  stats.forEach((report) => {
+    if (report.type !== 'transport' || !report.selectedCandidatePairId) return;
+    const pair = stats.get(report.selectedCandidatePairId);
+    if (pair && pair.availableOutgoingBitrate) estimate = pair.availableOutgoingBitrate;
+  });
+  return estimate;
 }
 
 // Lado de quem compartilha: a pessoa avisou como está me vendo. `forShare`
@@ -2447,7 +2521,10 @@ async function applyLocalTracksToPeer(peer) {
   const audioTrack = localStream ? localStream.getAudioTracks()[0] || null : null;
 
   await peer.videoSender.replaceTrack(videoTrack).catch(() => {});
-  if (videoTrack) applyVideoEncodingToPeer(peer);
+  if (videoTrack) {
+    applyVideoEncodingToPeer(peer);
+    startBandwidthProbing(peer);
+  }
 
   await peer.audioSender.replaceTrack(audioTrack || getOrCreateSilentAudioTrack()).catch(() => {});
 }
