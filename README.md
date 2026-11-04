@@ -107,7 +107,12 @@ generated instantly, no ICE gathering wait.
    starts out assuming 3 Mbps for video instead of WebRTC's default
    300 kbps, so the first share after connecting already goes out at full
    resolution instead of spending its first seconds blurry and downscaled
-   while the bandwidth estimate catches up. Audio goes out as
+   while the bandwidth estimate catches up. On a fresh connection that
+   estimate still tends to drop right after the first frame, and with a
+   mostly still screen it used to stay low, so during the first seconds of
+   video to each person the app also has WebRTC re-measure the real
+   bandwidth with short probes instead of waiting for the screen to move.
+   Audio goes out as
    stereo Opus at up to 128 kbps (WebRTC's default would be mono at
    32 kbps, fine for voice but noticeably worse for music and games).
 6. Once two participants are connected, everything else between them

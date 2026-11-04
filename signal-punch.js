@@ -22,11 +22,14 @@
 //    nunca passa por aqui. Só é tentado se o código couber no limite de
 //    tamanho de mensagem do serviço (com chunking pra mensagens grandes).
 //
-// 3) Broker MQTT público (EMQX) como reserva do reserva: só usado pra MANDAR
-//    quando o ntfy.sh recusa por limite (cota diária de 250 mensagens por IP
-//    ou limite de pedidos por minuto — ver ntfyLimitedUntil). A conexão de
-//    escuta fica sempre aberta, porque é ela que deixa alguém cujo ntfy
-//    estourou alcançar você.
+// 3) Broker MQTT público (EMQX) como reserva do reserva: usado pra MANDAR
+//    quando o ntfy.sh não entrega — recusa por limite (cota diária de 250
+//    mensagens por IP ou limite de pedidos por minuto — ver
+//    ntfyLimitedUntil), está inalcançável daqui (ver ntfyUnreachableUntil),
+//    ou aceitou mas a confirmação não veio (quem recebe não alcança o ntfy:
+//    com "Cache: no" a mensagem some sem erro nenhum — ver RELAY_FALLBACK_MS).
+//    A conexão de escuta fica sempre aberta, porque é ela que deixa alguém
+//    cujo ntfy não funciona alcançar você.
 //
 // Usado tanto pro pareamento 1:1 original quanto pro protocolo de salas (ver
 // renderer.js): toda mensagem trocada é um objeto JSON pequeno e genérico
@@ -100,9 +103,40 @@ const NTFY_DAILY_QUOTA_BACKOFF_MS = 60 * 60 * 1000;
 const NTFY_RATE_LIMIT_BACKOFF_MS = 60 * 1000;
 // Vale pro app inteiro (a cota é por IP, não por sala/sessão).
 let ntfyLimitedUntil = 0;
+// Erro de rede falando com o ntfy (DNS bloqueado por filtro tipo
+// Pi-hole/NextDNS, operadora ou firewall barrando, serviço fora do ar): por
+// esse tempo nem tenta e vai direto pro MQTT. Zerado assim que o ntfy
+// responde de novo (publicação ou stream aberto).
+const NTFY_UNREACHABLE_BACKOFF_MS = 60 * 1000;
+let ntfyUnreachableUntil = 0;
+// Um retransmissor publicou e a confirmação não chegou nesse tempo (ou
+// publicar está demorando isso tudo): manda também pelo outro. Antes o MQTT
+// só entrava com o ntfy recusando por limite — se um dos lados não alcançava
+// o ntfy.sh, a única via que sobrava era o UDP direto, e atrás de CGNAT a
+// oferta/resposta nunca passava ("sem conexão (sinalização)" pra sempre),
+// mesmo com os dois lados já ouvindo o MQTT. Ida e volta pelo ntfy medida
+// em ~1s; pelo MQTT, ~0,4s.
+const RELAY_FALLBACK_MS = 2000;
 
 function ntfyLimited() {
   return Date.now() < ntfyLimitedUntil;
+}
+
+function ntfyUnreachable() {
+  return Date.now() < ntfyUnreachableUntil;
+}
+
+function ntfyUsable() {
+  return !ntfyLimited() && !ntfyUnreachable();
+}
+
+function markNtfyReachable() {
+  ntfyUnreachableUntil = 0;
+}
+
+function markNtfyUnreachable() {
+  if (!ntfyUnreachable()) console.warn('[signal-punch] ntfy: inalcançável daqui — usando o broker MQTT reserva');
+  ntfyUnreachableUntil = Date.now() + NTFY_UNREACHABLE_BACKOFF_MS;
 }
 
 function splitIntoChunks(text, size) {
@@ -212,6 +246,7 @@ async function postNtfyMessage(topic, obj) {
       headers: { Cache: 'no', Firebase: 'no' },
       body: JSON.stringify(obj),
     });
+    markNtfyReachable();
     if (res.status === 429) {
       let code = null;
       try {
@@ -233,6 +268,7 @@ async function postNtfyMessage(topic, obj) {
     return { ok: res.ok, networkError: false, status: res.status };
   } catch (err) {
     console.error('[signal-punch] ntfy: publicar deu erro de rede:', err.message);
+    markNtfyUnreachable();
     return { ok: false, networkError: true, status: null };
   }
 }
@@ -273,13 +309,19 @@ function summarizeNtfyOutcome(results) {
 async function openNtfyStream(topic, signal) {
   try {
     const res = await fetch(`${NTFY_BASE}/${encodeURIComponent(topic)}/json`, { signal });
+    markNtfyReachable();
     if (!res.ok || !res.body) {
       console.error('[signal-punch] ntfy: abrir stream falhou, status', res.status);
       return null;
     }
     return res;
   } catch (err) {
-    if (err.name !== 'AbortError') console.error('[signal-punch] ntfy: abrir stream deu erro de rede:', err.message);
+    if (err.name !== 'AbortError') {
+      console.error('[signal-punch] ntfy: abrir stream deu erro de rede:', err.message);
+      // Quem me mandar pelo ntfy não chega enquanto isso; e as minhas
+      // publicações nem tentam o ntfy por um tempo (ver ntfyUsable).
+      markNtfyUnreachable();
+    }
     return null;
   }
 }
@@ -642,13 +684,47 @@ async function startListener({ onMessage }) {
   const pendingAcks = new Map();
 
   // Publica algo pequeno (uma confirmação) por um retransmissor: o ntfy, ou
-  // o broker MQTT reserva se o ntfy estiver no limite.
+  // o broker MQTT reserva se o ntfy não aceitar (limite, erro de rede, erro
+  // HTTP).
   async function relayPublish(targetSessionId, obj) {
-    if (!ntfyLimited()) {
+    if (ntfyUsable()) {
       const result = await postNtfyMessage(targetSessionId, obj);
-      if (result.ok || result.status !== 429) return;
+      if (result.ok) return;
     }
     if (mqttRelay) await mqttRelay.publish(targetSessionId, obj);
+  }
+
+  // De onde cada sessão de fato nos mandou UDP (ip:porta como chegou aqui).
+  // Atrás de CGNAT/NAT simétrico isso é diferente do candidato que ela
+  // anunciou (o STUN dela vê outro mapeamento), e só esse endereço passa
+  // pelo NAT dela — é por ele que as confirmações já voltavam e chegavam.
+  // Mas as mensagens NOVAS (welcome, oferta, resposta) iam só pros
+  // candidatos anunciados: o "join" dela chegava e era confirmado, e a
+  // oferta de volta nunca chegava por UDP. Agora vai pros dois (é o mesmo
+  // princípio do candidato "peer-reflexive" do ICE).
+  const observedUdp = new Map(); // sessionId -> { ip, port }
+  const MAX_OBSERVED_UDP = 200;
+
+  function rememberObservedUdp(fromSessionId, rinfo) {
+    if (!fromSessionId || !rinfo) return;
+    observedUdp.delete(fromSessionId); // reinsere no fim: o mais antigo é o que sai
+    observedUdp.set(fromSessionId, { ip: rinfo.address, port: rinfo.port });
+    if (observedUdp.size > MAX_OBSERVED_UDP) observedUdp.delete(observedUdp.keys().next().value);
+  }
+
+  function sendAck(toSessionId, mid, rinfo, via) {
+    const ack = { v: 1, sid: toSessionId, t: 'ack', mid };
+    if (rinfo) {
+      try {
+        socket.send(Buffer.from(JSON.stringify(ack)), rinfo.port, rinfo.address, () => {});
+      } catch {
+        // socket fechado — nada a fazer
+      }
+    } else if (via === 'mqtt') {
+      if (mqttRelay) mqttRelay.publish(toSessionId, ack).catch(() => {});
+    } else {
+      relayPublish(toSessionId, ack).catch(() => {});
+    }
   }
 
   // Ponto único por onde toda mensagem recebida passa, venha de UDP
@@ -663,7 +739,8 @@ async function startListener({ onMessage }) {
         onAck(
           rinfo
             ? { source: 'udp', address: `${rinfo.address}:${rinfo.port}` }
-            : { source: via === 'mqtt' ? 'mqtt' : 'http-relay' }
+            : { source: via === 'mqtt' ? 'mqtt' : 'http-relay' },
+          rinfo
         );
       }
       return;
@@ -672,35 +749,25 @@ async function startListener({ onMessage }) {
     const from = typeof envelope.from === 'string' ? envelope.from : null;
     const complete = assembler(envelope);
     if (complete === ALREADY_DELIVERED) {
-      // Quem mandou continua reenviando por UDP porque a confirmação dele
-      // ainda não chegou — ela se perdeu, ou foi pelo ntfy e o ntfy recusou
-      // (limite diário). Antes a repetição era descartada calada e a
-      // confirmação NUNCA chegava: quem mandou achava que a mensagem tinha
-      // se perdido (com o "join", a pessoa era tirada da sala do nada ~10s
-      // depois de entrar, mesmo funcionando). Confirma de novo pelo próprio
-      // UDP — de graça, sem gastar cota do ntfy. Uma vez por rodada de
+      // Quem mandou continua reenviando porque a confirmação dele ainda não
+      // chegou — ela se perdeu, ou foi por um caminho que não chega nele
+      // (ex: pelo ntfy, que ele não alcança). Antes a repetição era
+      // descartada calada e a confirmação NUNCA chegava: quem mandou achava
+      // que a mensagem tinha se perdido (com o "join", a pessoa era tirada da
+      // sala do nada ~10s depois de entrar, mesmo funcionando). Confirma de
+      // novo pelo canal em que a repetição chegou. Uma vez por rodada de
       // reenvio (pedaço 0), não uma por pedaço.
-      if (rinfo && envelope.i === 0 && typeof envelope.from === 'string') {
-        const ack = { v: 1, sid: envelope.from, t: 'ack', mid: envelope.mid };
-        try {
-          socket.send(Buffer.from(JSON.stringify(ack)), rinfo.port, rinfo.address, () => {});
-        } catch {
-          // socket fechado — nada a fazer
-        }
+      if (envelope.i === 0 && from) {
+        if (rinfo) rememberObservedUdp(from, rinfo);
+        sendAck(from, envelope.mid, rinfo, via);
       }
       return;
     }
     if (!complete) return; // ainda faltam pedaços, ou envelope não reconhecido
 
     if (from) {
-      const ack = { v: 1, sid: from, t: 'ack', mid: envelope.mid };
-      if (rinfo) {
-        socket.send(Buffer.from(JSON.stringify(ack)), rinfo.port, rinfo.address, () => {});
-      } else if (via === 'mqtt') {
-        if (mqttRelay) mqttRelay.publish(from, ack).catch(() => {});
-      } else {
-        relayPublish(from, ack).catch(() => {});
-      }
+      if (rinfo) rememberObservedUdp(from, rinfo);
+      sendAck(from, envelope.mid, rinfo, via);
     }
 
     onMessage(complete, { from });
@@ -758,19 +825,23 @@ async function startListener({ onMessage }) {
 
   // Manda `message` pro participante identificado por (targetSessionId,
   // targetCandidates) — divide em pedaços (ver UDP_CHUNK_SIZE/
-  // NTFY_CHUNK_SIZE) e corre as duas vias: reenvia por UDP periodicamente
+  // NTFY_CHUNK_SIZE) e corre as vias: reenvia por UDP periodicamente
   // (que não tem confirmação embutida) até o destinatário confirmar com um
   // ack — por qualquer via — ou estourar o tempo limite; e, se o UDP não
-  // confirmar logo, publica cada pedaço no ntfy UMA vez só (HTTP já garante
-  // entrega se o POST voltar sucesso — repetir isso à toa foi o que estourou
-  // o limite de taxa do ntfy.sh numa versão anterior deste arquivo).
+  // confirmar logo, publica cada pedaço num retransmissor UMA vez só (HTTP já
+  // garante entrega se o POST voltar sucesso — repetir isso à toa foi o que
+  // estourou o limite de taxa do ntfy.sh numa versão anterior deste
+  // arquivo). Retransmissor primeiro: o ntfy, ou o MQTT se foi por ele que
+  // esse destino confirmou da última vez; o outro entra se o primeiro falhar
+  // ou se a confirmação não vier (ver RELAY_FALLBACK_MS).
   function send(targetCandidates, targetSessionId, message, opts = {}) {
-    const timeoutMs = opts.timeoutMs ?? 6000;
+    const timeoutMs = opts.timeoutMs ?? 7000;
     const udpRetryIntervalMs = opts.udpRetryIntervalMs ?? 600;
     // `urgent`: não dá pra esperar o UDP tentar primeiro (ex: aviso de saída,
-    // mandado logo antes do canal fechar).
+    // mandado logo antes do canal fechar) — vai pelos dois retransmissores
+    // de uma vez.
     const lastVia = lastAckVia.get(targetSessionId);
-    const ntfyDelayMs = opts.urgent || (lastVia && lastVia !== 'udp') ? 0 : NTFY_FALLBACK_DELAY_MS;
+    const relayDelayMs = opts.urgent || (lastVia && lastVia !== 'udp') ? 0 : NTFY_FALLBACK_DELAY_MS;
 
     const mid = crypto.randomBytes(6).toString('base64url');
     const json = JSON.stringify(message);
@@ -790,20 +861,21 @@ async function startListener({ onMessage }) {
 
     return new Promise((resolve) => {
       let done = false;
-      let ntfyTimer = null;
+      let relayTimer = null;
       const finish = (result) => {
         if (done) return;
         done = true;
         clearInterval(udpRetryTimer);
         clearTimeout(giveUpTimer);
-        clearTimeout(ntfyTimer);
+        clearTimeout(relayTimer);
         pendingAcks.delete(mid);
         pendingSends.delete(finish);
         resolve(result);
       };
       pendingSends.add(finish);
 
-      pendingAcks.set(mid, (via) => {
+      pendingAcks.set(mid, (via, rinfo) => {
+        if (rinfo) rememberObservedUdp(targetSessionId, rinfo);
         lastAckVia.set(targetSessionId, via.source);
         finish({ ok: true, via });
       });
@@ -816,22 +888,53 @@ async function startListener({ onMessage }) {
       const ntfyResults = [];
       // 'unused' | 'ok' | 'failed' | 'unavailable' — usado só no diagnóstico
       let mqttOutcome = 'unused';
-      ntfyTimer = setTimeout(async () => {
-        ntfyTimer = null;
-        if (!ntfyLimited()) {
-          await Promise.all(
-            ntfyEnvelopes.map((env) => postNtfyMessage(targetSessionId, env).then((r) => ntfyResults.push(r)))
-          ).catch(() => {});
-          if (done || !ntfyLimited()) return; // o ntfy aceitou (ou falhou por outro motivo que não limite)
-        }
-        // O ntfy está no limite: manda pela reserva.
+
+      // Cada um devolve true se o retransmissor aceitou todos os pedaços.
+      const viaNtfy = async () => {
+        if (!ntfyUsable()) return false;
+        const results = await Promise.all(ntfyEnvelopes.map((env) => postNtfyMessage(targetSessionId, env)));
+        ntfyResults.push(...results);
+        return results.every((r) => r.ok);
+      };
+      const viaMqtt = async () => {
         if (!mqttRelay) {
           mqttOutcome = 'unavailable';
-          return;
+          return false;
         }
         const oks = await Promise.all(mqttEnvelopes.map((env) => mqttRelay.publish(targetSessionId, env)));
         mqttOutcome = oks.every(Boolean) ? 'ok' : 'failed';
-      }, ntfyDelayMs);
+        return mqttOutcome === 'ok';
+      };
+      const relays = lastVia === 'mqtt' ? [viaMqtt, viaNtfy] : [viaNtfy, viaMqtt];
+
+      relayTimer = setTimeout(async () => {
+        relayTimer = null;
+        if (opts.urgent) {
+          relays.forEach((relay) => relay().catch(() => {}));
+          return;
+        }
+        for (const relay of relays) {
+          if (done) return;
+          // Passa pro próximo assim que este falhar; se publicou, dá
+          // RELAY_FALLBACK_MS pra confirmação chegar. Publicar demorando
+          // isso tudo também conta como falha (ex: conexão "pendurada" num
+          // bloqueio que descarta pacotes — o fetch só desiste em ~10s).
+          await new Promise((next) => {
+            let timer = setTimeout(next, RELAY_FALLBACK_MS);
+            relay().then(
+              (accepted) => {
+                clearTimeout(timer);
+                if (accepted) timer = setTimeout(next, RELAY_FALLBACK_MS);
+                else next();
+              },
+              () => {
+                clearTimeout(timer);
+                next();
+              }
+            );
+          });
+        }
+      }, relayDelayMs);
 
       // socket.send() LANÇA de verdade (não é uma Promise rejeitada) se o
       // socket já tiver sido fechado — pode acontecer se o app fechar ou a
@@ -842,9 +945,12 @@ async function startListener({ onMessage }) {
       // nenhuma pra capturá-la, então virava um "Uncaught Exception" fatal
       // no processo principal.
       const sendUdpOnce = () => {
+        const targets = [...(targetCandidates || [])];
+        const observed = observedUdp.get(targetSessionId);
+        if (observed && !targets.some((c) => c.ip === observed.ip && c.port === observed.port)) targets.push(observed);
         udpEnvelopes.forEach((env) => {
           const payload = Buffer.from(JSON.stringify(env));
-          (targetCandidates || []).forEach((c) => {
+          targets.forEach((c) => {
             try {
               socket.send(payload, c.port, c.ip, () => {});
             } catch {
@@ -862,7 +968,14 @@ async function startListener({ onMessage }) {
           finish({
             ok: false,
             via: null,
-            ntfy: ntfyResults.length === 0 && ntfyLimited() ? 'rate-limited' : summarizeNtfyOutcome(ntfyResults),
+            ntfy:
+              ntfyResults.length > 0
+                ? summarizeNtfyOutcome(ntfyResults)
+                : ntfyLimited()
+                  ? 'rate-limited'
+                  : ntfyUnreachable()
+                    ? 'unreachable'
+                    : 'unknown',
             mqtt: mqttOutcome,
           }),
         timeoutMs
