@@ -1,7 +1,7 @@
 {
   "name": "transmissao-p2p",
   "productName": "Sinal P2P",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Transmissão de tela e áudio ponto-a-ponto (sem servidor)",
   "main": "main.js",
   "author": "Caio Cunha",
@@ -14,7 +14,7 @@
     "dist": "electron-builder --win --mac --linux"
   },
   "devDependencies": {
-    "electron": "^44.7.0",
+    "electron": "^44.10.2",
     "electron-builder": "^26.15.3",
     "node-addon-api": "^8.9.2",
     "node-gyp": "^12.4.0"

@@ -420,8 +420,14 @@ function joinFailureMessage(result) {
   if (result.ntfy === 'rate-limited' && result.mqtt === 'ok') {
     return 'Não consegui entrar — o ntfy.sh atingiu o limite e a mensagem foi pelo servidor reserva (MQTT), mas ninguém respondeu: código expirado ou a pessoa não está mais na sala.';
   }
+  if (result.mqtt === 'ok') {
+    return 'Não consegui entrar — a mensagem saiu pelo servidor reserva (MQTT), mas ninguém respondeu: código expirado ou a pessoa não está mais na sala.';
+  }
   if (result.ntfy === 'rate-limited' && (result.mqtt === 'failed' || result.mqtt === 'unavailable')) {
     return 'Não consegui entrar — o ntfy.sh atingiu o limite e o servidor reserva (MQTT) também não respondeu. Tente de novo mais tarde.';
+  }
+  if (result.ntfy === 'unreachable' && (result.mqtt === 'failed' || result.mqtt === 'unavailable')) {
+    return 'Não consegui entrar — nem o ntfy.sh nem o servidor reserva (MQTT) responderam daqui. Confira a internet (ou se algum filtro/firewall bloqueia esses serviços) e tente de novo.';
   }
   switch (result.ntfy) {
     case 'unreachable':
