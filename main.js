@@ -157,23 +157,25 @@ async function ensureFirewallAccess() {
   });
 }
 
-// Minimizar a janela enquanto está compartilhando a tela trava o PC inteiro
+// Minimizar a janela enquanto está compartilhando a tela travava o PC inteiro
 // nalgumas máquinas (não só o app) — reproduzido em mais de uma máquina.
-// Pesquisa aponta pra uma classe de bug conhecida e documentada (inclusive
-// pela própria Intel) de driver de GPU híbrida (Intel+dedicada, Optimus e
-// afins): MINIMIZAR é, no Win32, um evento de RESIZE da janela pro estado
-// iconificado — e redimensionar uma janela acelerada por GPU enquanto a
-// mesma GPU está sob carga pesada (aqui: captura de tela + codificação de
-// vídeo por hardware rodando ao mesmo tempo) é o gatilho documentado desse
-// tipo de travamento em laptops com GPU híbrida. Não tem como consertar o
-// driver da Intel/NVIDIA a partir daqui — mas dá pra evitar o gatilho: só
-// desabilita o próprio botão/atalho de minimizar da janela enquanto uma
-// transmissão estiver ativa (ver 'sharing:active' abaixo), o que remove a
-// ação perigosa em vez de tentar reagir depois que ela já travou tudo.
-// Não cobre 100% dos jeitos de minimizar no Windows (Win+D "Mostrar área de
-// trabalho" ainda minimiza todas as janelas de qualquer forma), mas cobre o
-// caminho mais comum (botão da barra de título, clique com botão direito na
-// barra de tarefas, Alt+Espaço).
+//
+// A primeira explicação (bug de driver de GPU híbrida, Intel+dedicada) estava
+// ERRADA pra este caso: o PC onde mais acontecia tem uma GPU só (RTX 5070). A
+// causa medida depois foi a política de segundo plano do Windows 11 (ver
+// optOutOfBackgroundThrottling acima): ao minimizar, as threads do app iam
+// pros núcleos de eficiência da CPU híbrida e o resto do Windows ficava preso
+// atrás delas. Isso agora é desligado no próprio app, e o codec de vídeo
+// passou a usar a placa de vídeo com muito mais gente (ver chooseSendCodec no
+// renderer), então minimizar não deveria mais travar.
+//
+// O botão de minimizar continua desabilitado enquanto uma transmissão está
+// ativa (ver 'sharing:active' abaixo) só como cinto de segurança, até
+// confirmarmos em uso real que não é mais necessário: é a única parte da
+// correção antiga que ainda pesa na experiência de quem usa. Não cobre todos
+// os jeitos de minimizar no Windows (Win+D "Mostrar área de trabalho" ainda
+// minimiza todas as janelas) — é por isso que o opt-out acima é a correção de
+// verdade, e este bloqueio é só complemento.
 function getMinimizeWarningMarkerPath() {
   return path.join(app.getPath('appData'), 'sinal-p2p', 'minimize-warning-shown.json');
 }
@@ -194,10 +196,99 @@ async function maybeExplainMinimizeDisabled() {
     title: 'Minimizar desabilitado durante a transmissão',
     message: 'Enquanto você está compartilhando a tela, o botão de minimizar desta janela fica desativado.',
     detail:
-      'Minimizar durante a transmissão pode travar o computador inteiro em algumas máquinas (driver de vídeo, ' +
-      'principalmente notebooks com GPU híbrida). Pra tirar a janela do caminho sem minimizar, é só trocar de ' +
-      'janela normalmente (Alt+Tab ou clicando em outro app) — o Sinal P2P continua transmitindo por trás.',
+      'Minimizar durante a transmissão pode deixar o computador lento ou travado em algumas máquinas. ' +
+      'Pra tirar a janela do caminho sem minimizar, é só trocar de janela normalmente (Alt+Tab ou clicando em ' +
+      'outro app) — o Sinal P2P continua transmitindo por trás.',
   });
+}
+
+// Registro de diagnóstico em arquivo: o app empacotado não tem console nem
+// DevTools, então é a única forma de ver depois o que aconteceu num
+// travamento (política de energia aplicada, janela minimizada, codec usado
+// com cada pessoa, etc). Poucas linhas por sessão; passa de 512 KB vira .1.
+// Fica em %APPDATA%\sinal-p2p\diagnostico.log.
+const DIAG_MAX_BYTES = 512 * 1024;
+let diagPath = null;
+function diag(message) {
+  try {
+    if (!diagPath) {
+      diagPath = path.join(app.getPath('appData'), 'sinal-p2p', 'diagnostico.log');
+      fs.mkdirSync(path.dirname(diagPath), { recursive: true });
+    }
+    try {
+      if (fs.statSync(diagPath).size > DIAG_MAX_BYTES) fs.renameSync(diagPath, diagPath + '.1');
+    } catch {
+      // ainda não existe — tudo bem
+    }
+    // Hora local (não UTC) pra bater com o relógio de quem vai ler o arquivo.
+    const now = new Date();
+    const pad = (n, size = 2) => String(n).padStart(size, '0');
+    const stamp =
+      `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ` +
+      `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}.${pad(now.getMilliseconds(), 3)}`;
+    fs.appendFileSync(diagPath, `${stamp} [${process.pid}] ${message}\n`);
+  } catch {
+    // diagnóstico nunca pode derrubar o app
+  }
+}
+
+// No Windows 11, minimizar a janela faz o SO tratar o app como "de segundo
+// plano": EcoQoS, threads empurradas pros núcleos de eficiência das CPUs
+// híbridas Intel e timer mais grosso. O Sinal P2P continua trabalhando
+// pesado em segundo plano (é pra isso que ele serve), e medido aqui, num
+// i5-12600K, com VP8 por software em 3 conexões: minimizado, os 4 E-cores iam
+// a 100%, o codificador ficava 14x mais lento e o Windows inteiro engasgava
+// (abrir um app levava de 6 a 14 s: o "PC estático"). Pedir ao SO pra não
+// aplicar essa política (ver DisableProcessThrottling no addon nativo)
+// deixou minimizado idêntico a visível: mesmo custo de CPU, mesmos fps.
+//
+// A configuração vale POR PROCESSO e não passa pros filhos, então vale pro
+// principal e pra cada processo do Chromium (renderer, GPU, utilitários) —
+// inclusive os que nascem depois (ex: o serviço de captura de vídeo ao começar
+// a compartilhar). Por isso roda no começo, a cada evento que cria processo
+// e num intervalo curto.
+const throttlingOptOutDone = new Set();
+const throttlingOptOutFailures = new Map();
+function optOutOfBackgroundThrottling(reason) {
+  if (process.platform !== 'win32') return;
+  let metrics;
+  try {
+    metrics = app.getAppMetrics();
+  } catch {
+    return;
+  }
+  const alive = new Set(metrics.map((metric) => metric.pid));
+  throttlingOptOutDone.forEach((pid) => {
+    if (!alive.has(pid)) throttlingOptOutDone.delete(pid);
+  });
+  throttlingOptOutFailures.forEach((count, pid) => {
+    if (!alive.has(pid)) throttlingOptOutFailures.delete(pid);
+  });
+
+  const applied = [];
+  const failed = [];
+  for (const metric of metrics) {
+    if (throttlingOptOutDone.has(metric.pid)) continue;
+    if ((throttlingOptOutFailures.get(metric.pid) || 0) >= 3) continue; // desiste (ex: sem permissão)
+    if (processAudio.disableProcessThrottling(metric.pid)) {
+      throttlingOptOutDone.add(metric.pid);
+      applied.push(`${metric.type}:${metric.pid}`);
+    } else {
+      throttlingOptOutFailures.set(metric.pid, (throttlingOptOutFailures.get(metric.pid) || 0) + 1);
+      failed.push(`${metric.type}:${metric.pid}`);
+    }
+  }
+  if (applied.length || failed.length) {
+    diag(`segundo plano: política do Windows desligada (${reason}) em [${applied.join(', ')}]` + (failed.length ? `, falhou em [${failed.join(', ')}]` : ''));
+  }
+}
+
+// Chama agora e de novo logo depois: o processo novo (ex: o serviço de captura
+// de vídeo) só aparece alguns instantes após o evento que o cria.
+function optOutOfBackgroundThrottlingSoon(reason) {
+  optOutOfBackgroundThrottling(reason);
+  setTimeout(() => optOutOfBackgroundThrottling(reason + '+1s'), 1000).unref();
+  setTimeout(() => optOutOfBackgroundThrottling(reason + '+3s'), 3000).unref();
 }
 
 // Handles de captura por processo ativos, por WebContents (pra poder parar
@@ -309,7 +400,15 @@ ipcMain.on('sharing:active', (event, active) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win || win.isDestroyed()) return;
   win.setMinimizable(!active);
+  diag(`compartilhando a tela: ${active ? 'começou' : 'parou'} (janela ${win.isMinimized() ? 'minimizada' : 'aberta'})`);
+  // Começar a compartilhar cria processos novos (captura de vídeo/áudio).
+  if (active) optOutOfBackgroundThrottlingSoon('compartilhar');
   if (active) maybeExplainMinimizeDisabled();
+});
+
+// Linhas de diagnóstico vindas da página (ex: qual codec cada conexão usa).
+ipcMain.on('diag:log', (event, line) => {
+  if (typeof line === 'string') diag('página: ' + line.slice(0, 500));
 });
 
 // Canal de sinalização sem servidor (ver signal-punch.js): cada participante
@@ -463,7 +562,16 @@ function createWindow() {
   // do renderer começa do zero — sem isso, um reload em pleno
   // compartilhamento (ex: DevTools) deixaria minimizar desabilitado pra
   // sempre, já que só o renderer avisa quando volta a compartilhar de novo.
-  win.webContents.on('did-finish-load', () => win.setMinimizable(true));
+  win.webContents.on('did-finish-load', () => {
+    win.setMinimizable(true);
+    optOutOfBackgroundThrottlingSoon('página carregada'); // o renderer só existe a partir daqui
+  });
+
+  // Histórico das mudanças de estado da janela no diagnóstico: se o PC
+  // travar de novo, dá pra ver se foi logo depois de minimizar/restaurar.
+  ['minimize', 'restore', 'hide', 'show'].forEach((eventName) => {
+    win.on(eventName, () => diag(`janela: ${eventName}`));
+  });
 
   // Avisa o renderer quando a janela some/volta (minimizar, esconder). Com
   // backgroundThrottling desligado (necessário, ver acima), a página fica
@@ -513,6 +621,12 @@ app.whenReady().then(() => {
   processAudio.cleanupOrphans();
 
   registerDisplayMediaHandler(session.defaultSession);
+
+  diag(`app iniciado (v${app.getVersion()}, Electron ${process.versions.electron}, ${process.platform})`);
+  optOutOfBackgroundThrottling('início');
+  // Rede de segurança pra processos que o Chromium cria sem avisar (ou recria
+  // depois de uma queda do processo de GPU, por exemplo).
+  setInterval(() => optOutOfBackgroundThrottling('periódico'), 5000).unref();
 
   createWindow();
   ensureFirewallAccess(); // não bloqueia a abertura da janela — a caixa de diálogo aparece por cima

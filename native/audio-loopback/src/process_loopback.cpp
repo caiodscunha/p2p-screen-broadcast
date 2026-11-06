@@ -761,10 +761,62 @@ Napi::Value StopCapture(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+// ---------- política de energia/escalonamento dos processos (Windows 10/11) ----------
+//
+// Quando a janela de um app é minimizada, o Windows 11 passa a tratar o
+// processo como "de segundo plano": com o app em EcoQoS ele deixa de usar os
+// núcleos de desempenho e as threads vão para os núcleos de eficiência
+// (E-cores) das CPUs híbridas Intel (12ª geração em diante); além disso, ele
+// deixa de honrar o timeBeginPeriod() do processo. Medido num i5-12600K com
+// 3 espectadores recebendo VP8 (codificado por software, ~24 threads): com a
+// janela minimizada os 4 E-cores iam a 100% e os P-cores caíam pra 25%, o
+// codificador ficava 14x mais lento (88-111 ms por quadro, 9 fps) e o resto
+// do Windows, que também roda em QoS de fundo (serviços, antivírus, criação
+// de processo), ficava preso atrás dessas threads: abrir um app levava de 6 a
+// 14 segundos. Este app existe justamente pra continuar transmitindo em
+// segundo plano, então pede ao Windows pra NÃO aplicar essa política a ele
+// (ControlMask ligado e StateMask zerado = "eu cuido, não limite").
+//
+// Vale por processo (não é herdado pelos filhos) — o processo principal chama
+// isto pra si e pra cada processo do Chromium (renderer, GPU, utilitários).
+// As constantes são declaradas aqui porque IGNORE_TIMER_RESOLUTION só existe
+// em SDKs recentes, e a chamada é resolvida em tempo de execução pra não
+// quebrar em Windows mais antigo.
+struct PowerThrottlingState {
+  ULONG version;
+  ULONG controlMask;
+  ULONG stateMask;
+};
+constexpr int kProcessPowerThrottlingClass = 4;
+constexpr ULONG kThrottlingExecutionSpeed = 0x1;
+constexpr ULONG kThrottlingIgnoreTimerResolution = 0x4;
+
+Napi::Value DisableProcessThrottling(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  using SetProcessInformationFn = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+  static const SetProcessInformationFn setProcessInformation = reinterpret_cast<SetProcessInformationFn>(
+      reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation")));
+  if (!setProcessInformation) return Napi::Boolean::New(env, false);
+
+  DWORD pid = GetCurrentProcessId();
+  if (info.Length() > 0 && info[0].IsNumber()) pid = info[0].As<Napi::Number>().Uint32Value();
+
+  const bool isSelf = pid == GetCurrentProcessId();
+  HANDLE process = isSelf ? GetCurrentProcess() : OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
+  if (!process) return Napi::Boolean::New(env, false);
+
+  PowerThrottlingState state = {1 /* PROCESS_POWER_THROTTLING_CURRENT_VERSION */,
+                                kThrottlingExecutionSpeed | kThrottlingIgnoreTimerResolution, 0};
+  BOOL ok = setProcessInformation(process, kProcessPowerThrottlingClass, &state, sizeof(state));
+  if (!isSelf) CloseHandle(process);
+  return Napi::Boolean::New(env, ok != FALSE);
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("listProcesses", Napi::Function::New(env, ListProcesses));
   exports.Set("startCapture", Napi::Function::New(env, StartCapture));
   exports.Set("stopCapture", Napi::Function::New(env, StopCapture));
+  exports.Set("disableProcessThrottling", Napi::Function::New(env, DisableProcessThrottling));
   return exports;
 }
 

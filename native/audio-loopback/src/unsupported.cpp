@@ -20,10 +20,17 @@ Napi::Value StopCapture(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// A política de energia por processo (ver DisableProcessThrottling em
+// process_loopback.cpp) só existe no Windows; aqui não há o que fazer.
+Napi::Value DisableProcessThrottling(const Napi::CallbackInfo& info) {
+  return Napi::Boolean::New(info.Env(), false);
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("listProcesses", Napi::Function::New(env, ListProcesses));
   exports.Set("startCapture", Napi::Function::New(env, StartCapture));
   exports.Set("stopCapture", Napi::Function::New(env, StopCapture));
+  exports.Set("disableProcessThrottling", Napi::Function::New(env, DisableProcessThrottling));
   return exports;
 }
 

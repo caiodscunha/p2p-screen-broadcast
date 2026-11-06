@@ -1075,6 +1075,8 @@ function connectToPeer(peerInfo) {
     encodingQueue: Promise.resolve(),
     bandwidthProbeTimer: null, // ver startBandwidthProbing
     probeNudge: false,
+    sendsSoftware: false, // true se o vídeo que EU mando pra essa pessoa é codificado por software (ver chooseSendCodec)
+    sendCodecLabel: null, // último codec registrado no diagnóstico pra essa conexão
     remoteView: 'full', // como ESSA pessoa está vendo a minha tela (ver applyRemoteView)
     remoteViewVersion: 0,
     sentView: 'full', // como eu disse pra ela que estou vendo a tela DELA
@@ -1116,6 +1118,8 @@ function createPeerConnection(peer) {
   peer.lastRemoteOfferSeq = 0;
   peer.videoSender = null;
   peer.audioSender = null;
+  peer.sendsSoftware = false; // conexão nova = codec ainda não negociado/escolhido
+  peer.sendCodecLabel = null;
   // Associa os transceivers a UM MediaStream próprio (mesmo sem track
   // nenhuma ainda) — sem isso, o m-line negociado não carrega um "msid" de
   // verdade, e o `event.streams` do lado de quem recebe chega vazio.
@@ -1758,6 +1762,10 @@ function markPeerConnected(peer) {
     peer.sentView = null; // força reenviar, mesmo que seja 'full'
     updateViewRequests();
   }
+  // O codec só pode ser escolhido depois que a negociação com essa pessoa
+  // terminou (ver chooseSendCodec) — antes disso a lista de codecs negociados
+  // vem vazia e o navegador usaria a ordem de preferência DELA.
+  if (mySharing) applyVideoEncodingToPeer(peer);
 
   markJoinedRoom();
 
@@ -2102,6 +2110,77 @@ const THUMB_VIEW_MAX_BITRATE = 300_000;
 const VIEW_KINDS = ['full', 'thumb', 'off'];
 let myViewVersion = 0;
 
+// ---------- qual codec EU uso pra mandar vídeo a cada pessoa ----------
+//
+// Quem paga o custo de codificar é quem ENVIA, mas o codec que sai de um
+// SDP negociado é o primeiro da lista de quem RECEBE que o remetente sabe
+// codificar. Então a lista de preferência de um espectador decidia o
+// consumo de CPU de quem compartilha. Medido (i5-12600K, 1080p60, conteúdo
+// em movimento, 3 espectadores): H.264 na placa de vídeo custa ~2,5% da CPU
+// da máquina inteira; VP8 por software custa 6x a 8x isso, uma thread de
+// codificador por espectador, ~24 threads no total. E espectador sem
+// decodificação H.264 High por hardware (ex: Linux com NVIDIA, ou qualquer
+// PC sem decoder de GPU) não lista High, só Baseline/Main/CBP: com a ordem
+// antiga caía direto no VP8. Só que o Main (4d001f) e o Baseline (42001f)
+// TAMBÉM vão pra NVENC/Quick Sync/AMF (medido: mesmos 3,2 ms por quadro e
+// ~2,5% de CPU do High) e qualquer decodificador de H.264 abre os dois.
+//
+// Por isso, depois de negociado, cada lado fixa o codec que ENVIA
+// (`encodings[0].codec`, que o Electron 44 respeita: confirmado pelas
+// estatísticas, sem reiniciar o encoder ao reaplicar o mesmo valor):
+// - com encoder H.264 de hardware (o perfil High só aparece na lista de envio
+//   quando existe um), usa o melhor perfil de hardware que a outra pessoa
+//   aceitou: High > Main > Baseline. O Constrained Baseline (42e01f) fica de
+//   fora de propósito: no Windows cai no OpenH264 por software, pior que o VP8;
+// - sem hardware, ou se a outra pessoa só aceita perfis que não vão pra
+//   placa de vídeo, usa VP8 (nunca OpenH264 por software).
+//
+// Quando o encode é por software, o custo é limitado em vez de deixar o
+// 1080p60 por espectador devorar a CPU: no Windows 11, com o app minimizado, o
+// SO empurrava essas threads pros núcleos de eficiência e o PC inteiro
+// travava (ver optOutOfBackgroundThrottling em main.js; o opt-out resolve a
+// causa, o limite evita o consumo exagerado em si). Uma pessoa recebendo por
+// software: até 1080p a 30 fps; duas ou mais: 720p a 30 fps.
+const SOFTWARE_ENCODE_ONE_VIEWER = { height: 1080, fps: 30, bitrate: 6_000_000 };
+const SOFTWARE_ENCODE_MANY_VIEWERS = { height: 720, fps: 30, bitrate: 3_000_000 };
+
+function hasHardwareH264Encoder() {
+  try {
+    return RTCRtpSender.getCapabilities('video').codecs.some(
+      (codec) => codec.mimeType.toLowerCase() === 'video/h264' && /profile-level-id=64/i.test(codec.sdpFmtpLine || '')
+    );
+  } catch {
+    return false;
+  }
+}
+
+// `negotiated`: `sender.getParameters().codecs` (vazio até a negociação acabar).
+// Devolve { codec, software, label }; `codec` é null se ainda não dá pra escolher.
+function chooseSendCodec(negotiated) {
+  if (!Array.isArray(negotiated) || !negotiated.length) return { codec: null, software: !hasHardwareH264Encoder(), label: '?' };
+  const fmtp = (codec) => codec.sdpFmtpLine || '';
+  const h264 = negotiated.filter((codec) => codec.mimeType.toLowerCase() === 'video/h264' && /packetization-mode=1/.test(fmtp(codec)));
+  const profile = (prefix) => h264.find((codec) => new RegExp('profile-level-id=' + prefix, 'i').test(fmtp(codec)));
+  if (hasHardwareH264Encoder()) {
+    const hardware = profile('64') || profile('4d') || profile('4200');
+    if (hardware) {
+      const id = (fmtp(hardware).match(/profile-level-id=(\w+)/i) || [])[1] || '?';
+      return { codec: hardware, software: false, label: `H.264 ${id} (placa de vídeo)` };
+    }
+  }
+  const vp8 = negotiated.find((codec) => codec.mimeType.toLowerCase() === 'video/vp8');
+  if (vp8) return { codec: vp8, software: true, label: 'VP8 (software)' };
+  return { codec: null, software: true, label: 'padrão do navegador (software?)' };
+}
+
+function softwareEncodeLimits() {
+  let viewers = 0;
+  roomPeers.forEach((other) => {
+    if (other.sendsSoftware && other.remoteView === 'full') viewers++;
+  });
+  return viewers > 1 ? SOFTWARE_ENCODE_MANY_VIEWERS : SOFTWARE_ENCODE_ONE_VIEWER;
+}
+
 function applyVideoEncodingToPeer(peer) {
   const sender = peer.videoSender;
   if (!sender) return;
@@ -2115,11 +2194,15 @@ function applyVideoEncodingToPeer(peer) {
       if (!params.encodings || !params.encodings.length) params.encodings = [{}];
       const encoding = params.encodings[0];
       const view = peer.remoteView;
+      const videoTrack = localStream && localStream.getVideoTracks()[0];
+      const trackHeight = (videoTrack && videoTrack.getSettings().height) || selectedResolution();
+
+      const choice = chooseSendCodec(params.codecs);
+      if (choice.codec) encoding.codec = choice.codec;
+
       encoding.active = view !== 'off';
       if (view === 'thumb') {
-        const videoTrack = localStream && localStream.getVideoTracks()[0];
-        const height = (videoTrack && videoTrack.getSettings().height) || selectedResolution();
-        encoding.scaleResolutionDownBy = Math.max(1, height / THUMB_VIEW_HEIGHT);
+        encoding.scaleResolutionDownBy = Math.max(1, trackHeight / THUMB_VIEW_HEIGHT);
         encoding.maxFramerate = Math.min(THUMB_VIEW_MAX_FPS, selectedFrameRate());
         encoding.maxBitrate = THUMB_VIEW_MAX_BITRATE;
       } else {
@@ -2128,8 +2211,31 @@ function applyVideoEncodingToPeer(peer) {
         // O -1 kbps alternado só serve pra disparar a sondagem de banda (ver
         // startBandwidthProbing).
         encoding.maxBitrate = MAX_BITRATE_BY_RESOLUTION[selectedResolution()] - (peer.probeNudge ? 1000 : 0);
+        if (choice.software) {
+          const limits = softwareEncodeLimits();
+          encoding.scaleResolutionDownBy = Math.max(1, trackHeight / limits.height);
+          encoding.maxFramerate = Math.min(encoding.maxFramerate, limits.fps);
+          encoding.maxBitrate = Math.min(encoding.maxBitrate, limits.bitrate);
+        }
       }
       await sender.setParameters(params);
+
+      // Só depois de aplicar: registra no diagnóstico quando a escolha muda, e
+      // reajusta os outros que dividem o orçamento de software (1 -> 2 pessoas).
+      if (choice.codec && peer.sendCodecLabel !== choice.label) {
+        peer.sendCodecLabel = choice.label;
+        window.api.diag(`vídeo pra ${peer.name}: ${choice.label}`);
+      }
+      if (choice.codec && peer.sendsSoftware !== choice.software) {
+        peer.sendsSoftware = choice.software;
+        // Todos os que recebem por software (inclusive esta conexão, que pode
+        // ter calculado o limite antes de os outros contarem) dividem o mesmo
+        // orçamento: reaplica em cada um com a contagem nova. Não entra em
+        // laço: a segunda passada não muda mais nenhum `sendsSoftware`.
+        roomPeers.forEach((other) => {
+          if (other.sendsSoftware) applyVideoEncodingToPeer(other);
+        });
+      }
     })
     .catch((err) => console.warn('[room] não deu pra ajustar o vídeo enviado pra', peer.name, err));
 }
