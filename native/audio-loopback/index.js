@@ -15,6 +15,11 @@ if (process.platform === 'win32') {
       listProcesses: () => addon.listProcesses(),
       startCapture: (pid, exclude, callback) => addon.startCapture(pid, exclude, callback),
       stopCapture: (handle) => addon.stopCapture(handle),
+      // Binário compilado antes dessa função existir não a tem — sem ela só
+      // não dá pra desligar a política de segundo plano, o resto funciona.
+      disableProcessThrottling: addon.disableProcessThrottling
+        ? (pid) => addon.disableProcessThrottling(pid)
+        : null,
     };
   } catch {
     // Addon não compilado/disponível — o app segue funcionando sem esse recurso.
@@ -50,4 +55,19 @@ function cleanupOrphans() {
   if (backend && backend.cleanupOrphans) backend.cleanupOrphans();
 }
 
-module.exports = { supported, listProcesses, startCapture, stopCapture, cleanupOrphans };
+// Windows: pede ao SO pra NÃO tratar o processo `pid` como "de segundo plano"
+// (EcoQoS + núcleos de eficiência + timer mais grosso quando a janela é
+// minimizada) — ver DisableProcessThrottling em src/process_loopback.cpp pro
+// porquê. Devolve true se aplicou. Em outros SOs (ou sem o addon) não faz
+// nada e devolve false. Funciona mesmo sem a captura de áudio por processo
+// estar disponível, desde que o addon tenha carregado.
+function disableProcessThrottling(pid) {
+  if (!backend || !backend.disableProcessThrottling) return false;
+  try {
+    return Boolean(backend.disableProcessThrottling(pid));
+  } catch {
+    return false;
+  }
+}
+
+module.exports = { supported, listProcesses, startCapture, stopCapture, cleanupOrphans, disableProcessThrottling };

@@ -42,6 +42,10 @@ contextBridge.exposeInMainWorld('api', {
   // enquanto isso — ver comentário em main.js sobre o bug de travamento.
   setSharingActive: (active) => ipcRenderer.send('sharing:active', active),
 
+  // Linha pro arquivo de diagnóstico (%APPDATA%\sinal-p2p\diagnostico.log) —
+  // o app empacotado não tem console. Ver diag() em main.js.
+  diag: (line) => ipcRenderer.send('diag:log', String(line)),
+
   // Janela minimizada/escondida ou de volta (ver main.js).
   onWindowVisible: (callback) => {
     const listener = (event, visible) => callback(visible);
