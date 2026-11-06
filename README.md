@@ -346,15 +346,21 @@ the app, on any machine that built or downloaded the Linux release.
   participant; there's a per-connection bitrate cap, but nothing that
   budgets total bandwidth across a room with many simultaneous
   broadcasters. The same goes for encoding: every viewer gets their own
-  encode of your screen. To keep that cheap, the app prefers H.264 on the
-  GPU's hardware encoder (NVENC, Quick Sync, AMF, VideoToolbox), which also
-  lets viewers decode it on their GPU, and only sends each viewer what they
-  actually see: a viewer who has your stream as a small thumbnail (focused
-  on someone else) gets it at 180p and 15 fps, and a viewer who can't see
-  it at all (thumbnails hidden, or the app minimized) gets no video from
-  you until that changes, which stops your encoder for them (audio keeps
-  going). A PC without a usable hardware encoder falls back to VP8 in
-  software, which gets CPU-heavy at 1080p and above with several viewers.
+  encode of your screen. To keep that cheap, the sender uses H.264 on the
+  GPU's hardware encoder (NVENC, Quick Sync, AMF, VideoToolbox) for every
+  viewer that can open it. That is practically everyone: the High profile
+  when the viewer has a hardware decoder, otherwise Main or Baseline, which
+  the same hardware encoder produces and any H.264 decoder opens (a viewer
+  without hardware decoding, such as Linux with an NVIDIA card, used to force
+  VP8 in software on the sender, which was the expensive case). The app also
+  only sends each viewer what they actually see: a viewer who has your
+  stream as a small thumbnail (focused on someone else) gets it at 180p and
+  15 fps, and a viewer who can't see it at all (thumbnails hidden, or the
+  app minimized) gets no video from you until that changes, which stops your
+  encoder for them (audio keeps going). A PC without a usable hardware
+  encoder falls back to VP8 in software and caps it so it cannot eat the
+  whole CPU: one viewer gets up to 1080p at 30 fps, two or more get 720p at
+  30 fps.
 - **No native `getDisplayMedia` system-audio loopback on Linux**: that
   specific API is only supported by Chromium/Electron on Windows and macOS.
   Linux instead gets its own audio path: on a PipeWire session, per-app
@@ -396,28 +402,35 @@ yet:
   app on Wayland sessions (Electron's default since version 38) instead of
   through XWayland, which changes how screen capture works there; this
   hasn't been tested on Linux yet.
-- **Minimizing while sharing could freeze the whole computer (fixed, but not
-  a driver fix: the trigger is avoided instead)**: on some machines, mainly
-  laptops with hybrid graphics (an Intel integrated GPU alongside a
-  discrete one, e.g. NVIDIA Optimus), minimizing the window while actively
-  sharing your screen could freeze the entire PC, not just the app. This
-  matches a known, driver-level bug class (documented by Intel and reported
-  by others independently of this app): minimizing is a window-resize event
-  at the OS level, and resizing a GPU-accelerated window while its GPU is
-  under heavy concurrent load (screen capture + hardware video encoding, in
-  this case) is a known trigger for hybrid-graphics driver hangs. We can't
-  fix the driver from here, so instead the app **disables the minimize
-  button/shortcut for as long as you're sharing your screen** (a one-time
-  dialog explains this the first time it happens), removing the trigger
-  instead of reacting to it. This doesn't cover every way Windows can
-  minimize a window (Win+D "Show desktop" still minimizes everything
-  regardless); switching to another app normally (Alt+Tab, clicking another
-  window) works fine and doesn't trigger this. Separately, and unrelated to
-  the freeze above: if another window fully covers the broadcaster's
-  (without minimizing), the video can still visibly stall for viewers until
-  it's uncovered again (confirmed via WebRTC stats that frames keep
-  arriving but stop being decoded while occluded); not yet root-caused or
-  fixed.
+- **Minimizing while sharing could freeze the whole computer (fixed at the
+  cause, in the app)**: on Windows 11 with a hybrid Intel CPU (12th
+  generation and newer, with performance and efficiency cores), minimizing
+  the window makes Windows treat the app as a background process: its
+  threads are moved to the 4 to 8 efficiency cores and its timers get
+  coarser. When the sender was encoding VP8 in software (one encoder per
+  viewer, about 24 threads in total), the efficiency cores went to 100%
+  while the performance cores sat at 25%, the encoder became about 14 times
+  slower (9 fps, 90 to 110 ms per frame) and everything else in Windows that
+  runs at background priority (services, antivirus, creating a process) got
+  stuck behind those threads: starting any program took 6 to 14 seconds in
+  measurements, which is the "PC stuck" feeling. It reproduced on a PC with
+  a single GPU, so the earlier explanation (a hybrid-graphics driver bug) was
+  wrong. The fix has two parts. The app opts all of its processes out of
+  that background policy (EcoQoS and timer resolution throttling; it is
+  per process, so the main process re-applies it to every Chromium process,
+  including ones created later), and the sender now uses the GPU encoder
+  for nearly every viewer (see above). With both, minimized measured the
+  same as visible: same CPU, same frame rate, and starting a program stayed
+  under 0.1 s. The minimize button is still disabled while you share, only
+  as a precaution until this is confirmed in everyday use; Win+D "Show
+  desktop" minimizes everything anyway, and that case is covered by the
+  opt-out. A short diagnostic log (policy applied, window events, the codec
+  used for each viewer) is written to `%APPDATA%\sinal-p2p\diagnostico.log`.
+  Separately: if another window fully covers the broadcaster's (without
+  minimizing), the video used to stall visibly for viewers until it was
+  uncovered. That was not reproduced in recent tests (sender covered, or
+  viewer windows off-screen, 3 viewers at 1080p60), so it may be gone, but
+  it is unconfirmed.
 
 ## License
 
